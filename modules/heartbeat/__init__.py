@@ -24,7 +24,13 @@ EXTENSION_META = {
             "Continue the task, or reply HEARTBEAT_OK when you are done."
         ),
         # Max number of continuation turns before giving up and moving on.
-        "max_continuations":   5,        # Example: {"start": "09:00", "end": "22:00"}
+        "max_continuations":   5,
+        # Session to run heartbeat turns in.
+        # "main" = agent's own DM session (default).
+        # "dm:<id>" or "group:<platform>:<id>" for an explicit session.
+        "session":         "main",
+        # active_hours: restrict heartbeats to a time window. null = always run.
+        # Example: {"start": "09:00", "end": "22:00"}
         "active_hours":    None,
     },
 }
