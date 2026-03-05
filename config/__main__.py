@@ -54,10 +54,16 @@ class MatrixConfig:
         return t
 
 @dataclass
-class BridgesConfig:
-    cli:     CLIConfig     = field(default_factory=CLIConfig)
-    discord: DiscordConfig = field(default_factory=DiscordConfig)
-    matrix:  MatrixConfig  = field(default_factory=MatrixConfig)
+class BridgeConfig:
+    enabled: bool = False
+    options: dict = field(default_factory=dict)
+
+    def __getattr__(self, name: str):
+        # allows bridge_cfg.token style access into options
+        try:
+            return self.options[name]
+        except KeyError:
+            raise AttributeError(name)
 
 @dataclass
 class MemoryConfig:
@@ -78,7 +84,7 @@ class LoggingConfig:
 class Config:
     llm:             LLMConfig
     gateway:         GatewayConfig = field(default_factory=GatewayConfig)
-    bridges:         BridgesConfig = field(default_factory=BridgesConfig)
+    bridges:         dict[str, BridgeConfig] = field(default_factory=dict)
     memory:          MemoryConfig  = field(default_factory=MemoryConfig)
     logging:         LoggingConfig = field(default_factory=LoggingConfig)
     max_tool_cycles: int           = 10
@@ -104,6 +110,13 @@ def load(path="config.yaml") -> Config:
     mem_raw = raw.get("memory", {})
     log_raw = raw.get("logging", {})
 
+    bridges: dict[str, BridgeConfig] = {}
+    for name, br in raw.get("bridges", {}).items():
+        if isinstance(br, dict):
+            enabled = bool(br.get("enabled", False))
+            options = {k: v for k, v in br.items() if k != "enabled"}
+            bridges[name] = BridgeConfig(enabled=enabled, options=options)
+
     return Config(
         llm=LLMConfig(
             model=llm_raw["model"],
@@ -114,15 +127,7 @@ def load(path="config.yaml") -> Config:
             host=gw_raw.get("host", "127.0.0.1"),
             port=int(gw_raw.get("port", 8765)),
         ),
-        bridges=BridgesConfig(
-            cli=CLIConfig(enabled=bool(br_raw.get("cli", {}).get("enabled", True))),
-            discord=DiscordConfig(enabled=bool(br_raw.get("discord", {}).get("enabled", False))),
-            matrix=MatrixConfig(
-                enabled=bool(br_raw.get("matrix", {}).get("enabled", False)),
-                homeserver=br_raw.get("matrix", {}).get("homeserver", ""),
-                username=br_raw.get("matrix", {}).get("username", ""),
-            ),
-        ),
+        bridges = bridges,
         memory=MemoryConfig(workspace_path=Path(mem_raw.get("workspace_path", "~/.agent/workspace"))),
         logging=LoggingConfig(level=log_raw.get("level", "INFO")),
         max_tool_cycles=int(raw.get("max_tool_cycles", 10)),

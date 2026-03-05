@@ -33,7 +33,7 @@ async def main() -> None:
         name = entry.name
 
         # Check config.bridges.<name>.enabled — skip if no config entry or disabled
-        bridge_cfg = getattr(cfg.bridges, name, None)
+        bridge_cfg = cfg.bridges.get(name)
         if bridge_cfg is None:
             logger.debug("Bridge '%s' has no config entry — skipping", name)
             continue
