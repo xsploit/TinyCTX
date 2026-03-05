@@ -10,5 +10,6 @@ EXTENSION_META = {
         "workspace":  "/home/agent",   # default working directory for bash
         "page_size":  2000,            # lines per view_range chunk
         "cache_size": 128,             # max cached file conversions
+        "shell_timeout": 60,  # add this to prevent hanging on long-running shell commands
     },
 }

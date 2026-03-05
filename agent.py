@@ -50,7 +50,7 @@ class AgentLoop:
     def __init__(self, session_key: SessionKey, config: Config) -> None:
         self.session_key  = session_key
         self.config       = config
-        self.context      = Context()
+        self.context = Context(token_limit=config.context)
         self.tool_handler = ToolCallHandler()
         self._turn_count  = 0
         self._llm         = LLM(

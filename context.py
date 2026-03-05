@@ -119,7 +119,7 @@ class Context:
         messages = ctx.assemble()   # → send to LLM
     """
 
-    def __init__(self) -> None:
+    def __init__(self, token_limit: int = 16384) -> None:
         self.dialogue: list[HistoryEntry] = []
 
         # pid -> (PromptSlot, provider callable)
@@ -131,6 +131,9 @@ class Context:
 
         # Arbitrary state bag for hooks/modules to share data during assembly
         self.state: dict[str, Any] = {}
+
+        # Token limit for the assembled context.
+        self.token_limit = token_limit
 
     # ------------------------------------------------------------------
     # Hook registration
@@ -179,6 +182,17 @@ class Context:
     def clear(self) -> None:
         self.dialogue.clear()
         self.state.clear()
+
+    # ------------------------------------------------------------------
+    # Token counting
+    # ------------------------------------------------------------------
+
+    def _count_tokens(self, messages: list[dict]) -> int:
+        return sum(
+            len(str(m.get("content", ""))) +
+            len(json.dumps(m.get("tool_calls", [])))
+            for m in messages
+        ) // 4
 
     # ------------------------------------------------------------------
     # Assembly
@@ -265,9 +279,32 @@ class Context:
             else:
                 merged.append(dict(m))
 
-        self.state["tokens_used"] = sum(
-            len(str(m.get("content", ""))) for m in merged
-        ) // 4
+        # Count tokens and enforce limit — drop oldest non-system messages first.
+        # Tool call pairs (assistant + tool result) are dropped together to keep
+        # the message list valid for the API.
+        self.state["tokens_used"] = self._count_tokens(merged)
+
+        while self.state["tokens_used"] > self.token_limit:
+            # Find the oldest non-system message
+            drop_idx = next(
+                (i for i, m in enumerate(merged) if m["role"] != ROLE_SYSTEM),
+                None,
+            )
+            if drop_idx is None:
+                break  # only system messages left, cannot trim further
+
+            # If it's an assistant message with tool calls, also drop the
+            # immediately following tool result messages to keep pairs intact.
+            if merged[drop_idx].get("tool_calls"):
+                call_ids = {tc["id"] for tc in merged[drop_idx]["tool_calls"]}
+                merged.pop(drop_idx)
+                # Remove associated tool results (now at same index after pop)
+                while drop_idx < len(merged) and merged[drop_idx]["role"] == ROLE_TOOL and merged[drop_idx].get("tool_call_id") in call_ids:
+                    merged.pop(drop_idx)
+            else:
+                merged.pop(drop_idx)
+
+            self.state["tokens_used"] = self._count_tokens(merged)
 
         return merged
 

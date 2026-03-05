@@ -13,7 +13,6 @@ class LLMConfig:
     model:       str
     base_url:    str
     api_key_env: str = "ANTHROPIC_API_KEY"  # name of the env var holding the key
-
     @property
     def api_key(self) -> str:
         # api_key_env can be set to "N/A" or left blank for local endpoints
@@ -83,6 +82,7 @@ class Config:
     memory:          MemoryConfig  = field(default_factory=MemoryConfig)
     logging:         LoggingConfig = field(default_factory=LoggingConfig)
     max_tool_cycles: int           = 10
+    context:         int           = 16384  # add this
 
 def load(path="config.yaml") -> Config:
     p = Path(path)
@@ -126,6 +126,7 @@ def load(path="config.yaml") -> Config:
         memory=MemoryConfig(workspace_path=Path(mem_raw.get("workspace_path", "~/.agent/workspace"))),
         logging=LoggingConfig(level=log_raw.get("level", "INFO")),
         max_tool_cycles=int(raw.get("max_tool_cycles", 10)),
+        context=int(raw.get("context", 16384)),
     )
 
 def apply_logging(cfg: LoggingConfig) -> None:

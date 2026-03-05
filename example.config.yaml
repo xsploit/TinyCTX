@@ -1,6 +1,6 @@
 # config.yaml — Safe to commit. No secrets.
 # API key lives in the environment variable named by llm.api_key_env.
-
+context: 16384
 llm:
   model: claude-sonnet-4-20250514
   base_url: https://api.anthropic.com/v1   # any OpenAI-compat endpoint works

@@ -14,7 +14,7 @@ from pathlib import Path
 def register(agent) -> None:
     workspace = Path(agent.config.memory.workspace_path).expanduser().resolve()
     workspace.mkdir(parents=True, exist_ok=True)
-
+    shell_timeout = getattr(agent.config, 'shell_timeout', 60)
     def resolve(raw: str) -> Path:
         p = Path(raw)
         return p if p.is_absolute() else workspace / p
@@ -28,7 +28,7 @@ def register(agent) -> None:
         try:
             result = subprocess.run(
                 command, shell=True, cwd=workspace,
-                capture_output=True, text=True, timeout=60,
+                capture_output=True, text=True, timeout=shell_timeout,
             )
             parts = []
             if result.stdout: parts.append(result.stdout.rstrip())
