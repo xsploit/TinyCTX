@@ -177,7 +177,7 @@ class AgentLoop:
             "function": {"name": call.tool_name, "arguments": call.args},
             "id": call.call_id,
         }
-        result = self.tool_handler.execute_tool_call(proxy)
+        result = await self.tool_handler.execute_tool_call(proxy)
         return ToolResult(
             call_id=call.call_id,
             tool_name=call.tool_name,
