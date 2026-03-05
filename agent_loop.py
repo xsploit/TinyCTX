@@ -1,5 +1,5 @@
 """
-agent_loop.py — The 6-stage agent execution loop.
+agent.py — The 6-stage agent execution loop.
 One instance per session, owned by its Lane.
 Yields OutboundReply chunks; never calls the gateway directly.
 
@@ -12,7 +12,7 @@ Stages:
   6. Streaming Reply  — yield OutboundReply chunks to Lane
 
 Module loading:
-  On init, scans modules/ directory for packages exposing register(agent_loop).
+  On init, scans modules/ directory for packages exposing register(agent).
   Each module receives self and wires in whatever it needs — tools, prompt
   providers, context hooks. No hardcoding of module names anywhere.
 """
@@ -69,7 +69,7 @@ class AgentLoop:
         Scan MODULES_DIR for packages and call register(self) on each.
         A module is any subdirectory containing __main__.py or __init__.py
         that exposes a register() callable.
-        Convention: register(agent_loop) — receives self, wires in whatever it needs.
+        Convention: register(agent) — receives self, wires in whatever it needs.
         """
         if not MODULES_DIR.exists():
             logger.debug("No modules/ directory found, skipping module load.")

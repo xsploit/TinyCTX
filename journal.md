@@ -122,8 +122,8 @@ Async routing layer. No LLM calls, no tools, no memory.
 contracts.py        ← no internal imports
 config.py           ← no internal imports
 context.py          ← contracts
-agent_loop.py       ← contracts, context, config
-gateway.py          ← contracts, agent_loop, config
+agent.py       ← contracts, context, config
+gateway.py          ← contracts, agent, config
 bridges/*           ← contracts, config  (never gateway internals)
 main.py             ← everything
 ```
@@ -132,9 +132,9 @@ main.py             ← everything
 
 ## What's Stubbed (build these next, in order)
 
-1. **Inference** (`agent_loop._infer`) — real LLM call using `config.llm`
-2. **Tool execution** (`agent_loop._execute_tool`) — tool registry dispatch
-3. **History flush** (`agent_loop._flush_history`) — write to daily Markdown log
+1. **Inference** (`agent._infer`) — real LLM call using `config.llm`
+2. **Tool execution** (`agent._execute_tool`) — tool registry dispatch
+3. **History flush** (`agent._flush_history`) — write to daily Markdown log
 4. **Memory layer** — workspace file loading, BM25+vector retrieval
 5. **Tool registry** — declarative tools with JSON Schema + approval gate
 6. **Bridge: Discord** — discord.py, buffers chunks, sends on final
@@ -183,7 +183,7 @@ Async OpenAI-compatible streaming LLM client. Uses `aiohttp`. No internal import
 - `LLMConfig` now has `base_url: str = "https://api.openai.com"`
 - Add to config.yaml: `llm.base_url`
 
-### `agent_loop.py` updated
+### `agent.py` updated
 - `_infer()` stub replaced with real `LLM.stream()` call
 - Collects `TextDelta` chunks into `response_text`, `ToolCallAssembled` into
   `tool_calls` list, `LLMError` breaks the cycle and surfaces as reply text
@@ -299,7 +299,7 @@ which env var held the API key — replaced by explicit `api_key_env` field.
 - `api_key` property reads `os.environ[self.api_key_env]`
 - `load()` now raises `ValueError` if `llm.base_url` or `llm.model` missing
 
-### `agent_loop.py` changes
+### `agent.py` changes
 - `_has_api_key()` now checks `config.llm.api_key_env` directly
 
 ### Minimal valid config.yaml
@@ -336,7 +336,7 @@ always include `/v1` (or whatever version prefix the server uses).
 - Note: model streams `reasoning_content` chunks before `content` — these are
   chain-of-thought tokens, correctly ignored (only `content` is picked up)
 
-### `agent_loop.py`
+### `agent.py`
 - Added `reset()` — clears `Context` and resets `_turn_count`
 
 ### `gateway.py`
@@ -368,7 +368,7 @@ always include `/v1` (or whatever version prefix the server uses).
 
 All paths resolve relative to `workspace`. Absolute paths pass through unchanged.
 
-### `agent_loop.py` updated
+### `agent.py` updated
 - `__init__` accepts optional `registry: ToolRegistry`
 - `_infer` passes `registry.schemas()` to `LLM.stream()` as `tools=`
 - `_execute_tool` now dispatches to `registry.execute()` instead of stub

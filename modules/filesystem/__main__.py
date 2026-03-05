@@ -3,7 +3,7 @@ modules/filesystem/__main__.py
 
 Registers filesystem tools (shell, view, create_file, str_replace) into the
 agent loop's tool_handler. No imports from utils or contracts — everything
-arrives through the agent_loop argument.
+arrives through the agent argument.
 """
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ import subprocess
 from pathlib import Path
 
 
-def register(agent_loop) -> None:
-    workspace = Path(agent_loop.config.memory.workspace_path).expanduser().resolve()
+def register(agent) -> None:
+    workspace = Path(agent.config.memory.workspace_path).expanduser().resolve()
     workspace.mkdir(parents=True, exist_ok=True)
 
     def resolve(raw: str) -> Path:
@@ -105,7 +105,7 @@ def register(agent_loop) -> None:
         p.write_text(original.replace(old_str, new_str, 1), encoding="utf-8")
         return f"[replaced 1 occurrence in {p}]"
 
-    agent_loop.tool_handler.register_tool(shell)
-    agent_loop.tool_handler.register_tool(view)
-    agent_loop.tool_handler.register_tool(create_file)
-    agent_loop.tool_handler.register_tool(str_replace)
+    agent.tool_handler.register_tool(shell)
+    agent.tool_handler.register_tool(view)
+    agent.tool_handler.register_tool(create_file)
+    agent.tool_handler.register_tool(str_replace)

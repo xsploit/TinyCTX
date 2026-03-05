@@ -1,7 +1,7 @@
 """
 gateway.py — Async session router and lane queues.
 No LLM calls, no tools, no memory. Pure routing and async primitives.
-Imports only from contracts.py, agent_loop.py, config.py, and stdlib.
+Imports only from contracts.py, agent.py, config.py, and stdlib.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Awaitable
 
 from contracts import InboundMessage, OutboundReply, SessionKey, ChatType
-from agent_loop import AgentLoop
+from agent import AgentLoop
 from config import Config
 
 logger = logging.getLogger(__name__)

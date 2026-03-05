@@ -2,15 +2,15 @@ from __future__ import annotations
 import json
 
 
-def register(agent_loop, config=None):
+def register(agent, config=None):
     if config is None:
         try:
             from modules.ctx_tools import EXTENSION_META
             config = EXTENSION_META.get("default_config", {})
         except ImportError:
             config = {}
-    _register_dedup(agent_loop.context, config)
-    _register_trim(agent_loop.context, config)
+    _register_dedup(agent.context, config)
+    _register_trim(agent.context, config)
 
 
 def _register_dedup(context, config):

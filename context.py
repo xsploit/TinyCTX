@@ -1,6 +1,6 @@
 """
 context.py — Conversation history types and context assembly pipeline.
-Imports only from contracts.py and stdlib. Never imports from gateway or agent_loop.
+Imports only from contracts.py and stdlib. Never imports from gateway or agent.
 
 The Context class owns:
   - HistoryEntry list (the raw dialogue)
