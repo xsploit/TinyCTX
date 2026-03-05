@@ -2,3 +2,5 @@ PyYAML
 requests
 aiohttp
 pyyaml
+playwright
+duckduckgo-search
