@@ -11,6 +11,13 @@ Stages:
   5. Result Backfill  — inject ToolResults back into Context
   6. Streaming Reply  — yield OutboundReply chunks to Lane
 
+Model pool:
+  All named models from config.models are pre-instantiated into self._models.
+  Inference walks primary → fallback list, triggering fallback according to
+  config.llm.fallback_on (any_error or specific http_codes).
+  Modules call agent.get_model(name) to get a named LLM instance for their
+  own use (e.g. compaction with a cheaper model).
+
 Module loading:
   On init, scans modules/ directory for packages exposing register(agent).
   Each module receives self and wires in whatever it needs — tools, prompt
@@ -20,7 +27,6 @@ Module loading:
 from __future__ import annotations
 
 import importlib
-import importlib.util
 import json
 import logging
 import os
@@ -30,19 +36,33 @@ from typing import AsyncIterator
 
 from contracts import InboundMessage, OutboundReply, ToolCall, ToolResult, SessionKey
 from context import Context, HistoryEntry
-from config import Config
+from config import Config, ModelConfig
 from ai import LLM, TextDelta, ToolCallAssembled, LLMError
 from utils.tool_handler import ToolCallHandler
 
 logger = logging.getLogger(__name__)
 
-# Where to look for modules. Relative to cwd (where main.py lives).
 MODULES_DIR = Path("modules")
+
+
+def _build_llm(cfg: ModelConfig) -> LLM:
+    api_key = cfg.api_key if cfg.api_key_env.upper() != "N/A" else "no-key"
+    try:
+        api_key = cfg.api_key
+    except EnvironmentError:
+        api_key = "no-key"
+    return LLM(
+        base_url=cfg.base_url,
+        api_key=api_key,
+        model=cfg.model,
+        max_tokens=cfg.max_tokens,
+        temperature=cfg.temperature,
+    )
 
 
 class AgentLoop:
     """
-    Owns one session's Context, tool_handler, and LLM client.
+    Owns one session's Context, tool_handler, and LLM pool.
     Called by Lane once per inbound message.
     Yields OutboundReply chunks that the Lane forwards to the gateway.
     """
@@ -50,28 +70,44 @@ class AgentLoop:
     def __init__(self, session_key: SessionKey, config: Config) -> None:
         self.session_key  = session_key
         self.config       = config
-        self.context = Context(token_limit=config.context)
+        self.context      = Context(token_limit=config.context)
         self.tool_handler = ToolCallHandler()
         self._turn_count  = 0
         self.gateway      = None  # set by Lane.__post_init__ after construction
-        self._llm         = LLM(
-            base_url=config.llm.base_url,
-            api_key=config.llm.api_key if _has_api_key(config) else "no-key",
-            model=config.llm.model,
-        )
+
+        # Build the full model pool from config.models
+        self._models: dict[str, LLM] = {
+            name: _build_llm(mc)
+            for name, mc in config.models.items()
+        }
+
         self._load_modules()
+
+    # ------------------------------------------------------------------
+    # Public model accessor (for modules)
+    # ------------------------------------------------------------------
+
+    def get_model(self, name: str) -> LLM:
+        """
+        Return a named LLM instance from the pool.
+        Falls back to the primary model if name is not in the pool.
+        Modules use this to request a specific model (e.g. cheap/fast for
+        compaction or memory flush) without knowing API keys or base_urls.
+        """
+        if name in self._models:
+            return self._models[name]
+        primary = self.config.llm.primary
+        logger.warning(
+            "get_model('%s') — not found, falling back to primary '%s'",
+            name, primary,
+        )
+        return self._models[primary]
 
     # ------------------------------------------------------------------
     # Module loader
     # ------------------------------------------------------------------
 
     def _load_modules(self) -> None:
-        """
-        Scan MODULES_DIR for packages and call register(self) on each.
-        A module is any subdirectory containing __main__.py or __init__.py
-        that exposes a register() callable.
-        Convention: register(agent) — receives self, wires in whatever it needs.
-        """
         if not MODULES_DIR.exists():
             logger.debug("No modules/ directory found, skipping module load.")
             return
@@ -116,31 +152,71 @@ class AgentLoop:
         final_text = ""
 
         for cycle in range(max_cycles):
-            # Stage 2: Context Assembly — fetch tools first so assemble()
-            # can account for their token cost when trimming history.
-            tools = self.tool_handler.get_tool_definitions() or None
+            # Stage 2: Context Assembly
+            tools    = self.tool_handler.get_tool_definitions() or None
             messages = self.context.assemble(tools=tools)
 
-            # Stage 3: Inference
+            # Stage 3: Inference — walk primary → fallback chain
             text_chunks: list[str]      = []
             tool_calls:  list[ToolCall] = []
             error:       str | None     = None
 
-            async for event in self._llm.stream(messages, tools=tools):
-                if isinstance(event, TextDelta):
-                    text_chunks.append(event.text)
-                elif isinstance(event, ToolCallAssembled):
-                    tool_calls.append(ToolCall(
-                        call_id=event.call_id,
-                        tool_name=event.tool_name,
-                        args=event.args,
-                    ))
-                elif isinstance(event, LLMError):
-                    error = event.message
+            model_chain = [self.config.llm.primary] + list(self.config.llm.fallback)
+
+            for model_name in model_chain:
+                llm = self._models[model_name]
+                text_chunks  = []
+                tool_calls   = []
+                error        = None
+                last_http_status: int | None = None
+
+                async for event in llm.stream(messages, tools=tools):
+                    if isinstance(event, TextDelta):
+                        text_chunks.append(event.text)
+                    elif isinstance(event, ToolCallAssembled):
+                        tool_calls.append(ToolCall(
+                            call_id=event.call_id,
+                            tool_name=event.tool_name,
+                            args=event.args,
+                        ))
+                    elif isinstance(event, LLMError):
+                        error = event.message
+                        # Try to parse HTTP status from error string e.g. "HTTP 429: ..."
+                        if event.message.startswith("HTTP "):
+                            try:
+                                last_http_status = int(event.message.split()[1].rstrip(":"))
+                            except (IndexError, ValueError):
+                                pass
+                        break
+
+                if not error:
+                    # Success — stop walking the chain
+                    if model_name != self.config.llm.primary:
+                        logger.info(
+                            "[%s] inference succeeded on fallback model '%s'",
+                            self.session_key, model_name,
+                        )
                     break
 
+                # Decide whether to try the next model
+                fo = self.config.llm.fallback_on
+                should_fallback = fo.any_error or (
+                    last_http_status is not None
+                    and last_http_status in fo.http_codes
+                )
+
+                if should_fallback and model_name != model_chain[-1]:
+                    logger.warning(
+                        "[%s] model '%s' failed (%s) — trying next fallback",
+                        self.session_key, model_name, error,
+                    )
+                    continue
+
+                # Not falling back — surface the error
+                break
+
             if error:
-                logger.error("[%s] LLM error: %s", self.session_key, error)
+                logger.error("[%s] LLM error (all models exhausted): %s", self.session_key, error)
                 final_text = f"[LLM error: {error}]"
                 break
 
@@ -221,7 +297,7 @@ class AgentLoop:
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
         version = self._next_session_version(sessions_dir)
-        path = sessions_dir / f"{version}.json"
+        path    = sessions_dir / f"{version}.json"
 
         dialogue_raw = [
             {
@@ -253,12 +329,7 @@ class AgentLoop:
             logger.warning("[%s] _flush_history failed: %s", self.session_key, exc)
 
     def _next_session_version(self, sessions_dir: Path) -> int:
-        """Return the next unused integer filename (1, 2, 3, ...) in sessions_dir."""
         existing = [
             int(p.stem) for p in sessions_dir.glob("*.json") if p.stem.isdigit()
         ]
         return max(existing, default=0) + 1
-
-
-def _has_api_key(config: Config) -> bool:
-    return bool(os.environ.get(config.llm.api_key_env, "").strip())

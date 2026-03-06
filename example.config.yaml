@@ -1,10 +1,40 @@
 # config.yaml — Safe to commit. No secrets.
-# API key lives in the environment variable named by llm.api_key_env.
+# API keys live in environment variables named by each model's api_key_env.
+
 context: 16384
+
+# Named model definitions — add as many as you need.
+models:
+  smart:
+    base_url: https://api.anthropic.com/v1
+    model: claude-sonnet-4-20250514
+    api_key_env: ANTHROPIC_API_KEY
+    max_tokens: 4096
+    temperature: 0.7
+
+  fast:
+    base_url: https://api.openai.com/v1
+    model: gpt-4o-mini
+    api_key_env: OPENAI_API_KEY
+    max_tokens: 2048
+    temperature: 0.7
+
+  local:
+    base_url: http://localhost:11434/v1
+    api_key_env: N/A          # local endpoints need no key
+    model: qwen3:32b
+    max_tokens: 8192
+    temperature: 0.6
+
+# LLM routing — which model to use and when to fall back.
 llm:
-  model: claude-sonnet-4-20250514
-  base_url: https://api.anthropic.com/v1   # any OpenAI-compat endpoint works
-  api_key_env: ANTHROPIC_API_KEY           # name of the env var holding your key
+  primary: smart              # key into models: above
+  fallback:
+    - fast
+    - local
+  fallback_on:
+    any_error: false          # true = fall back on any LLMError
+    http_codes: [429, 500, 502, 503, 504]  # fall back on these HTTP status codes
 
 gateway:
   host: 127.0.0.1
