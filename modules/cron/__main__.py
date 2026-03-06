@@ -147,7 +147,7 @@ def _validate_job(job: CronJob, now_ms: int) -> list[str]:
 
     if s.kind not in ("every", "at", "cron"):
         warnings.append(f"unknown schedule kind '{s.kind}'")
-        return warnings  # further checks meaningless
+        return warnings
 
     if s.kind == "every":
         if not s.every_ms or s.every_ms <= 0:
@@ -292,7 +292,6 @@ def _build_cron_list(path: Path) -> str:
         if warnings:
             status_icon = "⚠"
 
-        # Schedule summary
         s = j.schedule
         if s.kind == "every" and s.every_ms:
             mins = s.every_ms // 60000
@@ -315,8 +314,7 @@ def _build_cron_list(path: Path) -> str:
         disabled_str = " [disabled]" if not j.enabled else ""
         lines.append(f"[{j.id}] {j.name} — {sched_str}{disabled_str} {status_icon}")
 
-        # Timing
-        lines.append(f"  next: {_fmt_ts(j.state.next_run_at_ms)}  |  last: ", )
+        lines.append(f"  next: {_fmt_ts(j.state.next_run_at_ms)}  |  last: ")
         if j.state.last_status:
             last = j.state.last_status
             if j.state.last_error:
@@ -325,11 +323,9 @@ def _build_cron_list(path: Path) -> str:
         else:
             lines[-1] += "never run"
 
-        # Message preview
         preview = j.message if len(j.message) <= 60 else j.message[:57] + "..."
         lines.append(f"  msg: {preview}")
 
-        # Warnings
         for w in warnings:
             lines.append(f"  ⚠ {w}")
 
@@ -349,8 +345,8 @@ def _build_cron_list(path: Path) -> str:
 class _CronRunner:
     """
     Watches CRON.json for changes and fires due jobs.
-    Uses a timer-per-wake approach: sleeps until the next due job rather
-    than polling on a fixed interval.
+    Each job is pushed through the gateway so it gets its own isolated Lane
+    and AgentLoop — job context never bleeds into the user's session.
     """
 
     def __init__(self, agent, store_path: Path) -> None:
@@ -443,7 +439,11 @@ class _CronRunner:
     async def _run_job(self, job: CronJob) -> None:
         logger.info("[cron] running job '%s' (%s)", job.name, job.id)
         start_ms = _now_ms()
+
         try:
+            # Each job gets its own session key — the gateway will create an
+            # isolated Lane + AgentLoop for it, keeping job context entirely
+            # separate from the user's session.
             job_session = SessionKey.dm(f"cron-{job.id}")
             msg = InboundMessage(
                 session_key=job_session,
@@ -453,19 +453,50 @@ class _CronRunner:
                 message_id=f"cron-{job.id}-{int(time.time_ns())}",
                 timestamp=time.time(),
             )
-            parts: list[str] = []
-            async for chunk in self._agent.run(msg):
-                parts.append(chunk.text)
-                if not chunk.is_partial:
-                    break
-            reply = "".join(parts).strip()
-            if reply:
-                print(f"\n[CRON: {job.name}]\n{reply}\n")
 
-            job.state.last_status  = "ok"
-            job.state.last_error   = None
+            gateway = getattr(self._agent, "gateway", None)
+            if gateway is None:
+                logger.error("[cron] agent.gateway not set — cannot run job '%s'", job.name)
+                job.state.last_status = "error"
+                job.state.last_error  = "agent.gateway not available"
+                return
+
+            # Collect the reply via a temporary handler registered for this job's session.
+            parts: list[str] = []
+            reply_event = asyncio.Event()
+
+            async def _collect(reply):
+                parts.append(reply.text)
+                if not reply.is_partial:
+                    reply_event.set()
+
+            # Register a one-shot reply handler keyed to the cron platform user.
+            # Cron author uses Platform.CLI so replies route to "cli" — we
+            # temporarily replace it and restore afterwards.
+            original_handler = gateway._reply_handlers.get("cli")
+            gateway._reply_handlers["cli"] = _collect
+
+            try:
+                await gateway.push(msg)
+                await asyncio.wait_for(reply_event.wait(), timeout=120)
+            finally:
+                if original_handler is not None:
+                    gateway._reply_handlers["cli"] = original_handler
+                else:
+                    gateway._reply_handlers.pop("cli", None)
+
+            reply_text = "".join(parts).strip()
+            if reply_text:
+                print(f"\n[CRON: {job.name}]\n{reply_text}\n")
+
+            job.state.last_status = "ok"
+            job.state.last_error  = None
             logger.info("[cron] job '%s' completed", job.name)
 
+        except asyncio.TimeoutError:
+            job.state.last_status = "error"
+            job.state.last_error  = "timed out after 120s"
+            logger.error("[cron] job '%s' timed out", job.name)
         except Exception as exc:
             job.state.last_status = "error"
             job.state.last_error  = str(exc)
@@ -502,7 +533,6 @@ def register(agent) -> None:
     runner = _CronRunner(agent, store_path)
     runner.start()
 
-    # Cancel runner on session reset
     original_reset = agent.reset
     def patched_reset():
         original_reset()
@@ -510,7 +540,6 @@ def register(agent) -> None:
         logger.info("[cron] runner stopped on session reset")
     agent.reset = patched_reset
 
-    # Register cron_list tool
     def cron_list() -> str:
         """
         List all scheduled cron jobs, validate their configuration, and show next/last run times.

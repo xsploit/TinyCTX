@@ -53,6 +53,7 @@ class AgentLoop:
         self.context = Context(token_limit=config.context)
         self.tool_handler = ToolCallHandler()
         self._turn_count  = 0
+        self.gateway      = None  # set by Lane.__post_init__ after construction
         self._llm         = LLM(
             base_url=config.llm.base_url,
             api_key=config.llm.api_key if _has_api_key(config) else "no-key",

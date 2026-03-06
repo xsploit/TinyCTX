@@ -29,12 +29,14 @@ class Lane:
     session_key:   SessionKey
     config:        Config
     reply_handler: ReplyHandler
+    gateway:       "Gateway"
     loop:          AgentLoop = field(init=False)
     queue:         asyncio.Queue = field(default_factory=asyncio.Queue)
     _worker:       asyncio.Task | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.loop = AgentLoop(session_key=self.session_key, config=self.config)
+        self.loop.gateway = self.gateway
 
     def start(self) -> None:
         if self._worker is None or self._worker.done():
@@ -77,9 +79,10 @@ class Lane:
 # ---------------------------------------------------------------------------
 
 class SessionRouter:
-    def __init__(self, config: Config, reply_handler: ReplyHandler) -> None:
+    def __init__(self, config: Config, reply_handler: ReplyHandler, gateway: "Gateway") -> None:
         self._config        = config
         self._reply_handler = reply_handler
+        self._gateway       = gateway
         self._lanes: dict[SessionKey, Lane] = {}
 
     async def route(self, msg: InboundMessage) -> None:
@@ -89,7 +92,12 @@ class SessionRouter:
 
     def _get_or_create(self, key: SessionKey) -> Lane:
         if key not in self._lanes:
-            lane = Lane(session_key=key, config=self._config, reply_handler=self._reply_handler)
+            lane = Lane(
+                session_key=key,
+                config=self._config,
+                reply_handler=self._reply_handler,
+                gateway=self._gateway,
+            )
             lane.start()
             self._lanes[key] = lane
             logger.info("Opened lane %s", key)
@@ -113,12 +121,11 @@ class Gateway:
     def __init__(self, config: Config) -> None:
         self._config           = config
         self._reply_handlers:  dict[str, ReplyHandler] = {}
-        # DM sessions have platform=None on the SessionKey, so we track
-        # which platform each DM session arrived from separately.
-        # key: SessionKey  value: platform string e.g. "cli", "discord"
         self._dm_platforms:    dict[SessionKey, str] = {}
         self._router           = SessionRouter(
-            config=config, reply_handler=self._dispatch_reply
+            config=config,
+            reply_handler=self._dispatch_reply,
+            gateway=self,
         )
 
     def register_reply_handler(self, platform: str, handler: ReplyHandler) -> None:
@@ -126,8 +133,6 @@ class Gateway:
         logger.info("Registered reply handler for platform '%s'", platform)
 
     async def push(self, msg: InboundMessage) -> None:
-        # For DM sessions, record which platform this message came from
-        # so we can route replies back correctly.
         if msg.session_key.chat_type.value == "dm":
             self._dm_platforms[msg.session_key] = msg.author.platform.value
         await self._router.route(msg)
@@ -135,10 +140,8 @@ class Gateway:
     async def _dispatch_reply(self, reply: OutboundReply) -> None:
         sk = reply.session_key
         if sk.platform is not None:
-            # Group session — platform is on the key
             platform = sk.platform.value
         else:
-            # DM session — look up which platform last messaged this session
             platform = self._dm_platforms.get(sk)
 
         if platform is None:
@@ -160,6 +163,8 @@ class Gateway:
         lane = self._router._lanes.get(key)
         if lane:
             lane.reset()
+        else:
+            logger.debug("reset_session: no lane for %s", key)
 
     async def shutdown(self) -> None:
         await self._router.close_all()

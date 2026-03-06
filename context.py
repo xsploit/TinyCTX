@@ -327,7 +327,7 @@ class Context:
                         "type": "function",
                         "function": {
                             "name":      tc["name"],
-                            "arguments": json.dumps(tc["arguments"]),
+                            "arguments": tc["arguments"] if isinstance(tc["arguments"], str) else json.dumps(tc["arguments"]),
                         },
                     }
                     for tc in entry.tool_calls

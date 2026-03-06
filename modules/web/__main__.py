@@ -77,7 +77,7 @@ def _state(agent) -> dict:
                 "ignore_tags":            ["script", "style"],
                 "max_discovery_elements": 40,
             },
-            "downloads_dir": None,   # set during register()
+            "downloads_dir": None,
         })
     return getattr(agent, _STATE_KEY)
 
@@ -208,7 +208,6 @@ async def _dynamic_discovery(agent) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def register(agent) -> None:
-    # Pull config
     try:
         from modules.web import EXTENSION_META
         cfg: dict = EXTENSION_META.get("default_config", {})
@@ -230,12 +229,17 @@ def register(agent) -> None:
         "max_discovery_elements": cfg.get("max_discovery_elements", 40),
     })
 
-    # Close browser on session reset
     original_reset = agent.reset
 
     def patched_reset():
         original_reset()
-        asyncio.get_event_loop().create_task(_close_browser(agent))
+        # Use get_running_loop() — get_event_loop() is deprecated in 3.10+
+        # and may raise if called outside an async context.
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_close_browser(agent))
+        except RuntimeError:
+            pass  # no running loop at reset time — browser will be GC'd
 
     agent.reset = patched_reset
 
@@ -544,7 +548,6 @@ def register(agent) -> None:
         else:
             return f"Error: unknown action '{action}'. Valid: {valid}"
 
-    # Register all tools
     for fn in (
         web_search,
         http_request,
