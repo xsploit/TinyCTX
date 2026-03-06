@@ -30,30 +30,6 @@ class GatewayConfig:
     port: int = 8765
 
 @dataclass
-class CLIConfig:
-    enabled: bool = True
-
-@dataclass
-class DiscordConfig:
-    enabled: bool = False
-    @property
-    def token(self) -> str:
-        t = os.environ.get("DISCORD_TOKEN", "").strip()
-        if not t: raise EnvironmentError("DISCORD_TOKEN env var not set.")
-        return t
-
-@dataclass
-class MatrixConfig:
-    enabled:    bool = False
-    homeserver: str  = ""
-    username:   str  = ""
-    @property
-    def token(self) -> str:
-        t = os.environ.get("MATRIX_TOKEN", "").strip()
-        if not t: raise EnvironmentError("MATRIX_TOKEN env var not set.")
-        return t
-
-@dataclass
 class BridgeConfig:
     enabled: bool = False
     options: dict = field(default_factory=dict)
