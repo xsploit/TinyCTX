@@ -115,15 +115,16 @@ class AgentLoop:
         final_text = ""
 
         for cycle in range(max_cycles):
-            # Stage 2: Context Assembly
-            messages = self.context.assemble()
+            # Stage 2: Context Assembly — fetch tools first so assemble()
+            # can account for their token cost when trimming history.
+            tools = self.tool_handler.get_tool_definitions() or None
+            messages = self.context.assemble(tools=tools)
 
             # Stage 3: Inference
             text_chunks: list[str]      = []
             tool_calls:  list[ToolCall] = []
             error:       str | None     = None
 
-            tools = self.tool_handler.get_tool_definitions() or None
             async for event in self._llm.stream(messages, tools=tools):
                 if isinstance(event, TextDelta):
                     text_chunks.append(event.text)
@@ -214,7 +215,6 @@ class AgentLoop:
         Version is auto-incremented — finds the highest existing N.json, writes N+1.
         Called automatically after every reply.
         """
-        # sessions/dm_cli-owner/  or  sessions/group_discord_123456/
         safe_key = str(self.session_key).replace(":", "_")
         sessions_dir = Path("sessions") / safe_key
         sessions_dir.mkdir(parents=True, exist_ok=True)

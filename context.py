@@ -187,18 +187,19 @@ class Context:
     # Token counting
     # ------------------------------------------------------------------
 
-    def _count_tokens(self, messages: list[dict]) -> int:
-        return sum(
+    def _count_tokens(self, messages: list[dict], tools: list[dict] | None = None) -> int:
+        tool_chars = len(json.dumps(tools)) if tools else 0
+        return (sum(
             len(str(m.get("content", ""))) +
             len(json.dumps(m.get("tool_calls", [])))
             for m in messages
-        ) // 4
+        ) + tool_chars) // 4
 
     # ------------------------------------------------------------------
     # Assembly
     # ------------------------------------------------------------------
 
-    def assemble(self) -> list[dict]:
+    def assemble(self, tools: list[dict] | None = None) -> list[dict]:
         """
         Run the four-stage pipeline and return API-ready messages.
 
@@ -279,10 +280,11 @@ class Context:
             else:
                 merged.append(dict(m))
 
-        # Count tokens and enforce limit — drop oldest non-system messages first.
+        # Count tokens (including tool definitions) and enforce limit.
+        # Drop oldest non-system messages first.
         # Tool call pairs (assistant + tool result) are dropped together to keep
         # the message list valid for the API.
-        self.state["tokens_used"] = self._count_tokens(merged)
+        self.state["tokens_used"] = self._count_tokens(merged, tools)
 
         while self.state["tokens_used"] > self.token_limit:
             # Find the oldest non-system message
@@ -304,7 +306,7 @@ class Context:
             else:
                 merged.pop(drop_idx)
 
-            self.state["tokens_used"] = self._count_tokens(merged)
+            self.state["tokens_used"] = self._count_tokens(merged, tools)
 
         return merged
 
