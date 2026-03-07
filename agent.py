@@ -11,6 +11,14 @@ Stages:
   5. Result Backfill  — inject ToolResults back into Context
   6. Streaming Reply  — yield OutboundReply chunks to Lane
 
+Streaming behaviour:
+  Tool-call cycles (cycles 0..N-1) buffer text as before — we can't stream
+  text that may be followed by a tool call mid-response.
+  The final cycle (no tool calls returned) streams TextDelta events directly
+  to the Lane as is_partial=True chunks, with a closing is_partial=False
+  chunk at the end. This gives the CLI (and future bridges) word-by-word
+  output with no extra latency.
+
 Model pool:
   All named models from config.models are pre-instantiated into self._models.
   Inference walks primary → fallback list, triggering fallback according to
@@ -163,31 +171,60 @@ class AgentLoop:
             messages = self.context.assemble(tools=tools)
 
             # Stage 3: Inference — walk primary → fallback chain
+            #
+            # On every cycle we need to know whether tool calls follow the
+            # text, so we always buffer tool-call cycles.  On the *final*
+            # cycle (no tool calls returned) we stream text chunks directly.
+            # We detect "final" lazily: start streaming, and if a ToolCall
+            # arrives we switch to buffered mode (the partial chunks already
+            # sent are still valid — they're just the preamble text).
+
             text_chunks: list[str]      = []
             tool_calls:  list[ToolCall] = []
             error:       str | None     = None
+
+            # Partial chunks emitted this cycle (for final-cycle streaming).
+            # We accumulate them so we can reconstruct final_text if needed.
+            streamed_text: list[str] = []
+            streaming_active = False   # True once we start yielding partials
 
             model_chain = [self.config.llm.primary] + list(self.config.llm.fallback)
 
             for model_name in model_chain:
                 llm = self._models[model_name]
-                text_chunks  = []
-                tool_calls   = []
-                error        = None
+                text_chunks    = []
+                tool_calls     = []
+                error          = None
+                streamed_text  = []
+                streaming_active = False
                 last_http_status: int | None = None
 
                 async for event in llm.stream(messages, tools=tools):
                     if isinstance(event, TextDelta):
                         text_chunks.append(event.text)
+
+                        # Stream this chunk immediately if we're on the final
+                        # cycle (no tool calls seen yet this cycle).
+                        if not tool_calls:
+                            streamed_text.append(event.text)
+                            streaming_active = True
+                            yield OutboundReply(
+                                session_key=self.session_key,
+                                text=event.text,
+                                reply_to_message_id=msg.message_id,
+                                trace_id=msg.trace_id,
+                                is_partial=True,
+                            )
+
                     elif isinstance(event, ToolCallAssembled):
                         tool_calls.append(ToolCall(
                             call_id=event.call_id,
                             tool_name=event.tool_name,
                             args=event.args,
                         ))
+
                     elif isinstance(event, LLMError):
                         error = event.message
-                        # Try to parse HTTP status from error string e.g. "HTTP 429: ..."
                         if event.message.startswith("HTTP "):
                             try:
                                 last_http_status = int(event.message.split()[1].rstrip(":"))
@@ -196,7 +233,6 @@ class AgentLoop:
                         break
 
                 if not error:
-                    # Success — stop walking the chain
                     if model_name != self.config.llm.primary:
                         logger.info(
                             "[%s] inference succeeded on fallback model '%s'",
@@ -218,7 +254,6 @@ class AgentLoop:
                     )
                     continue
 
-                # Not falling back — surface the error
                 break
 
             if error:
@@ -233,10 +268,13 @@ class AgentLoop:
             ))
 
             if not tool_calls:
+                # This was the final cycle. Text was already streamed as
+                # partials — just record it and break.
                 final_text = response_text
                 break
 
-            # Stages 4 & 5: Execute tools, backfill results
+            # Tool calls present — execute them (stages 4 & 5).
+            # Any partial text already sent is the preamble; that's fine.
             logger.debug("[%s] cycle %d — %d tool call(s)", self.session_key, cycle, len(tool_calls))
             for tc in tool_calls:
                 result = await self._execute_tool(tc)
@@ -246,9 +284,29 @@ class AgentLoop:
             logger.warning("[%s] hit max_tool_cycles (%d)", self.session_key, max_cycles)
             final_text = final_text or "[Tool cycle limit reached.]"
 
-        # Stage 6: Streaming Reply
-        async for chunk in self._stream_reply(final_text, msg):
-            yield chunk
+        # Stage 6: close the stream.
+        #
+        # If the final cycle streamed partials, send a closing is_partial=False
+        # chunk with an empty string — bridges use this as the "done" signal.
+        #
+        # If nothing was streamed (error path, or final_text came from a
+        # tool-cycle fallback), send the full text as a single non-partial chunk.
+        if streaming_active and not error:
+            yield OutboundReply(
+                session_key=self.session_key,
+                text="",
+                reply_to_message_id=msg.message_id,
+                trace_id=msg.trace_id,
+                is_partial=False,
+            )
+        else:
+            yield OutboundReply(
+                session_key=self.session_key,
+                text=final_text,
+                reply_to_message_id=msg.message_id,
+                trace_id=msg.trace_id,
+                is_partial=False,
+            )
 
         await self._flush_history()
 
@@ -267,19 +325,6 @@ class AgentLoop:
             tool_name=call.tool_name,
             output=str(result.get("result", result.get("error", "[no output]"))),
             is_error=not result.get("success", False),
-        )
-
-    # ------------------------------------------------------------------
-    # Stage 6: Reply streaming
-    # ------------------------------------------------------------------
-
-    async def _stream_reply(self, text: str, source: InboundMessage) -> AsyncIterator[OutboundReply]:
-        yield OutboundReply(
-            session_key=self.session_key,
-            text=text,
-            reply_to_message_id=source.message_id,
-            trace_id=source.trace_id,
-            is_partial=False,
         )
 
     # ------------------------------------------------------------------

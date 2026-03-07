@@ -3,10 +3,15 @@ bridges/cli/__main__.py — Interactive CLI bridge.
 
 Exposes run(gateway) for main.py loader.
 Can still be run standalone: python -m bridges.cli
+
+Streaming: partial chunks (is_partial=True) are printed inline without a
+newline as they arrive. The closing chunk (is_partial=False) prints the
+final newline and unblocks the input prompt.
 """
 from __future__ import annotations
 
 import asyncio
+import sys
 import time
 import logging
 
@@ -28,17 +33,36 @@ CLI_SESSION = SessionKey.dm(CLI_USER_ID)
 class CLIBridge:
     def __init__(self, gateway) -> None:
         self._gateway    = gateway
-        self._prompt     = PromptSession()
-        self._reply_buf: list[str] = []
-        self._reply_done = asyncio.Event()  # set when a full reply has arrived
+        self._reply_done = asyncio.Event()
+        self._started    = False  # True once we've printed "agent: " prefix
 
     async def handle_reply(self, reply: OutboundReply) -> None:
-        self._reply_buf.append(reply.text)
-        if not reply.is_partial:
-            full = "".join(self._reply_buf)
-            self._reply_buf.clear()
-            print(f"\nagent: {full}\n")
-            self._reply_done.set()  # unblock the input loop
+        if reply.is_partial:
+            # First partial chunk of a new reply — print the "agent: " prefix.
+            if not self._started:
+                # Print prefix without newline; flush immediately so it appears
+                # before the first word streams in.
+                print("\nagent: ", end="", flush=True)
+                self._started = True
+            # Stream the token directly to stdout, no newline.
+            print(reply.text, end="", flush=True)
+        else:
+            # Final chunk — close the line.
+            if self._started:
+                # Streaming reply: we already printed the prefix + tokens,
+                # just add the closing newline.
+                if reply.text:
+                    # Non-streaming fallback path: text arrived all at once.
+                    print(f"\nagent: {reply.text}")
+                else:
+                    print()  # close the streamed line
+            else:
+                # No partials arrived (e.g. error path) — print the whole thing.
+                print(f"\nagent: {reply.text}")
+
+            print()  # blank line after each reply for readability
+            self._started = False
+            self._reply_done.set()
 
     async def run(self) -> None:
         self._gateway.register_reply_handler(Platform.CLI.value, self.handle_reply)
@@ -47,7 +71,7 @@ class CLIBridge:
         with patch_stdout():
             while True:
                 try:
-                    text = await self._prompt.prompt_async("you: ")
+                    text = await PromptSession().prompt_async("you: ")
                 except (KeyboardInterrupt, EOFError):
                     print("\nBye.")
                     break
@@ -60,7 +84,7 @@ class CLIBridge:
                     break
                 if text.lower() == "/reset":
                     self._gateway.reset_session(CLI_SESSION)
-                    self._reply_buf.clear()
+                    self._started = False
                     print("\n[context cleared]\n")
                     continue
 
@@ -73,8 +97,6 @@ class CLIBridge:
                     timestamp=time.time(),
                 )
 
-                # Reset the event, send the message, then wait for the reply
-                # before showing the prompt again.
                 self._reply_done.clear()
                 await self._gateway.push(msg)
                 await self._reply_done.wait()

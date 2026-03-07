@@ -56,11 +56,22 @@ def _make_msg(text="hello", session_key=None):
 
 
 async def _collect(agent, msg):
-    """Run the agent and collect all reply chunks."""
+    """Run the agent and collect all reply chunks (partials + final)."""
     chunks = []
     async for chunk in agent.run(msg):
         chunks.append(chunk)
     return chunks
+
+
+def _full_text(chunks):
+    """
+    Reassemble the full reply text from a list of chunks.
+    With streaming the agent yields many is_partial=True chunks (individual
+    tokens) then a closing is_partial=False chunk with text="".
+    Without streaming (error path) a single is_partial=False chunk carries
+    the full text. This helper handles both cases.
+    """
+    return "".join(c.text for c in chunks)
 
 
 def _text_stream(*texts):
@@ -173,14 +184,13 @@ class TestBasicReply:
     async def test_simple_text_reply(self, make_agent):
         agent = make_agent(_text_stream("hello back"))
         chunks = await _collect(agent, _make_msg("hello"))
-        assert len(chunks) == 1
-        assert chunks[0].text == "hello back"
+        assert _full_text(chunks) == "hello back"
 
     @pytest.mark.asyncio
     async def test_reply_is_outbound_reply(self, make_agent):
         agent = make_agent(_text_stream("hi"))
         chunks = await _collect(agent, _make_msg())
-        assert isinstance(chunks[0], OutboundReply)
+        assert all(isinstance(c, OutboundReply) for c in chunks)
 
     @pytest.mark.asyncio
     async def test_reply_session_key_matches(self, make_agent):
@@ -188,13 +198,13 @@ class TestBasicReply:
         agent = make_agent(_text_stream("hi"))
         agent.session_key = sk
         chunks = await _collect(agent, _make_msg(session_key=sk))
-        assert chunks[0].session_key == sk
+        assert chunks[-1].session_key == sk
 
     @pytest.mark.asyncio
     async def test_multi_chunk_text_assembled(self, make_agent):
         agent = make_agent(_text_stream("part1", " ", "part2"))
         chunks = await _collect(agent, _make_msg())
-        assert chunks[0].text == "part1 part2"
+        assert _full_text(chunks) == "part1 part2"
 
     @pytest.mark.asyncio
     async def test_turn_count_increments(self, make_agent):
@@ -340,7 +350,7 @@ class TestLLMErrors:
     async def test_llm_error_surfaces_in_reply(self, make_agent):
         agent = make_agent(_error_stream("HTTP 500: server error"))
         chunks = await _collect(agent, _make_msg("hi"))
-        assert any("LLM error" in c.text for c in chunks)
+        assert "LLM error" in _full_text(chunks)
 
     @pytest.mark.asyncio
     async def test_fallback_used_on_error(self, make_agent):
@@ -353,7 +363,7 @@ class TestLLMErrors:
         agent.config.llm.fallback_on.http_codes = [429]
 
         chunks = await _collect(agent, _make_msg("hi"))
-        assert chunks[0].text == "fallback answer"
+        assert _full_text(chunks) == "fallback answer"
 
     @pytest.mark.asyncio
     async def test_no_fallback_on_non_matching_code(self, make_agent):
@@ -367,8 +377,8 @@ class TestLLMErrors:
         agent.config.llm.fallback_on.http_codes = [429, 500]
 
         chunks = await _collect(agent, _make_msg("hi"))
-        assert "should not see this" not in chunks[0].text
-        assert "LLM error" in chunks[0].text
+        assert "should not see this" not in _full_text(chunks)
+        assert "LLM error" in _full_text(chunks)
 
     @pytest.mark.asyncio
     async def test_any_error_fallback(self, make_agent):
@@ -381,7 +391,7 @@ class TestLLMErrors:
         agent.config.llm.fallback_on.any_error = True
 
         chunks = await _collect(agent, _make_msg("hi"))
-        assert chunks[0].text == "fallback worked"
+        assert _full_text(chunks) == "fallback worked"
 
 
 # ---------------------------------------------------------------------------
