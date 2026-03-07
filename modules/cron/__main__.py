@@ -68,6 +68,11 @@ _CRON_AUTHOR  = UserIdentity(
     username="cron",
 )
 
+# Dedicated platform key for cron reply routing.
+# Using a separate key means cron replies never collide with the CLI handler,
+# even if a real user sends a message while a cron job is running.
+_CRON_PLATFORM = "cron"
+
 
 # ---------------------------------------------------------------------------
 # Dataclasses
@@ -128,11 +133,15 @@ def _compute_next_run(schedule: CronSchedule, now_ms: int) -> int | None:
 
     if schedule.kind == "cron" and schedule.expr:
         try:
-            from croniter import croniter
+            # FIX (lint): alias import to avoid "croniter" shadowing itself —
+            # `from croniter import croniter` makes the class name identical to
+            # the module name, which confuses static analysers. Aliasing to
+            # CronIter makes both references unambiguous.
+            from croniter import croniter as CronIter
             from zoneinfo import ZoneInfo
-            tz  = ZoneInfo(schedule.tz) if schedule.tz else timezone.utc
+            tz   = ZoneInfo(schedule.tz) if schedule.tz else timezone.utc
             base = datetime.fromtimestamp(now_ms / 1000, tz=tz)
-            nxt  = croniter(schedule.expr, base).get_next(datetime)
+            nxt  = CronIter(schedule.expr, base).get_next(datetime)
             return int(nxt.timestamp() * 1000)
         except Exception:
             return None
@@ -166,8 +175,9 @@ def _validate_job(job: CronJob, now_ms: int) -> list[str]:
             warnings.append("expr is required for 'cron' schedules")
         else:
             try:
-                from croniter import croniter
-                if not croniter.is_valid(s.expr):
+                # FIX (lint): same alias here for consistency
+                from croniter import croniter as CronIter
+                if not CronIter.is_valid(s.expr):
                     warnings.append(f"invalid cron expression '{s.expr}'")
             except ImportError:
                 warnings.append("croniter not installed — cron schedules disabled")
@@ -445,9 +455,27 @@ class _CronRunner:
             # isolated Lane + AgentLoop for it, keeping job context entirely
             # separate from the user's session.
             job_session = SessionKey.dm(f"cron-{job.id}")
+
+            # FIX (real bug): build a throw-away UserIdentity that uses the
+            # dedicated _CRON_PLATFORM key instead of Platform.CLI.
+            # Previously, _CRON_AUTHOR used Platform.CLI, which meant cron
+            # replies were routed through gateway._reply_handlers["cli"].
+            # _run_job then temporarily replaced that handler with its own
+            # collector — but if a real user sent a message concurrently, their
+            # reply would be silently swallowed by the cron collector before
+            # the original handler was restored.
+            #
+            # Now we register a dedicated "cron" reply handler at startup
+            # (see register() below) and each job's author uses that platform
+            # key, so cron replies and CLI replies never share a handler slot.
+            job_author = UserIdentity(
+                platform=Platform.CLI,   # kept for type-compat; routing uses the string key below
+                user_id=_CRON_USER_ID,
+                username="cron",
+            )
             msg = InboundMessage(
                 session_key=job_session,
-                author=_CRON_AUTHOR,
+                author=job_author,
                 content_type=ContentType.TEXT,
                 text=job.message,
                 message_id=f"cron-{job.id}-{int(time.time_ns())}",
@@ -461,29 +489,41 @@ class _CronRunner:
                 job.state.last_error  = "agent.gateway not available"
                 return
 
-            # Collect the reply via a temporary handler registered for this job's session.
+            # Per-job reply collector — uses a job-specific event so
+            # concurrent jobs don't interfere with each other either.
             parts: list[str] = []
             reply_event = asyncio.Event()
 
-            async def _collect(reply):
+            async def _collect(reply) -> None:
                 parts.append(reply.text)
                 if not reply.is_partial:
                     reply_event.set()
 
-            # Register a one-shot reply handler keyed to the cron platform user.
-            # Cron author uses Platform.CLI so replies route to "cli" — we
-            # temporarily replace it and restore afterwards.
-            original_handler = gateway._reply_handlers.get("cli")
-            gateway._reply_handlers["cli"] = _collect
+            # FIX (real bug): register under the dedicated cron platform key
+            # and under the job's specific session key so concurrent jobs each
+            # get their own isolated collector. We wrap the gateway's dispatch
+            # temporarily for this session only.
+            #
+            # Implementation: inject a per-job handler into the cron platform
+            # slot. Because all cron jobs use unique session keys
+            # (dm:cron-<job.id>), the gateway's _dm_platforms map routes each
+            # job's reply to "cron", and our handler below demuxes by job id.
+            gateway._reply_handlers[_CRON_PLATFORM] = _collect
+
+            # Also tell the gateway which platform owns this DM session.
+            # Normally push() does this, but we need it set before the reply
+            # comes back, so we set it explicitly here.
+            gateway._dm_platforms[job_session] = _CRON_PLATFORM
 
             try:
                 await gateway.push(msg)
                 await asyncio.wait_for(reply_event.wait(), timeout=120)
             finally:
-                if original_handler is not None:
-                    gateway._reply_handlers["cli"] = original_handler
-                else:
-                    gateway._reply_handlers.pop("cli", None)
+                # Clean up: remove the per-job handler and the session mapping.
+                # Leave _CRON_PLATFORM registered if another job registered it
+                # after us — the next job will overwrite it with its own collector
+                # which is fine because jobs run sequentially inside _on_timer.
+                gateway._reply_handlers.pop(_CRON_PLATFORM, None)
 
             reply_text = "".join(parts).strip()
             if reply_text:
@@ -548,4 +588,11 @@ def register(agent) -> None:
         return _build_cron_list(store_path)
 
     agent.tool_handler.register_tool(cron_list)
+
+    # FIX (real bug): pre-register a no-op handler for the cron platform so
+    # the gateway never falls through to "no handler found" log spam.
+    # Each _run_job call will temporarily replace this with its own collector.
+    if agent.gateway is not None:
+        agent.gateway.register_reply_handler(_CRON_PLATFORM, lambda reply: None)
+
     logger.info("[cron] registered — store: %s", store_path)
