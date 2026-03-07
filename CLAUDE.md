@@ -24,7 +24,7 @@ In the CLI bridge: type `/reset` to clear context, `exit` to quit.
 
 ## Architecture
 
-```
+```txt
 main.py
   └── loads bridges/* (any dir with __main__.py + config.bridges.<name>.enabled=true)
       └── each bridge calls gateway.push(InboundMessage)
@@ -100,7 +100,7 @@ Modules must not import from `gateway.py` or any bridge. They receive everything
 ## Modules reference
 
 | Module | What it does |
-|--------|-------------|
+| --------|-------------|
 | `memory` | Injects SOUL.md, AGENTS.md, MEMORY.md as system prompt on every turn. Edit files live — no restart needed. |
 | `filesystem` | Tools: `shell`, `view`, `create_file`, `str_replace`. Sandboxed to workspace. |
 | `web` | Tools: `web_search` (DuckDuckGo), `http_request`, `navigate`/`click`/`type_text` (Playwright), `screenshot`. |
