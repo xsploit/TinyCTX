@@ -92,6 +92,9 @@ class Config:
     logging:         LoggingConfig          = field(default_factory=LoggingConfig)
     max_tool_cycles: int                    = 10
     context:         int                    = 16384
+    # Catch-all for unknown top-level keys (e.g. mcp:, custom module config, etc.)
+    # Modules access this via agent.config.extra.get("mcp", {})
+    extra:           dict                   = field(default_factory=dict)
 
     def get_model_config(self, name: str) -> ModelConfig:
         """
@@ -130,6 +133,13 @@ def _parse_model(raw: dict) -> ModelConfig:
     )
 
 
+# Known top-level keys — everything else goes into Config.extra
+_KNOWN_KEYS = {
+    "models", "llm", "gateway", "bridges", "memory",
+    "logging", "max_tool_cycles", "context",
+}
+
+
 def load(path="config.yaml") -> Config:
     p = Path(path)
     if not p.exists():
@@ -151,18 +161,14 @@ def load(path="config.yaml") -> Config:
 
     # ------------------------------------------------------------------ llm routing
     llm_raw = raw.get("llm", {})
-    primary = llm_raw.get("primary", next(iter(models)))  # default to first model
+    primary = llm_raw.get("primary", next(iter(models)))
     if primary not in models:
-        raise ValueError(
-            f"llm.primary '{primary}' is not defined under models:"
-        )
+        raise ValueError(f"llm.primary '{primary}' is not defined under models:")
 
     fallback = list(llm_raw.get("fallback", []))
     for name in fallback:
         if name not in models:
-            raise ValueError(
-                f"llm.fallback entry '{name}' is not defined under models:"
-            )
+            raise ValueError(f"llm.fallback entry '{name}' is not defined under models:")
 
     fallback_on = _parse_fallback_on(llm_raw.get("fallback_on", {}))
 
@@ -184,6 +190,9 @@ def load(path="config.yaml") -> Config:
             options = {k: v for k, v in br.items() if k != "enabled"}
             bridges[name] = BridgeConfig(enabled=enabled, options=options)
 
+    # ------------------------------------------------------------------ extra
+    extra = {k: v for k, v in raw.items() if k not in _KNOWN_KEYS}
+
     return Config(
         models=models,
         llm=llm,
@@ -198,6 +207,7 @@ def load(path="config.yaml") -> Config:
         logging=LoggingConfig(level=log_raw.get("level", "INFO")),
         max_tool_cycles=int(raw.get("max_tool_cycles", 10)),
         context=int(raw.get("context", 16384)),
+        extra=extra,
     )
 
 

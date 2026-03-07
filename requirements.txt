@@ -4,3 +4,4 @@ aiohttp
 pyyaml
 playwright
 duckduckgo-search
+mcp
