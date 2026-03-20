@@ -67,10 +67,11 @@ def _format_results(results: list[dict], budget_tokens: int) -> str | None:
     Format hybrid search results as a <memory> XML block, respecting the
     token budget.
 
-    Chunks are included highest-score-first. Once adding the next chunk's
-    formatted block would exceed budget_tokens, it and all remaining chunks
-    are dropped and a truncation note is appended. Set budget_tokens=0 to
-    include all results unconditionally.
+    Chunks are included highest-score-first. The first (highest-scoring)
+    chunk is always included regardless of budget — a zero-result block is
+    never useful. Subsequent chunks are added until the next one would push
+    over the budget, at which point they are dropped and a truncation note
+    is appended. Set budget_tokens=0 to include all results unconditionally.
     """
     if not results:
         return None
@@ -79,23 +80,21 @@ def _format_results(results: list[dict], budget_tokens: int) -> str | None:
     footer   = "</memory>"
     overhead = _estimate_tokens(header + "\n\n" + footer)
 
-    blocks:        list[str] = []
-    used_tokens:   int       = overhead
-    dropped:       int       = 0
+    blocks:      list[str] = []
+    used_tokens: int       = overhead
+    dropped:     int       = 0
 
-    for r in results:
+    for i, r in enumerate(results):
         block = f"[{r['file']}]\n{r['text'].strip()}"
         cost  = _estimate_tokens(block + "\n\n")
 
-        if budget_tokens > 0 and used_tokens + cost > budget_tokens:
+        # Always include the first chunk; enforce budget from the second onward
+        if i > 0 and budget_tokens > 0 and used_tokens + cost > budget_tokens:
             dropped += 1
             continue
 
         blocks.append(block)
         used_tokens += cost
-
-    if not blocks:
-        return None
 
     parts = [header] + blocks + [footer]
     if dropped:
@@ -121,9 +120,6 @@ def register(agent) -> None:
     except ImportError:
         defaults = {}
 
-    # Module-level overrides live under a top-level extra key in config.yaml.
-    # The conventional key is "memory_search" to avoid collision with the
-    # core "workspace" block; use agent.config.extra.get("memory_search", {}).
     overrides: dict = {}
     if hasattr(agent.config, "extra") and isinstance(agent.config.extra, dict):
         overrides = agent.config.extra.get("memory_search", {})
@@ -178,16 +174,13 @@ def register(agent) -> None:
     bm25_weight = float(cfg["bm25_weight"])
     auto_inject = bool(cfg["auto_inject"])
 
-    # Chunking strategy
     from modules.memory.chunkers import get_strategy
     chunk_kwargs: dict = cfg.get("chunk_kwargs") or {}
     strategy = get_strategy(cfg["chunk_strategy"], **chunk_kwargs)
 
-    # Store
     from modules.memory.store import MemoryStore
     store = MemoryStore(db_path)
 
-    # Embedder (optional)
     embedder        = None
     embedding_model = cfg.get("embedding_model", "").strip()
 
@@ -209,7 +202,6 @@ def register(agent) -> None:
         else ""
     )
 
-    # Indexer
     from modules.memory.indexer import MemoryIndexer
     indexer = MemoryIndexer(
         store           = store,
@@ -224,10 +216,8 @@ def register(agent) -> None:
     # ------------------------------------------------------------------
 
     async def _pre_assemble_async(ctx) -> None:
-        # a. Sync index (lazy — no-op if nothing is dirty)
         await indexer.sync()
 
-        # b. Extract last user message as search query
         query = ""
         for entry in reversed(ctx.dialogue):
             if entry.role == "user":
@@ -238,7 +228,6 @@ def register(agent) -> None:
             ctx.state["memory_search_results"] = []
             return
 
-        # c. Embed query (None → BM25-only path in hybrid_search)
         query_vector = None
         if embedder is not None:
             try:
@@ -246,7 +235,6 @@ def register(agent) -> None:
             except Exception as exc:
                 logger.warning("[memory] query embedding failed: %s — using BM25 only", exc)
 
-        # d. Hybrid search → store in ctx.state for prompt provider + tool
         results = store.hybrid_search(query, query_vector, top_k, bm25_weight)
         ctx.state["memory_search_results"] = results
 
@@ -310,7 +298,6 @@ def register(agent) -> None:
         if not results:
             return "[no memory found for that query]"
 
-        # Apply budget — tool output shouldn't be unbounded either
         formatted = _format_results(results, budget_tokens)
         if formatted is None:
             return "[no memory found for that query]"
