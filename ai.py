@@ -1,5 +1,5 @@
 """
-ai.py — Async OpenAI-compatible LLM client.
+ai.py — Async OpenAI-compatible LLM and Embedder clients.
 Streams SSE, assembles tool call deltas, yields typed events.
 Imports only aiohttp and stdlib. No internal project imports.
 """
@@ -36,7 +36,7 @@ LLMEvent = TextDelta | ToolCallAssembled | LLMError
 
 
 # ---------------------------------------------------------------------------
-# Client
+# Chat client
 # ---------------------------------------------------------------------------
 
 class LLM:
@@ -90,21 +90,18 @@ class LLM:
         # Accumulate tool call fragments keyed by index
         # { index: {"id": str, "name": str, "args_buf": str} }
         tool_buf: dict[int, dict] = {}
-        # in LLM.stream(), right before the aiohttp call
-        # print(f"[debug] hitting: {self.endpoint}")
+
         try:
             async with aiohttp.ClientSession(timeout=self.timeout) as session:
                 async with session.post(
                     self.endpoint, headers=headers, json=payload
                 ) as resp:
-                    # print(f"[debug] status: {resp.status}")
                     if resp.status != 200:
                         body = await resp.text()
                         yield LLMError(f"HTTP {resp.status}: {body}")
                         return
 
                     async for raw in resp.content:
-                        # print(f"[debug] raw: {raw}")
                         line = raw.decode().strip()
                         if not line.startswith("data: "):
                             continue
@@ -154,3 +151,94 @@ class LLM:
             yield LLMError(f"Connection failed: {e}")
         except Exception as e:
             yield LLMError(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Embedding client
+# ---------------------------------------------------------------------------
+
+class Embedder:
+    """
+    Async OpenAI-compatible embedding client.
+    Calls /v1/embeddings and returns float vectors.
+
+    Works with any server that speaks the OpenAI embeddings API:
+      - OpenAI          base_url = https://api.openai.com/v1
+      - llama-swap      base_url = http://localhost:8080/v1
+      - Ollama          base_url = http://localhost:11434/v1
+      - LM Studio       base_url = http://localhost:1234/v1
+
+    Usage:
+        embedder = Embedder.from_config(agent.config.get_embedding_model("embed"))
+        vectors = await embedder.embed(["hello", "world"])
+    """
+
+    def __init__(
+        self,
+        base_url:   str,
+        api_key:    str,
+        model:      str,
+        batch_size: int = 32,
+        timeout:    int = 60,
+    ) -> None:
+        self.model      = model
+        self.endpoint   = f"{base_url.rstrip('/')}/embeddings"
+        self.api_key    = api_key
+        self.batch_size = batch_size
+        self.timeout    = aiohttp.ClientTimeout(total=timeout)
+
+    @classmethod
+    def from_config(cls, cfg: "ModelConfig", batch_size: int = 32, timeout: int = 60) -> "Embedder":  # noqa: F821
+        """Build an Embedder from a ModelConfig with kind='embedding'."""
+        api_key = cfg.api_key  # resolves from env or returns "" for N/A
+        return cls(
+            base_url=cfg.base_url,
+            api_key=api_key,
+            model=cfg.model,
+            batch_size=batch_size,
+            timeout=timeout,
+        )
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        """
+        Embed a list of strings. Returns one float vector per input text,
+        in the same order as the input. Batches automatically.
+
+        Raises RuntimeError on API error.
+        """
+        if not texts:
+            return []
+
+        results: list[list[float]] = []
+        for i in range(0, len(texts), self.batch_size):
+            batch = texts[i : i + self.batch_size]
+            results.extend(await self._call(batch))
+        return results
+
+    async def embed_one(self, text: str) -> list[float]:
+        """Convenience wrapper — embed a single string."""
+        vecs = await self.embed([text])
+        return vecs[0]
+
+    async def _call(self, texts: list[str]) -> list[list[float]]:
+        payload = {"model": self.model, "input": texts}
+        headers = {
+            "Content-Type":  "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+
+        try:
+            async with aiohttp.ClientSession(timeout=self.timeout) as session:
+                async with session.post(
+                    self.endpoint, headers=headers, json=payload
+                ) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        raise RuntimeError(f"Embedding API HTTP {resp.status}: {body}")
+                    data = await resp.json()
+        except aiohttp.ClientConnectionError as e:
+            raise RuntimeError(f"Embedding API connection failed: {e}") from e
+
+        # Sort by index to guarantee order matches input regardless of server behaviour
+        items = sorted(data["data"], key=lambda x: x["index"])
+        return [item["embedding"] for item in items]

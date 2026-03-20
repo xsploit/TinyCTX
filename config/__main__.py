@@ -11,11 +11,19 @@ import yaml
 
 @dataclass
 class ModelConfig:
-    """One named model entry under models:"""
+    """
+    One named model entry under models:.
+
+    kind controls how the model is used:
+      "chat"      — standard /v1/chat/completions  (default)
+      "embedding" — /v1/embeddings, used by modules like memory/rag.
+                    max_tokens and temperature are ignored for embeddings.
+    """
     model:       str
     base_url:    str
-    api_key_env: str  = "ANTHROPIC_API_KEY"
-    max_tokens:  int  = 2048
+    kind:        str   = "chat"       # "chat" | "embedding"
+    api_key_env: str   = "ANTHROPIC_API_KEY"
+    max_tokens:  int   = 2048
     temperature: float = 0.7
 
     @property
@@ -25,9 +33,13 @@ class ModelConfig:
         key = os.environ.get(self.api_key_env, "").strip()
         if not key:
             raise EnvironmentError(
-                f"LLM API key not set. Export {self.api_key_env} before starting."
+                f"API key not set. Export {self.api_key_env} before starting."
             )
         return key
+
+    @property
+    def is_embedding(self) -> bool:
+        return self.kind.lower() == "embedding"
 
 
 @dataclass
@@ -111,6 +123,22 @@ class Config:
             f"Model '{name}' not found and primary '{primary}' is also missing."
         )
 
+    def get_embedding_model(self, name: str) -> ModelConfig:
+        """
+        Return a ModelConfig that must be kind='embedding'.
+        Raises ValueError if the name resolves to a chat model.
+        Raises KeyError if the name is not in models at all.
+        """
+        if name not in self.models:
+            raise KeyError(f"Embedding model '{name}' is not defined under models:")
+        cfg = self.models[name]
+        if not cfg.is_embedding:
+            raise ValueError(
+                f"Model '{name}' has kind='{cfg.kind}', expected 'embedding'. "
+                "Add 'kind: embedding' to its models: entry."
+            )
+        return cfg
+
 
 def _parse_fallback_on(raw: dict) -> FallbackOnConfig:
     return FallbackOnConfig(
@@ -124,9 +152,13 @@ def _parse_model(raw: dict) -> ModelConfig:
         raise ValueError("Model config missing required field: base_url")
     if not raw.get("model"):
         raise ValueError("Model config missing required field: model")
+    kind = raw.get("kind", "chat").lower()
+    if kind not in ("chat", "embedding"):
+        raise ValueError(f"Model kind must be 'chat' or 'embedding', got '{kind}'")
     return ModelConfig(
         model=raw["model"],
         base_url=raw["base_url"],
+        kind=kind,
         api_key_env=raw.get("api_key_env", "ANTHROPIC_API_KEY"),
         max_tokens=int(raw.get("max_tokens", 2048)),
         temperature=float(raw.get("temperature", 0.7)),
@@ -160,15 +192,25 @@ def load(path="config.yaml") -> Config:
             raise ValueError(f"models.{name}: {exc}") from exc
 
     # ------------------------------------------------------------------ llm routing
+    # Only chat models are eligible for the llm: routing block.
+    chat_models = {n for n, m in models.items() if not m.is_embedding}
+
     llm_raw = raw.get("llm", {})
-    primary = llm_raw.get("primary", next(iter(models)))
-    if primary not in models:
-        raise ValueError(f"llm.primary '{primary}' is not defined under models:")
+    primary = llm_raw.get("primary", next(iter(n for n in models if not models[n].is_embedding), None))
+    if primary is None:
+        raise ValueError("No chat models defined. At least one model without 'kind: embedding' is required.")
+    if primary not in chat_models:
+        raise ValueError(
+            f"llm.primary '{primary}' is not a chat model. "
+            "Embedding models cannot be used as the primary LLM."
+        )
 
     fallback = list(llm_raw.get("fallback") or [])
     for name in fallback:
-        if name not in models:
-            raise ValueError(f"llm.fallback entry '{name}' is not defined under models:")
+        if name not in chat_models:
+            raise ValueError(
+                f"llm.fallback entry '{name}' is either not defined or is an embedding model."
+            )
 
     fallback_on = _parse_fallback_on(llm_raw.get("fallback_on", {}))
 

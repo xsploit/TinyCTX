@@ -6,3 +6,5 @@ playwright
 duckduckgo-search
 mcp
 prompt_toolkit
+sqlite3
+numpy

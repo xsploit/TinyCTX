@@ -4,6 +4,9 @@
 context: 16384
 
 # Named model definitions — add as many as you need.
+# kind: chat      (default) — used for /v1/chat/completions
+# kind: embedding           — used for /v1/embeddings (memory, RAG, etc.)
+#                             max_tokens and temperature are ignored for embeddings.
 models:
   smart:
     base_url: https://api.anthropic.com/v1
@@ -26,7 +29,16 @@ models:
     max_tokens: 8192
     temperature: 0.6
 
+  # Embedding model — referenced by name in module configs (e.g. memory, rag).
+  # Not eligible for llm: routing. kind: embedding is required.
+  embed:
+    kind: embedding
+    base_url: http://localhost:11434/v1
+    api_key_env: N/A
+    model: nomic-embed-text
+
 # LLM routing — which model to use and when to fall back.
+# Only chat models (kind: chat or no kind) are allowed here.
 llm:
   primary: smart              # key into models: above
   fallback:
