@@ -25,6 +25,7 @@ Job schema (CRON.json):
         },
         "message":        "Check calendar and summarise today's agenda.",
         "delete_after_run": false,
+        "reset_after_run":  false,          // wipe this job's session context after each run
         "state": {
           "next_run_at_ms": 1234567890000,
           "last_run_at_ms": null,
@@ -62,16 +63,19 @@ from contracts import (
 logger = logging.getLogger(__name__)
 
 _CRON_USER_ID = "cron-system"
-_CRON_AUTHOR  = UserIdentity(
-    platform=Platform.CLI,
+
+# Platform.CRON is a dedicated enum value in contracts.py so that
+# gateway._dispatch_reply resolves the platform from author.platform.value
+# (via _dm_platforms populated by push()) without any overwrite risk.
+# Previously Platform.CLI was (ab)used here, causing push() to store "cli"
+# in _dm_platforms and route replies to the wrong handler.
+_CRON_PLATFORM = Platform.CRON.value  # "cron"
+
+_CRON_AUTHOR = UserIdentity(
+    platform=Platform.CRON,
     user_id=_CRON_USER_ID,
     username="cron",
 )
-
-# Dedicated platform key for cron reply routing.
-# Using a separate key means cron replies never collide with the CLI handler,
-# even if a real user sends a message while a cron job is running.
-_CRON_PLATFORM = "cron"
 
 
 # ---------------------------------------------------------------------------
@@ -97,15 +101,16 @@ class CronState:
 
 @dataclass
 class CronJob:
-    id:              str
-    name:            str
-    enabled:         bool
-    schedule:        CronSchedule
-    message:         str
-    state:           CronState       = field(default_factory=CronState)
-    delete_after_run: bool           = False
-    created_at_ms:   int             = 0
-    updated_at_ms:   int             = 0
+    id:               str
+    name:             str
+    enabled:          bool
+    schedule:         CronSchedule
+    message:          str
+    state:            CronState  = field(default_factory=CronState)
+    delete_after_run: bool       = False
+    reset_after_run:  bool       = False   # wipe session context after each run
+    created_at_ms:    int        = 0
+    updated_at_ms:    int        = 0
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +232,7 @@ def _load_store(path: Path) -> tuple[list[CronJob], int]:
                     last_error=st.get("last_error"),
                 ),
                 delete_after_run=j.get("delete_after_run", False),
+                reset_after_run=j.get("reset_after_run", False),
                 created_at_ms=j.get("created_at_ms", 0),
                 updated_at_ms=j.get("updated_at_ms", 0),
             ))
@@ -254,6 +260,7 @@ def _save_store(path: Path, jobs: list[CronJob], version: int = 1) -> None:
                 },
                 "message": j.message,
                 "delete_after_run": j.delete_after_run,
+                "reset_after_run":  j.reset_after_run,
                 "state": {
                     "next_run_at_ms": j.state.next_run_at_ms,
                     "last_run_at_ms": j.state.last_run_at_ms,
@@ -357,6 +364,11 @@ class _CronRunner:
     Watches CRON.json for changes and fires due jobs.
     Each job is pushed through the gateway so it gets its own isolated Lane
     and AgentLoop — job context never bleeds into the user's session.
+
+    Concurrency model: jobs within a single tick run sequentially under
+    _job_lock, so the shared _CRON_PLATFORM reply-handler slot is never
+    contested between jobs. Ticks themselves are serialised because _arm()
+    only schedules the next tick after _on_timer() completes.
     """
 
     def __init__(self, agent, store_path: Path) -> None:
@@ -367,6 +379,9 @@ class _CronRunner:
         self._last_mtime: float         = 0.0
         self._timer_task: asyncio.Task | None = None
         self._running     = False
+        # Serialises job execution so the cron reply-handler slot is never
+        # shared between two concurrently-running jobs.
+        self._job_lock    = asyncio.Lock()
 
     def start(self) -> None:
         self._running = True
@@ -441,7 +456,8 @@ class _CronRunner:
         ]
 
         for job in due:
-            await self._run_job(job)
+            async with self._job_lock:
+                await self._run_job(job)
 
         self._save()
         self._arm()
@@ -450,32 +466,17 @@ class _CronRunner:
         logger.info("[cron] running job '%s' (%s)", job.name, job.id)
         start_ms = _now_ms()
 
-        try:
-            # Each job gets its own session key — the gateway will create an
-            # isolated Lane + AgentLoop for it, keeping job context entirely
-            # separate from the user's session.
-            job_session = SessionKey.dm(f"cron-{job.id}")
+        # Each job gets its own persistent session key so its AgentLoop
+        # context is isolated from the user's session and from other jobs.
+        job_session = SessionKey.dm(f"cron-{job.id}")
 
-            # FIX (real bug): build a throw-away UserIdentity that uses the
-            # dedicated _CRON_PLATFORM key instead of Platform.CLI.
-            # Previously, _CRON_AUTHOR used Platform.CLI, which meant cron
-            # replies were routed through gateway._reply_handlers["cli"].
-            # _run_job then temporarily replaced that handler with its own
-            # collector — but if a real user sent a message concurrently, their
-            # reply would be silently swallowed by the cron collector before
-            # the original handler was restored.
-            #
-            # Now we register a dedicated "cron" reply handler at startup
-            # (see register() below) and each job's author uses that platform
-            # key, so cron replies and CLI replies never share a handler slot.
-            job_author = UserIdentity(
-                platform=Platform.CLI,   # kept for type-compat; routing uses the string key below
-                user_id=_CRON_USER_ID,
-                username="cron",
-            )
+        try:
+            # _CRON_AUTHOR uses Platform.CRON so gateway.push() stores
+            # "cron" in _dm_platforms[job_session] — replies are then
+            # dispatched to the "cron" handler, never the "cli" handler.
             msg = InboundMessage(
                 session_key=job_session,
-                author=job_author,
+                author=_CRON_AUTHOR,
                 content_type=ContentType.TEXT,
                 text=job.message,
                 message_id=f"cron-{job.id}-{int(time.time_ns())}",
@@ -489,8 +490,6 @@ class _CronRunner:
                 job.state.last_error  = "agent.gateway not available"
                 return
 
-            # Per-job reply collector — uses a job-specific event so
-            # concurrent jobs don't interfere with each other either.
             parts: list[str] = []
             reply_event = asyncio.Event()
 
@@ -499,31 +498,17 @@ class _CronRunner:
                 if not reply.is_partial:
                     reply_event.set()
 
-            # FIX (real bug): register under the dedicated cron platform key
-            # and under the job's specific session key so concurrent jobs each
-            # get their own isolated collector. We wrap the gateway's dispatch
-            # temporarily for this session only.
-            #
-            # Implementation: inject a per-job handler into the cron platform
-            # slot. Because all cron jobs use unique session keys
-            # (dm:cron-<job.id>), the gateway's _dm_platforms map routes each
-            # job's reply to "cron", and our handler below demuxes by job id.
+            # Install per-job collector into the dedicated cron handler slot.
+            # _job_lock (held by the caller) guarantees only one job is active
+            # at a time, so this slot is never shared between concurrent jobs.
             gateway._reply_handlers[_CRON_PLATFORM] = _collect
-
-            # Also tell the gateway which platform owns this DM session.
-            # Normally push() does this, but we need it set before the reply
-            # comes back, so we set it explicitly here.
-            gateway._dm_platforms[job_session] = _CRON_PLATFORM
 
             try:
                 await gateway.push(msg)
                 await asyncio.wait_for(reply_event.wait(), timeout=120)
             finally:
-                # Clean up: remove the per-job handler and the session mapping.
-                # Leave _CRON_PLATFORM registered if another job registered it
-                # after us — the next job will overwrite it with its own collector
-                # which is fine because jobs run sequentially inside _on_timer.
-                gateway._reply_handlers.pop(_CRON_PLATFORM, None)
+                # Restore the no-op sentinel so the slot is never empty.
+                gateway._reply_handlers[_CRON_PLATFORM] = _noop_reply_handler
 
             reply_text = "".join(parts).strip()
             if reply_text:
@@ -545,6 +530,13 @@ class _CronRunner:
         job.state.last_run_at_ms = start_ms
         job.updated_at_ms        = _now_ms()
 
+        # reset_after_run: wipe session context so the next run starts fresh.
+        if job.reset_after_run:
+            gateway = getattr(self._agent, "gateway", None)
+            if gateway is not None:
+                gateway.reset_session(job_session)
+                logger.debug("[cron] reset session for job '%s'", job.name)
+
         # One-shot cleanup
         if job.schedule.kind == "at":
             if job.delete_after_run:
@@ -554,6 +546,15 @@ class _CronRunner:
                 job.state.next_run_at_ms = None
         else:
             job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
+
+
+# ---------------------------------------------------------------------------
+# Module-level no-op handler — installed as the cron platform sentinel
+# so the slot is never empty between job runs.
+# ---------------------------------------------------------------------------
+
+async def _noop_reply_handler(reply) -> None:
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -589,10 +590,9 @@ def register(agent) -> None:
 
     agent.tool_handler.register_tool(cron_list)
 
-    # FIX (real bug): pre-register a no-op handler for the cron platform so
-    # the gateway never falls through to "no handler found" log spam.
-    # Each _run_job call will temporarily replace this with its own collector.
+    # Pre-register the no-op sentinel so the gateway never logs
+    # "no handler found" between job runs.
     if agent.gateway is not None:
-        agent.gateway.register_reply_handler(_CRON_PLATFORM, lambda reply: None)
+        agent.gateway.register_reply_handler(_CRON_PLATFORM, _noop_reply_handler)
 
     logger.info("[cron] registered — store: %s", store_path)

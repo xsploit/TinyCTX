@@ -19,6 +19,7 @@ class Platform(str, Enum):
     CLI     = "cli"
     DISCORD = "discord"
     MATRIX  = "matrix"
+    CRON    = "cron"   # internal platform for scheduled cron jobs
 
 
 class ContentType(str, Enum):
