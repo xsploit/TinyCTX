@@ -19,7 +19,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from contracts import (
-    SessionKey, UserIdentity, InboundMessage, OutboundReply,
+    SessionKey, UserIdentity, InboundMessage,
+    AgentTextChunk, AgentTextFinal, AgentError,
     Platform, ContentType, ToolCall, ToolResult,
 )
 from context import HistoryEntry
@@ -65,13 +66,12 @@ async def _collect(agent, msg):
 
 def _full_text(chunks):
     """
-    Reassemble the full reply text from a list of chunks.
-    With streaming the agent yields many is_partial=True chunks (individual
-    tokens) then a closing is_partial=False chunk with text="".
-    Without streaming (error path) a single is_partial=False chunk carries
-    the full text. This helper handles both cases.
+    Reassemble the full reply text from a list of agent events.
+    AgentTextChunk events are streaming tokens; AgentTextFinal closes the
+    stream (text may be empty sentinel or full text on non-streaming path);
+    AgentError carries an error message.
     """
-    return "".join(c.text for c in chunks)
+    return "".join(c.text if hasattr(c, 'text') else c.message for c in chunks)
 
 
 def _text_stream(*texts):
@@ -187,10 +187,10 @@ class TestBasicReply:
         assert _full_text(chunks) == "hello back"
 
     @pytest.mark.asyncio
-    async def test_reply_is_outbound_reply(self, make_agent):
+    async def test_reply_is_agent_event(self, make_agent):
         agent = make_agent(_text_stream("hi"))
         chunks = await _collect(agent, _make_msg())
-        assert all(isinstance(c, OutboundReply) for c in chunks)
+        assert all(isinstance(c, (AgentTextChunk, AgentTextFinal, AgentError)) for c in chunks)
 
     @pytest.mark.asyncio
     async def test_reply_session_key_matches(self, make_agent):
@@ -337,7 +337,8 @@ class TestToolExecution:
 
         agent.tool_handler.register_tool(loop_tool)
         chunks = await _collect(agent, _make_msg("go"))
-        assert any("cycle limit" in c.text.lower() or "tool" in c.text.lower() for c in chunks)
+        text_chunks = [c for c in chunks if isinstance(c, (AgentTextChunk, AgentTextFinal, AgentError))]
+        assert any("cycle limit" in c.text.lower() or "tool" in c.text.lower() for c in text_chunks)
         assert always_tool_count["n"] <= 3
 
 

@@ -9,7 +9,8 @@ Run with:
 """
 import pytest
 from contracts import (
-    SessionKey, UserIdentity, InboundMessage, OutboundReply,
+    SessionKey, UserIdentity, InboundMessage,
+    AgentTextFinal, AgentError,
     ToolCall, ToolResult,
     Platform, ContentType, ChatType,
 )
@@ -109,6 +110,10 @@ class TestPlatform:
         assert Platform.CLI.value == "cli"
         assert Platform.DISCORD.value == "discord"
         assert Platform.MATRIX.value == "matrix"
+        assert Platform.CRON.value == "cron"
+        assert Platform.API.value == "api"
 
     def test_platform_from_value(self):
         assert Platform("cli") == Platform.CLI
+        assert Platform("cron") == Platform.CRON
+        assert Platform("api") == Platform.API

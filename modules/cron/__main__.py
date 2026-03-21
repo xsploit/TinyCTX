@@ -493,22 +493,29 @@ class _CronRunner:
             parts: list[str] = []
             reply_event = asyncio.Event()
 
-            async def _collect(reply) -> None:
-                parts.append(reply.text)
-                if not reply.is_partial:
+            async def _collect(event) -> None:
+                from contracts import AgentTextChunk, AgentTextFinal, AgentError
+                if isinstance(event, AgentTextChunk):
+                    parts.append(event.text)
+                elif isinstance(event, AgentTextFinal):
+                    if event.text:
+                        parts.append(event.text)
+                    reply_event.set()
+                elif isinstance(event, AgentError):
+                    parts.append(event.message)
                     reply_event.set()
 
             # Install per-job collector into the dedicated cron handler slot.
             # _job_lock (held by the caller) guarantees only one job is active
             # at a time, so this slot is never shared between concurrent jobs.
-            gateway._reply_handlers[_CRON_PLATFORM] = _collect
+            gateway._platform_handlers[_CRON_PLATFORM] = _collect
 
             try:
                 await gateway.push(msg)
                 await asyncio.wait_for(reply_event.wait(), timeout=120)
             finally:
                 # Restore the no-op sentinel so the slot is never empty.
-                gateway._reply_handlers[_CRON_PLATFORM] = _noop_reply_handler
+                gateway._platform_handlers[_CRON_PLATFORM] = _noop_reply_handler
 
             reply_text = "".join(parts).strip()
             if reply_text:

@@ -1,10 +1,10 @@
 """
 tests/test_gateway.py
 
-Tests for Gateway, SessionRouter, and Lane.
+Tests for Router, _SessionRouter, and Lane.
 
 We avoid starting real AgentLoops (which need config, LLMs, modules, etc.)
-by monkey-patching Lane.__post_init__ and AgentLoop.run so the gateway's
+by monkey-patching Lane.__post_init__ and AgentLoop.run so the router's
 routing and dispatch logic can be tested in pure isolation.
 
 Run with:
@@ -14,10 +14,11 @@ import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from contracts import (
-    SessionKey, UserIdentity, InboundMessage, OutboundReply,
+    SessionKey, UserIdentity, InboundMessage,
+    AgentTextFinal, AgentError,
     Platform, ContentType, ChatType,
 )
-from gateway import Gateway, Lane, SessionRouter
+from router import Router, Lane, _SessionRouter
 
 
 # ---------------------------------------------------------------------------
@@ -25,14 +26,14 @@ from gateway import Gateway, Lane, SessionRouter
 # ---------------------------------------------------------------------------
 
 def _make_config():
-    """Minimal Config stub — gateway only needs a few fields."""
+    """Minimal Config stub — router only needs a few fields."""
     cfg = MagicMock()
     cfg.models = {"primary": MagicMock()}
     cfg.llm.primary = "primary"
     cfg.llm.fallback = []
     cfg.context = 4096
     cfg.max_tool_cycles = 5
-    cfg.memory.workspace_path = "/tmp/tinyctx_test"
+    cfg.workspace.path = "/tmp/tinyctx_test"
     return cfg
 
 
@@ -51,24 +52,23 @@ def _make_msg(session_key, text="hello", user_id="u1", platform=Platform.CLI):
     )
 
 
-def _make_reply(session_key, text="hi"):
-    return OutboundReply(
+def _make_final(session_key, text="hi"):
+    return AgentTextFinal(
         session_key=session_key,
         text=text,
         reply_to_message_id="msg-1",
         trace_id="trace-1",
-        is_partial=False,
     )
 
 
 # ---------------------------------------------------------------------------
-# Fixture: a Gateway with AgentLoop stubbed out
+# Fixture: a Router with AgentLoop stubbed out
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
 def gw():
     """
-    Gateway with AgentLoop creation patched to a no-op stub.
+    Router with AgentLoop creation patched to a no-op stub.
     The stub's run() is an async generator that yields nothing by default —
     tests can override it per-scenario.
     """
@@ -78,32 +78,55 @@ def gw():
         return
         yield  # make it an async generator
 
-    with patch("gateway.AgentLoop") as MockLoop:
+    with patch("router.AgentLoop") as MockLoop:
         instance = MagicMock()
         instance.run = _noop_run
         instance.gateway = None
         instance.reset = MagicMock()
         MockLoop.return_value = instance
-        gw = Gateway(config=cfg)
-        gw._mock_loop_instance = instance
-        yield gw
+        router = Router(config=cfg)
+        router._mock_loop_instance = instance
+        yield router
 
 
 # ---------------------------------------------------------------------------
-# Reply handler registration
+# Handler registration
 # ---------------------------------------------------------------------------
 
-class TestReplyHandlerRegistration:
-    def test_register_handler(self, gw):
+class TestHandlerRegistration:
+    def test_register_platform_handler(self, gw):
+        handler = AsyncMock()
+        gw.register_platform_handler("cli", handler)
+        assert "cli" in gw._platform_handlers
+
+    def test_register_reply_handler_alias(self, gw):
+        """register_reply_handler is an alias for register_platform_handler."""
         handler = AsyncMock()
         gw.register_reply_handler("cli", handler)
-        assert "cli" in gw._reply_handlers
+        assert "cli" in gw._platform_handlers
+
+    def test_register_session_handler(self, gw):
+        sk = SessionKey.dm("u1")
+        handler = AsyncMock()
+        gw.register_session_handler(sk, handler)
+        assert sk in gw._session_handlers
+
+    def test_unregister_session_handler(self, gw):
+        sk = SessionKey.dm("u1")
+        handler = AsyncMock()
+        gw.register_session_handler(sk, handler)
+        gw.unregister_session_handler(sk)
+        assert sk not in gw._session_handlers
+
+    def test_unregister_nonexistent_is_noop(self, gw):
+        sk = SessionKey.dm("nobody")
+        gw.unregister_session_handler(sk)  # should not raise
 
     def test_register_multiple_platforms(self, gw):
-        gw.register_reply_handler("cli", AsyncMock())
-        gw.register_reply_handler("discord", AsyncMock())
-        assert "cli" in gw._reply_handlers
-        assert "discord" in gw._reply_handlers
+        gw.register_platform_handler("cli", AsyncMock())
+        gw.register_platform_handler("discord", AsyncMock())
+        assert "cli" in gw._platform_handlers
+        assert "discord" in gw._platform_handlers
 
 
 # ---------------------------------------------------------------------------
@@ -114,43 +137,43 @@ class TestSessionRouting:
     @pytest.mark.asyncio
     async def test_dm_creates_lane(self, gw):
         sk = SessionKey.dm("u1")
-        gw.register_reply_handler("cli", AsyncMock())
+        gw.register_platform_handler("cli", AsyncMock())
         await gw.push(_make_msg(sk))
-        await asyncio.sleep(0)  # let the event loop tick
-        assert sk in gw._router._lanes
+        await asyncio.sleep(0)
+        assert sk in gw._session_router._lanes
 
     @pytest.mark.asyncio
     async def test_group_creates_lane(self, gw):
         sk = SessionKey.group(Platform.DISCORD, "ch1")
-        gw.register_reply_handler("discord", AsyncMock())
+        gw.register_platform_handler("discord", AsyncMock())
         await gw.push(_make_msg(sk, platform=Platform.DISCORD))
         await asyncio.sleep(0)
-        assert sk in gw._router._lanes
+        assert sk in gw._session_router._lanes
 
     @pytest.mark.asyncio
     async def test_same_session_reuses_lane(self, gw):
         sk = SessionKey.dm("u1")
-        gw.register_reply_handler("cli", AsyncMock())
+        gw.register_platform_handler("cli", AsyncMock())
         await gw.push(_make_msg(sk, text="first"))
         await gw.push(_make_msg(sk, text="second"))
         await asyncio.sleep(0)
-        assert len(gw._router._lanes) == 1
+        assert len(gw._session_router._lanes) == 1
 
     @pytest.mark.asyncio
     async def test_different_dm_sessions_get_different_lanes(self, gw):
         sk1 = SessionKey.dm("u1")
         sk2 = SessionKey.dm("u2")
-        gw.register_reply_handler("cli", AsyncMock())
+        gw.register_platform_handler("cli", AsyncMock())
         await gw.push(_make_msg(sk1, user_id="u1"))
         await gw.push(_make_msg(sk2, user_id="u2"))
         await asyncio.sleep(0)
-        assert len(gw._router._lanes) == 2
+        assert len(gw._session_router._lanes) == 2
 
     @pytest.mark.asyncio
     async def test_active_sessions_reflects_lanes(self, gw):
         sk1 = SessionKey.dm("u1")
         sk2 = SessionKey.dm("u2")
-        gw.register_reply_handler("cli", AsyncMock())
+        gw.register_platform_handler("cli", AsyncMock())
         await gw.push(_make_msg(sk1, user_id="u1"))
         await gw.push(_make_msg(sk2, user_id="u2"))
         await asyncio.sleep(0)
@@ -165,17 +188,16 @@ class TestDMPlatformTracking:
     @pytest.mark.asyncio
     async def test_dm_platform_recorded_on_push(self, gw):
         sk = SessionKey.dm("u1")
-        gw.register_reply_handler("cli", AsyncMock())
+        gw.register_platform_handler("cli", AsyncMock())
         await gw.push(_make_msg(sk, platform=Platform.CLI))
         assert gw._dm_platforms.get(sk) == "cli"
 
     @pytest.mark.asyncio
     async def test_dm_platform_updated_on_second_push(self, gw):
         sk = SessionKey.dm("u1")
-        gw.register_reply_handler("cli", AsyncMock())
-        gw.register_reply_handler("discord", AsyncMock())
+        gw.register_platform_handler("cli", AsyncMock())
+        gw.register_platform_handler("discord", AsyncMock())
         await gw.push(_make_msg(sk, platform=Platform.CLI))
-        # Same user now messages from Discord
         await gw.push(InboundMessage(
             session_key=sk,
             author=UserIdentity(platform=Platform.DISCORD, user_id="u1", username="alice"),
@@ -188,67 +210,85 @@ class TestDMPlatformTracking:
 
 
 # ---------------------------------------------------------------------------
-# Reply dispatch
+# Event dispatch
 # ---------------------------------------------------------------------------
 
-class TestReplyDispatch:
+class TestEventDispatch:
     @pytest.mark.asyncio
-    async def test_reply_dispatched_to_correct_handler(self, gw):
+    async def test_event_dispatched_to_platform_handler(self, gw):
         sk = SessionKey.dm("u1")
         received = []
 
-        async def handler(reply):
-            received.append(reply)
+        async def handler(event):
+            received.append(event)
 
-        gw.register_reply_handler("cli", handler)
+        gw.register_platform_handler("cli", handler)
         gw._dm_platforms[sk] = "cli"
 
-        reply = _make_reply(sk)
-        await gw._dispatch_reply(reply)
-        assert received == [reply]
+        event = _make_final(sk)
+        await gw._dispatch_event(event)
+        assert received == [event]
 
     @pytest.mark.asyncio
-    async def test_reply_dropped_if_no_platform_known(self, gw, caplog):
+    async def test_session_handler_takes_priority(self, gw):
         sk = SessionKey.dm("u1")
-        # No platform registered for this session
-        reply = _make_reply(sk)
-        # Should not raise — just logs an error
-        await gw._dispatch_reply(reply)
+        platform_received = []
+        session_received = []
+
+        async def platform_handler(event):
+            platform_received.append(event)
+
+        async def session_handler(event):
+            session_received.append(event)
+
+        gw.register_platform_handler("cli", platform_handler)
+        gw._dm_platforms[sk] = "cli"
+        gw.register_session_handler(sk, session_handler)
+
+        event = _make_final(sk)
+        await gw._dispatch_event(event)
+
+        assert session_received == [event]
+        assert platform_received == []
+
+    @pytest.mark.asyncio
+    async def test_event_dropped_if_no_platform_known(self, gw, caplog):
+        sk = SessionKey.dm("u1")
+        event = _make_final(sk)
+        await gw._dispatch_event(event)
         assert "Cannot determine platform" in caplog.text
 
     @pytest.mark.asyncio
-    async def test_reply_dropped_if_no_handler_registered(self, gw, caplog):
+    async def test_event_dropped_if_no_handler_registered(self, gw, caplog):
         sk = SessionKey.dm("u1")
         gw._dm_platforms[sk] = "matrix"
-        # No handler registered for "matrix"
-        reply = _make_reply(sk)
-        await gw._dispatch_reply(reply)
-        assert "No reply handler" in caplog.text
+        event = _make_final(sk)
+        await gw._dispatch_event(event)
+        assert "No handler" in caplog.text
 
     @pytest.mark.asyncio
-    async def test_group_reply_uses_platform_from_session_key(self, gw):
+    async def test_group_event_uses_platform_from_session_key(self, gw):
         sk = SessionKey.group(Platform.DISCORD, "ch1")
         received = []
 
-        async def handler(reply):
-            received.append(reply)
+        async def handler(event):
+            received.append(event)
 
-        gw.register_reply_handler("discord", handler)
-        reply = _make_reply(sk)
-        await gw._dispatch_reply(reply)
-        assert received == [reply]
+        gw.register_platform_handler("discord", handler)
+        event = _make_final(sk)
+        await gw._dispatch_event(event)
+        assert received == [event]
 
     @pytest.mark.asyncio
     async def test_handler_exception_does_not_propagate(self, gw):
         sk = SessionKey.dm("u1")
         gw._dm_platforms[sk] = "cli"
 
-        async def bad_handler(reply):
+        async def bad_handler(event):
             raise RuntimeError("handler blew up")
 
-        gw.register_reply_handler("cli", bad_handler)
-        # Should not raise out of _dispatch_reply
-        await gw._dispatch_reply(_make_reply(sk))
+        gw.register_platform_handler("cli", bad_handler)
+        await gw._dispatch_event(_make_final(sk))  # should not raise
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +299,7 @@ class TestResetSession:
     @pytest.mark.asyncio
     async def test_reset_existing_session_calls_loop_reset(self, gw):
         sk = SessionKey.dm("u1")
-        gw.register_reply_handler("cli", AsyncMock())
+        gw.register_platform_handler("cli", AsyncMock())
         await gw.push(_make_msg(sk))
         await asyncio.sleep(0)
 
@@ -268,8 +308,7 @@ class TestResetSession:
 
     def test_reset_nonexistent_session_is_noop(self, gw):
         sk = SessionKey.dm("nobody")
-        # Should not raise
-        gw.reset_session(sk)
+        gw.reset_session(sk)  # should not raise
 
 
 # ---------------------------------------------------------------------------
@@ -281,18 +320,18 @@ class TestShutdown:
     async def test_shutdown_closes_all_lanes(self, gw):
         sk1 = SessionKey.dm("u1")
         sk2 = SessionKey.dm("u2")
-        gw.register_reply_handler("cli", AsyncMock())
+        gw.register_platform_handler("cli", AsyncMock())
         await gw.push(_make_msg(sk1, user_id="u1"))
         await gw.push(_make_msg(sk2, user_id="u2"))
         await asyncio.sleep(0)
 
         await gw.shutdown()
-        assert gw._router._lanes == {}
+        assert gw._session_router._lanes == {}
 
     @pytest.mark.asyncio
     async def test_active_sessions_empty_after_shutdown(self, gw):
         sk = SessionKey.dm("u1")
-        gw.register_reply_handler("cli", AsyncMock())
+        gw.register_platform_handler("cli", AsyncMock())
         await gw.push(_make_msg(sk))
         await asyncio.sleep(0)
 

@@ -8,6 +8,17 @@ The Context class owns:
   - Four-stage hook pipeline (filter, transform, compress, post-process)
   - assemble() — produces a list[dict] ready to send to the LLM API
 
+Dialogue mutation:
+  - add(entry)                  — append a new entry
+  - edit(entry_id, new_content) — replace content in-place; no cascade
+  - delete(entry_id)            — smart-delete: removes entry + dependents
+                                  (tool calls cascade to their results and
+                                   vice versa); re-indexes after removal
+  - strip_tool_calls(entry_id)  — remove tool_calls from an assistant entry
+                                  and drop its tool results, preserving the
+                                  assistant's text content
+  - clear()                     — wipe entire dialogue
+
 Modules (compression, dedup, RAG, etc.) are registered externally at startup.
 Context itself never loads modules — that is main.py's concern.
 """
@@ -207,6 +218,111 @@ class Context:
         self.dialogue.clear()
         self.state.clear()
 
+    def edit(self, entry_id: str, new_content: str) -> bool:
+        """
+        Replace the content of a dialogue entry in-place.
+        Returns True if the entry was found and updated, False otherwise.
+        Does not cascade — editing an assistant turn's content does not
+        touch its tool_calls or the downstream tool results.
+        """
+        for entry in self.dialogue:
+            if entry.id == entry_id:
+                entry.content = new_content
+                return True
+        return False
+
+    def delete(self, entry_id: str) -> list[str]:
+        """
+        Remove an entry and all entries that depend on it, then re-index.
+
+        Dependency rules (mirrors the token-budget trimming in assemble()):
+          - Assistant turn with tool_calls  → also delete every tool-result
+            entry whose tool_call_id is in that call set.
+          - Tool-result entry               → also delete the assistant turn
+            that owns the call, plus all *other* tool results belonging to
+            that same assistant turn (a partial tool block is invalid).
+          - User / plain assistant turn     → no dependents.
+
+        Returns the list of entry ids that were actually removed.
+        """
+        ids_to_remove = self._dependents(entry_id)
+        if not ids_to_remove:
+            return []
+        self.dialogue = [e for e in self.dialogue if e.id not in ids_to_remove]
+        self._reindex()
+        return list(ids_to_remove)
+
+    def _dependents(self, entry_id: str) -> set[str]:
+        """
+        Return the set of entry ids that must be removed together with
+        entry_id (including entry_id itself). Empty set = entry not found.
+        """
+        # Build lookup maps once
+        by_id: dict[str, HistoryEntry] = {e.id: e for e in self.dialogue}
+        if entry_id not in by_id:
+            return set()
+
+        target = by_id[entry_id]
+        group: set[str] = {entry_id}
+
+        if target.role == ROLE_ASSISTANT and target.tool_calls:
+            # Delete all tool results that belong to this assistant turn
+            call_ids = {tc["id"] for tc in target.tool_calls}
+            for e in self.dialogue:
+                if e.role == ROLE_TOOL and e.tool_call_id in call_ids:
+                    group.add(e.id)
+
+        elif target.role == ROLE_TOOL and target.tool_call_id:
+            # Find the assistant turn that owns this call
+            for e in self.dialogue:
+                if e.role == ROLE_ASSISTANT and e.tool_calls:
+                    call_ids = {tc["id"] for tc in e.tool_calls}
+                    if target.tool_call_id in call_ids:
+                        # Delete the whole assistant turn + all its tool results
+                        group.add(e.id)
+                        for r in self.dialogue:
+                            if r.role == ROLE_TOOL and r.tool_call_id in call_ids:
+                                group.add(r.id)
+                        break
+
+        return group
+
+    def strip_tool_calls(self, entry_id: str) -> list[str]:
+        """
+        Remove the tool_calls field from an assistant entry and delete all
+        downstream tool-result entries, while preserving the assistant's
+        text content.
+
+        Use this instead of delete() when the assistant turn has meaningful
+        text content that should survive context trimming — mirroring the
+        behaviour of the token-budget trimmer in assemble().
+
+        Returns the list of tool-result entry ids that were removed.
+        If the entry has no tool_calls, or is not found, returns [].
+        """
+        target = next((e for e in self.dialogue if e.id == entry_id), None)
+        if target is None or target.role != ROLE_ASSISTANT or not target.tool_calls:
+            return []
+
+        call_ids = {tc["id"] for tc in target.tool_calls}
+        target.tool_calls = []
+
+        removed: list[str] = []
+        kept: list[HistoryEntry] = []
+        for e in self.dialogue:
+            if e.role == ROLE_TOOL and e.tool_call_id in call_ids:
+                removed.append(e.id)
+            else:
+                kept.append(e)
+        self.dialogue = kept
+        self._reindex()
+        return removed
+
+    def _reindex(self) -> None:
+        """Reassign .index on every entry to match its current position."""
+        for i, entry in enumerate(self.dialogue):
+            entry.index = i
+
     # ------------------------------------------------------------------
     # Token counting
     # ------------------------------------------------------------------
@@ -315,11 +431,29 @@ class Context:
             if drop_idx is None:
                 break
 
+            # Drop the entry and any tool results that depend on it.
+            # If the assistant turn has text content AND tool calls, preserve
+            # the text — strip only the tool_calls field and the downstream
+            # tool results. If there is no text content, drop the whole turn.
             if merged[drop_idx].get("tool_calls"):
                 call_ids = {tc["id"] for tc in merged[drop_idx]["tool_calls"]}
-                merged.pop(drop_idx)
-                while drop_idx < len(merged) and merged[drop_idx]["role"] == ROLE_TOOL and merged[drop_idx].get("tool_call_id") in call_ids:
+                if merged[drop_idx].get("content", "").strip():
+                    # Keep the turn but remove the tool_calls field so the
+                    # assistant text survives in context.
+                    merged[drop_idx] = {
+                        k: v for k, v in merged[drop_idx].items()
+                        if k != "tool_calls"
+                    }
+                else:
                     merged.pop(drop_idx)
+                # Either way, drop the orphaned tool results.
+                i = drop_idx
+                while (
+                    i < len(merged)
+                    and merged[i]["role"] == ROLE_TOOL
+                    and merged[i].get("tool_call_id") in call_ids
+                ):
+                    merged.pop(i)
             else:
                 merged.pop(drop_idx)
 

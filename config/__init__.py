@@ -6,8 +6,9 @@ from config.__main__ import (
     ModelConfig,
     LLMRoutingConfig,
     FallbackOnConfig,
-    GatewayConfig,
+    RouterConfig,
     BridgeConfig,
+    GatewayConfig,
     WorkspaceConfig,
     LoggingConfig,
 )

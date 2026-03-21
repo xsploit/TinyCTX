@@ -20,7 +20,8 @@ from prompt_toolkit.patch_stdout import patch_stdout
 
 from contracts import (
     Platform, ContentType,
-    SessionKey, UserIdentity, InboundMessage, OutboundReply,
+    SessionKey, UserIdentity, InboundMessage,
+    AgentTextChunk, AgentTextFinal, AgentToolCall, AgentToolResult, AgentError,
 )
 
 logger = logging.getLogger(__name__)
@@ -34,38 +35,46 @@ class CLIBridge:
     def __init__(self, gateway) -> None:
         self._gateway    = gateway
         self._reply_done = asyncio.Event()
-        self._started    = False  # True once we've printed "agent: " prefix
+        self._streaming  = False  # True once we've printed "agent: " prefix
 
-    async def handle_reply(self, reply: OutboundReply) -> None:
-        if reply.is_partial:
-            # First partial chunk of a new reply — print the "agent: " prefix.
-            if not self._started:
-                # Print prefix without newline; flush immediately so it appears
-                # before the first word streams in.
+    async def handle_event(self, event) -> None:
+        if isinstance(event, AgentTextChunk):
+            if not self._streaming:
                 print("\nagent: ", end="", flush=True)
-                self._started = True
-            # Stream the token directly to stdout, no newline.
-            print(reply.text, end="", flush=True)
-        else:
-            # Final chunk — close the line.
-            if self._started:
-                # Streaming reply: we already printed the prefix + tokens,
-                # just add the closing newline.
-                if reply.text:
-                    # Non-streaming fallback path: text arrived all at once.
-                    print(f"\nagent: {reply.text}")
+                self._streaming = True
+            print(event.text, end="", flush=True)
+
+        elif isinstance(event, AgentTextFinal):
+            if self._streaming:
+                if event.text:
+                    # Non-streaming fallback: full text arrived at once.
+                    print(f"\nagent: {event.text}")
                 else:
                     print()  # close the streamed line
             else:
-                # No partials arrived (e.g. error path) — print the whole thing.
-                print(f"\nagent: {reply.text}")
+                print(f"\nagent: {event.text}")
+            print()
+            self._streaming = False
+            self._reply_done.set()
 
-            print()  # blank line after each reply for readability
-            self._started = False
+        elif isinstance(event, AgentToolCall):
+            args_str = ", ".join(f"{k}={v!r}" for k, v in event.args.items())
+            print(f"\n[tool → {event.tool_name}({args_str})]")
+
+        elif isinstance(event, AgentToolResult):
+            status = "error" if event.is_error else "ok"
+            preview = event.output[:120].replace("\n", " ")
+            if len(event.output) > 120:
+                preview += "..."
+            print(f"[tool ← {event.tool_name} ({status}): {preview}]")
+
+        elif isinstance(event, AgentError):
+            print(f"\nagent: {event.message}\n")
+            self._streaming = False
             self._reply_done.set()
 
     async def run(self) -> None:
-        self._gateway.register_reply_handler(Platform.CLI.value, self.handle_reply)
+        self._gateway.register_platform_handler(Platform.CLI.value, self.handle_event)
         print("CLI bridge ready. Type a message, Ctrl-C or 'exit' to quit.\n")
 
         with patch_stdout():
@@ -84,7 +93,7 @@ class CLIBridge:
                     break
                 if text.lower() == "/reset":
                     self._gateway.reset_session(CLI_SESSION)
-                    self._started = False
+                    self._streaming = False
                     print("\n[context cleared]\n")
                     continue
 

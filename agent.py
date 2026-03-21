@@ -1,7 +1,7 @@
 """
 agent.py — The 6-stage agent execution loop.
 One instance per session, owned by its Lane.
-Yields OutboundReply chunks; never calls the gateway directly.
+Yields AgentEvent objects; never calls the gateway directly.
 
 Stages:
   1. Intake           — add user message to Context
@@ -9,15 +9,14 @@ Stages:
   3. Inference        — stream LLM, collect text + tool calls
   4. Tool Execution   — dispatch ToolCalls via tool_handler
   5. Result Backfill  — inject ToolResults back into Context
-  6. Streaming Reply  — yield OutboundReply chunks to Lane
+  6. Streaming Reply  — yield AgentEvent objects to Lane
 
 Streaming behaviour:
-  Tool-call cycles (cycles 0..N-1) buffer text as before — we can't stream
-  text that may be followed by a tool call mid-response.
-  The final cycle (no tool calls returned) streams TextDelta events directly
-  to the Lane as is_partial=True chunks, with a closing is_partial=False
-  chunk at the end. This gives the CLI (and future bridges) word-by-word
-  output with no extra latency.
+  Tool-call cycles (cycles 0..N-1) buffer text — we can't stream text that
+  may be followed by a tool call mid-response.
+  The final cycle streams AgentTextChunk events directly to the Lane, with
+  a closing AgentTextFinal at the end. Tool-use cycles yield AgentToolCall
+  and AgentToolResult events so bridges can display tool activity live.
 
 Model pool:
   All named models from config.models are pre-instantiated into self._models.
@@ -42,7 +41,11 @@ import time
 from pathlib import Path
 from typing import AsyncIterator
 
-from contracts import InboundMessage, OutboundReply, ToolCall, ToolResult, SessionKey
+from contracts import (
+    InboundMessage, AgentEvent,
+    AgentTextChunk, AgentTextFinal, AgentToolCall, AgentToolResult, AgentError,
+    ToolCall, ToolResult, SessionKey,
+)
 from context import Context, HistoryEntry, HOOK_PRE_ASSEMBLE_ASYNC
 from config import Config, ModelConfig
 from ai import LLM, TextDelta, ToolCallAssembled, LLMError
@@ -154,20 +157,26 @@ class AgentLoop:
     # Main entry point
     # ------------------------------------------------------------------
 
-    async def run(self, msg: InboundMessage) -> AsyncIterator[OutboundReply]:
+    async def run(self, msg: InboundMessage) -> AsyncIterator[AgentEvent]:
         self._turn_count += 1
         logger.debug("[%s] turn %d", self.session_key, self._turn_count)
+
+        # Shared kwargs for every event yielded this turn.
+        ev = dict(
+            session_key=self.session_key,
+            trace_id=msg.trace_id,
+            reply_to_message_id=msg.message_id,
+        )
 
         # Stage 1: Intake
         self.context.add(HistoryEntry.user(msg.text))
 
         max_cycles = self.config.max_tool_cycles
         final_text = ""
+        streaming_active = False
 
         for cycle in range(max_cycles):
             # Stage 2: Context Assembly
-            # Run async pre-assemble hooks first (e.g. memory indexing + embedding),
-            # then call the sync assemble() pipeline.
             await self.context.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
             tools    = self.tool_handler.get_tool_definitions() or None
             messages = self.context.assemble(tools=tools)
@@ -176,48 +185,42 @@ class AgentLoop:
             text_chunks: list[str]      = []
             tool_calls:  list[ToolCall] = []
             error:       str | None     = None
-
-            streamed_text: list[str] = []
-            streaming_active = False
+            streaming_active            = False
+            last_http_status: int | None = None
 
             model_chain = [self.config.llm.primary] + list(self.config.llm.fallback)
 
             for model_name in model_chain:
                 llm = self._models[model_name]
-                text_chunks    = []
-                tool_calls     = []
-                error          = None
-                streamed_text  = []
+                text_chunks      = []
+                tool_calls       = []
+                error            = None
                 streaming_active = False
-                last_http_status: int | None = None
+                last_http_status = None
 
-                async for event in llm.stream(messages, tools=tools):
-                    if isinstance(event, TextDelta):
-                        text_chunks.append(event.text)
-
+                async for llm_event in llm.stream(messages, tools=tools):
+                    if isinstance(llm_event, TextDelta):
+                        text_chunks.append(llm_event.text)
+                        # Only stream text on the final cycle (no tool calls yet).
+                        # If tool calls arrive later this cycle, we've already
+                        # streamed text we can't unsend — that's acceptable;
+                        # the final AgentTextFinal will carry the full text.
                         if not tool_calls:
-                            streamed_text.append(event.text)
                             streaming_active = True
-                            yield OutboundReply(
-                                session_key=self.session_key,
-                                text=event.text,
-                                reply_to_message_id=msg.message_id,
-                                trace_id=msg.trace_id,
-                                is_partial=True,
-                            )
+                            yield AgentTextChunk(text=llm_event.text, **ev)
 
-                    elif isinstance(event, ToolCallAssembled):
+                    elif isinstance(llm_event, ToolCallAssembled):
                         tool_calls.append(ToolCall(
-                            call_id=event.call_id,
-                            tool_name=event.tool_name,
-                            args=event.args,
+                            call_id=llm_event.call_id,
+                            tool_name=llm_event.tool_name,
+                            args=llm_event.args,
                         ))
 
-                    elif isinstance(event, LLMError):
-                        error = event.message
-                        if event.message.startswith("HTTP "):
+                    elif isinstance(llm_event, LLMError):
+                        error = llm_event.message
+                        if llm_event.message.startswith("HTTP "):
                             try:
-                                last_http_status = int(event.message.split()[1].rstrip(":"))
+                                last_http_status = int(llm_event.message.split()[1].rstrip(":"))
                             except (IndexError, ValueError):
                                 pass
                         break
@@ -235,20 +238,19 @@ class AgentLoop:
                     last_http_status is not None
                     and last_http_status in fo.http_codes
                 )
-
                 if should_fallback and model_name != model_chain[-1]:
                     logger.warning(
                         "[%s] model '%s' failed (%s) — trying next fallback",
                         self.session_key, model_name, error,
                     )
                     continue
-
                 break
 
             if error:
                 logger.error("[%s] LLM error (all models exhausted): %s", self.session_key, error)
-                final_text = f"[LLM error: {error}]"
-                break
+                yield AgentError(message=f"[LLM error: {error}]", **ev)
+                await self._flush_history()
+                return
 
             response_text = "".join(text_chunks)
             self.context.add(HistoryEntry.assistant(
@@ -260,31 +262,31 @@ class AgentLoop:
                 final_text = response_text
                 break
 
+            # Stage 4 & 5: Tool execution + result backfill
             logger.debug("[%s] cycle %d — %d tool call(s)", self.session_key, cycle, len(tool_calls))
             for tc in tool_calls:
+                yield AgentToolCall(
+                    call_id=tc.call_id,
+                    tool_name=tc.tool_name,
+                    args=tc.args,
+                    **ev,
+                )
                 result = await self._execute_tool(tc)
                 self.context.add(HistoryEntry.tool_result(result))
+                yield AgentToolResult(
+                    call_id=result.call_id,
+                    tool_name=result.tool_name,
+                    output=result.output,
+                    is_error=result.is_error,
+                    **ev,
+                )
 
         else:
             logger.warning("[%s] hit max_tool_cycles (%d)", self.session_key, max_cycles)
             final_text = final_text or "[Tool cycle limit reached.]"
 
-        if streaming_active and not error:
-            yield OutboundReply(
-                session_key=self.session_key,
-                text="",
-                reply_to_message_id=msg.message_id,
-                trace_id=msg.trace_id,
-                is_partial=False,
-            )
-        else:
-            yield OutboundReply(
-                session_key=self.session_key,
-                text=final_text,
-                reply_to_message_id=msg.message_id,
-                trace_id=msg.trace_id,
-                is_partial=False,
-            )
+        # Stage 6: Final reply event
+        yield AgentTextFinal(text=final_text if not streaming_active else "", **ev)
 
         await self._flush_history()
 

@@ -58,7 +58,8 @@ class LLMRoutingConfig:
 
 
 @dataclass
-class GatewayConfig:
+class RouterConfig:
+    """Internal TCP config for the session router (not user-facing)."""
     host: str = "127.0.0.1"
     port: int = 8765
 
@@ -73,6 +74,25 @@ class BridgeConfig:
             return self.options[name]
         except KeyError:
             raise AttributeError(name)
+
+
+@dataclass
+class GatewayConfig:
+    """
+    HTTP/SSE API gateway config.
+
+    Configured via the top-level 'gateway:' key in config.yaml:
+
+        gateway:
+          enabled: true
+          host: 127.0.0.1
+          port: 8080
+          api_key: "your-secret-token"
+    """
+    enabled: bool = False
+    host:    str  = "127.0.0.1"
+    port:    int  = 8080
+    api_key: str  = ""
 
 
 @dataclass
@@ -107,8 +127,9 @@ class LoggingConfig:
 class Config:
     models:          dict[str, ModelConfig]
     llm:             LLMRoutingConfig
-    gateway:         GatewayConfig           = field(default_factory=GatewayConfig)
+    router:          RouterConfig            = field(default_factory=RouterConfig)
     bridges:         dict[str, BridgeConfig] = field(default_factory=dict)
+    gateway:         GatewayConfig           = field(default_factory=GatewayConfig)
     workspace:       WorkspaceConfig         = field(default_factory=WorkspaceConfig)
     logging:         LoggingConfig           = field(default_factory=LoggingConfig)
     max_tool_cycles: int                     = 10
@@ -176,7 +197,7 @@ def _parse_model(raw: dict) -> ModelConfig:
 
 # Known top-level keys — everything else goes into Config.extra
 _KNOWN_KEYS = {
-    "models", "llm", "gateway", "bridges", "workspace",
+    "models", "llm", "router", "bridges", "gateway", "workspace",
     "logging", "max_tool_cycles", "context",
 }
 
@@ -234,8 +255,8 @@ def load(path="config.yaml") -> Config:
     workspace = WorkspaceConfig(path=Path(ws_raw.get("path", "~/.tinyctx")))
 
     # ------------------------------------------------------------------ rest
-    gw_raw  = raw.get("gateway", {})
-    log_raw = raw.get("logging", {})
+    router_raw = raw.get("router", {})
+    log_raw    = raw.get("logging", {})
 
     bridges: dict[str, BridgeConfig] = {}
     for name, br in raw.get("bridges", {}).items():
@@ -244,17 +265,27 @@ def load(path="config.yaml") -> Config:
             options = {k: v for k, v in br.items() if k != "enabled"}
             bridges[name] = BridgeConfig(enabled=enabled, options=options)
 
+    # ------------------------------------------------------------------ gateway
+    gw_raw  = raw.get("gateway", {})
+    gateway = GatewayConfig(
+        enabled=bool(gw_raw.get("enabled", False)),
+        host=gw_raw.get("host", "127.0.0.1"),
+        port=int(gw_raw.get("port", 8080)),
+        api_key=gw_raw.get("api_key", ""),
+    )
+
     # ------------------------------------------------------------------ extra
     extra = {k: v for k, v in raw.items() if k not in _KNOWN_KEYS}
 
     return Config(
         models=models,
         llm=llm,
-        gateway=GatewayConfig(
-            host=gw_raw.get("host", "127.0.0.1"),
-            port=int(gw_raw.get("port", 8765)),
+        router=RouterConfig(
+            host=router_raw.get("host", "127.0.0.1"),
+            port=int(router_raw.get("port", 8765)),
         ),
         bridges=bridges,
+        gateway=gateway,
         workspace=workspace,
         logging=LoggingConfig(level=log_raw.get("level", "INFO")),
         max_tool_cycles=int(raw.get("max_tool_cycles", 10)),

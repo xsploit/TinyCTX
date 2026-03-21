@@ -2,7 +2,7 @@
 
 ## What this is
 
-An ultra-lightweight agentic assistant framework. A single Python process runs one or more **bridges** (CLI, Discord, Matrix) that feed messages into a **gateway**, which routes them to per-session **agent loops**. Each loop runs a 6-stage cycle: intake → async pre-assemble hooks → context assembly → LLM inference → tool execution → result backfill → reply streaming.
+An ultra-lightweight agentic assistant framework. A single Python process runs one or more **bridges** (CLI, Discord, Matrix) that feed messages into a **router**, which routes them to per-session **agent loops**. An optional HTTP/SSE **gateway** exposes the router to external clients (SillyTavern, custom integrations, etc.). Each loop runs a 6-stage cycle: intake → async pre-assemble hooks → context assembly → LLM inference → tool execution → result backfill → reply streaming.
 
 Everything is async (asyncio + aiohttp). No frameworks. No ORM. No magic.
 
@@ -28,10 +28,11 @@ Run tests: `python -m pytest -v`
 
 ```
 main.py
-  └── loads bridges/* (any dir with __main__.py + config.bridges.<n>.enabled=true)
-      └── each bridge calls gateway.push(InboundMessage)
-          └── Gateway → SessionRouter → Lane → AgentLoop.run()
-              ├── await ctx.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)  ← new
+  ├── gateway/__main__.py  (if gateway.enabled) — HTTP/SSE API, external clients connect here
+  └── loads bridges/*      (any dir with __main__.py + config.bridges.<n>.enabled=true)
+      └── each bridge calls router.push(InboundMessage)
+          └── Router → _SessionRouter → Lane → AgentLoop.run()
+              ├── await ctx.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
               └── ctx.assemble() → LLM inference → tool execution
                   └── AgentLoop loads modules/* on init (any dir with register(agent))
 ```
@@ -42,9 +43,10 @@ main.py
 |------|------|
 | `contracts.py` | Pure data types. No logic. Everything imports from here, never the reverse. |
 | `config/` | YAML loader + env var resolution. `WorkspaceConfig` (global workspace path). `ModelConfig` supports `kind: chat` (default) or `kind: embedding`. |
-| `gateway.py` | Session routing. One `Lane` (queue + worker task) per `SessionKey`. |
-| `agent.py` | The 6-stage loop. Owns `Context`, `ToolCallHandler`, and LLM pool. Skips embedding models when building LLM pool. |
-| `context.py` | Dialogue history + hook pipeline. Sync stages: `pre_assemble`, `filter_turn`, `transform_turn`, `post_assemble`. Async stage: `HOOK_PRE_ASSEMBLE_ASYNC` (awaited by agent before each `assemble()` call). |
+| `router.py` | Session routing. One `Lane` (queue + worker task) per `SessionKey`. Bridges call `router.push()` and register platform/session handlers. |
+| `gateway/` | HTTP/SSE API gateway. External clients (SillyTavern, custom scripts, etc.) connect here. `run(router, cfg)` called by `main.py`. |
+| `agent.py` | The 6-stage loop. Owns `Context`, `ToolCallHandler`, and LLM pool. Yields `AgentEvent` stream. Skips embedding models when building LLM pool. |
+| `context.py` | Dialogue history + hook pipeline. Sync stages: `pre_assemble`, `filter_turn`, `transform_turn`, `post_assemble`. Async stage: `HOOK_PRE_ASSEMBLE_ASYNC` (awaited by agent before each `assemble()` call). Smart `delete()` / `edit()` / `strip_tool_calls()` for dialogue mutation. |
 | `ai.py` | Async OpenAI-compatible clients. `LLM` streams SSE → `TextDelta` / `ToolCallAssembled` / `LLMError`. `Embedder` calls `/v1/embeddings`, auto-batches, numpy fast-path. |
 | `utils/tool_handler.py` | Registers Python functions (sync or async) as LLM tools. Auto-extracts JSON schema from type hints + docstring `Args:` block. |
 
@@ -52,6 +54,24 @@ main.py
 
 - DM sessions: `SessionKey(chat_type=DM, conversation_id=<user_id>)` — platform-agnostic.
 - Group sessions: `SessionKey(chat_type=GROUP, conversation_id=<channel_id>, platform=<platform>)` — platform-specific.
+
+**Agent event stream:**
+
+`AgentLoop.run()` yields `AgentEvent` objects. Bridges and the gateway consume these:
+
+| Event | When |
+|-------|------|
+| `AgentTextChunk` | Streaming text token (is_partial) |
+| `AgentTextFinal` | Final text or stream-close sentinel |
+| `AgentToolCall` | Tool dispatched (before execution) |
+| `AgentToolResult` | Tool result (after execution) |
+| `AgentError` | LLM error or cycle limit |
+
+**Event handler routing (Router):**
+
+- `register_platform_handler(platform, fn)` — fallback for all sessions on a platform (used by CLI, cron, discord, matrix)
+- `register_session_handler(key, fn)` — per-session, takes priority; used by gateway for SSE streams
+- `unregister_session_handler(key)` — call in `finally` when SSE stream ends
 
 ---
 
@@ -80,8 +100,18 @@ llm:
     any_error: false
     http_codes: [429, 500, 502, 503, 504]
 
+gateway:                        # HTTP/SSE API gateway (external clients)
+  enabled: true
+  host: 127.0.0.1
+  port: 8080
+  api_key: "your-secret-token"
+
 workspace:
   path: ~/.tinyctx              # global — all modules resolve paths here
+
+# router: (internal TCP config, rarely needed)
+#   host: 127.0.0.1
+#   port: 8765
 
 # Module config lives under extra top-level keys (e.g. memory_search:, mcp:)
 # agent.config.extra.get("memory_search", {}) etc.
@@ -91,13 +121,47 @@ Modules access workspace via `agent.config.workspace.path`. There is no `memory.
 
 ---
 
+## Gateway API
+
+All endpoints require `Authorization: Bearer <api_key>`. Health is always public.
+
+```
+POST   /v1/sessions/{id}/message           send message; SSE stream or JSON response
+GET    /v1/sessions/{id}/history           raw dialogue (all roles, incl. tool calls)
+PATCH  /v1/sessions/{id}/history/{eid}     edit entry content
+DELETE /v1/sessions/{id}/history/{eid}     smart-delete entry + dependents
+POST   /v1/sessions/{id}/reset             wipe session context
+GET    /v1/workspace/files/{path}          read any file under workspace root
+PUT    /v1/workspace/files/{path}          write any file under workspace root
+GET    /v1/health                          status + active session list
+```
+
+**SSE event types** (`POST /message` with `stream: true`):
+```json
+{"type": "text_chunk",  "text": "..."}
+{"type": "tool_call",   "call_id": "...", "name": "...", "args": {...}}
+{"type": "tool_result", "call_id": "...", "name": "...", "output": "...", "is_error": false}
+{"type": "text_final",  "text": "..."}
+{"type": "error",       "message": "..."}
+{"type": "done"}
+```
+
+**Session type** (`session_type: "dm"|"group"`, default `"dm"`):
+- `dm` → `SessionKey.dm(session_id)` — shared across platforms
+- `group` → `SessionKey.group(Platform.API, session_id)` — API-scoped
+
+**Workspace file paths** are resolved relative to `workspace.path`. Path traversal (`..`) is rejected with 403.
+
+---
+
 ## Adding a bridge
 
-1. Create `bridges/<n>/__main__.py` with an async `run(gateway)` function.
-2. Register a reply handler: `gateway.register_reply_handler("<n>", handler)`.
-3. Push messages: `await gateway.push(InboundMessage(...))`.
-4. Add entry to `config.yaml` under `bridges:` with `enabled: true`.
-5. Tokens from env vars only — do not add bridge-specific dataclasses to `config/`.
+1. Create `bridges/<n>/__main__.py` with an async `run(router)` function.
+2. Register a platform handler: `router.register_platform_handler("<n>", handler)`.
+3. Push messages: `await router.push(InboundMessage(...))`.
+4. Handle `AgentEvent` objects in the handler — switch on type.
+5. Add entry to `config.yaml` under `bridges:` with `enabled: true`.
+6. Tokens from env vars only — do not add bridge-specific dataclasses to `config/`.
 
 ---
 
@@ -110,7 +174,7 @@ Modules access workspace via `agent.config.workspace.path`. There is no `memory.
 5. Register sync hooks: `agent.context.register_hook(stage, fn)`.
 6. Register async pre-assemble hooks: `agent.context.register_hook(HOOK_PRE_ASSEMBLE_ASYNC, async_fn)`.
 
-Modules must not import from `gateway.py` or any bridge.
+Modules must not import from `router.py`, `gateway/`, or any bridge.
 
 **Async hooks** (`HOOK_PRE_ASSEMBLE_ASYNC`) run before every `assemble()` call inside `agent.run()`. Use them for I/O that must complete before the context is built (e.g. embedding a query, syncing a search index). Import the constant: `from context import HOOK_PRE_ASSEMBLE_ASYNC`.
 
@@ -118,7 +182,7 @@ Modules must not import from `gateway.py` or any bridge.
 
 ## Key conventions
 
-- **`contracts.py` is the shared language.** Never import gateway/agent/bridges from contracts. Never import contracts from ai.py.
+- **`contracts.py` is the shared language.** Never import router/agent/bridges from contracts. Never import contracts from ai.py.
 - **Modules are self-contained.** No hardcoded module names anywhere in core.
 - **Bridges are self-contained.** No hardcoded bridge names anywhere in core.
 - **Config is generic.** `BridgeConfig(enabled, options)` for all bridges. Tokens from env vars.
@@ -132,6 +196,21 @@ Modules must not import from `gateway.py` or any bridge.
 
 ---
 
+## Context mutation
+
+`Context` supports direct dialogue mutation (all methods re-index after changes):
+
+| Method | Behaviour |
+|--------|-----------|
+| `edit(entry_id, content)` | Replace content in-place. No cascade. |
+| `delete(entry_id)` | Smart-delete: removes entry + dependents (assistant tool_calls cascade to their results; tool results cascade back to their assistant turn + siblings). |
+| `strip_tool_calls(entry_id)` | Remove `tool_calls` from an assistant entry and drop its results, preserving the assistant's text content. |
+| `clear()` | Wipe entire dialogue. |
+
+Token-budget trimming in `assemble()` follows the same rules: assistant turns with text content preserve the text when tool calls are trimmed.
+
+---
+
 ## Modules reference
 
 | Module | What it does |
@@ -139,7 +218,7 @@ Modules must not import from `gateway.py` or any bridge.
 | `memory` | Static: injects SOUL.md, AGENTS.md, MEMORY.md as system prompts. Dynamic: hybrid BM25+vector search over `workspace/memory/**/*.md` via async pre-assemble hook + `memory_search` tool. Config key: `memory_search:`. |
 | `filesystem` | Tools: `shell`, `view`, `create_file`, `str_replace`. Sandboxed to workspace. |
 | `web` | Tools: `web_search` (DuckDuckGo), `http_request`, `navigate`/`click`/`type_text`/`extract_text`/`extract_html`/`screenshot`/`wait_for` (Playwright), `manage_browser`. |
-| `cron` | Scheduled agent turns. Jobs in `workspace/CRON.json`. Schedule kinds: `every`, `at`, `cron` (requires `croniter`). Tool: `cron_list`. |
+| `cron` | Scheduled agent turns. Jobs in `workspace/CRON.json`. Schedule kinds: `every`, `at`, `cron` (requires `croniter`). Tool: `cron_list`. Each job gets its own isolated session (`dm:cron-<id>`). `reset_after_run: true` wipes session context after each run. |
 | `heartbeat` | Periodic timer turns. Agent replies `HEARTBEAT_OK` if nothing needs attention; otherwise triggers a continuation loop. Configurable active hours. |
 | `ctx_tools` | Context pipeline hooks: deduplicates repeated identical tool calls, strips `<think>` CoT blocks from old turns, truncates/trims large tool outputs. |
 | `skills` | agentskills.io standard. Scans configured dirs + `~/.agents/skills/` for `SKILL.md` files, injects a compact index as system prompt, tool: `use_skill(name)`. |

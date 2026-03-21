@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Union
 import uuid
 
 
@@ -20,6 +20,7 @@ class Platform(str, Enum):
     DISCORD = "discord"
     MATRIX  = "matrix"
     CRON    = "cron"   # internal platform for scheduled cron jobs
+    API     = "api"    # HTTP/SSE API bridge
 
 
 class ContentType(str, Enum):
@@ -103,20 +104,65 @@ class InboundMessage:
 
 
 # ---------------------------------------------------------------------------
-# Outbound reply envelope
+# Agent event stream
+#
+# AgentLoop.run() yields a stream of AgentEvent objects. The gateway routes
+# each event to the correct bridge via per-session or per-platform handlers.
+# Bridges receive the full event stream and decide what to render.
+#
+# All events share four common fields:
+#   session_key          — which lane produced the event
+#   trace_id             — ties all events for one user message together
+#   reply_to_message_id  — the inbound message_id that triggered this turn
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
-class OutboundReply:
-    """
-    Produced by AgentLoop. The gateway routes on session_key to the
-    correct bridge. Bridges never see each other's replies.
-    """
+class _AgentEventBase:
     session_key:         SessionKey
-    text:                str
-    reply_to_message_id: str
     trace_id:            str
-    is_partial:          bool = False
+    reply_to_message_id: str
+
+
+@dataclass(frozen=True)
+class AgentTextChunk(_AgentEventBase):
+    """One streaming text token. is_partial is always True."""
+    text: str
+
+
+@dataclass(frozen=True)
+class AgentTextFinal(_AgentEventBase):
+    """
+    Final (non-streaming) text, or the closing sentinel after a stream.
+    text may be empty when it closes a streamed sequence.
+    """
+    text: str
+
+
+@dataclass(frozen=True)
+class AgentToolCall(_AgentEventBase):
+    """A tool call dispatched by the agent during a tool-use cycle."""
+    call_id:   str
+    tool_name: str
+    args:      dict[str, Any]
+
+
+@dataclass(frozen=True)
+class AgentToolResult(_AgentEventBase):
+    """The result of a tool call."""
+    call_id:   str
+    tool_name: str
+    output:    str
+    is_error:  bool = False
+
+
+@dataclass(frozen=True)
+class AgentError(_AgentEventBase):
+    """LLM error or tool-cycle-limit reached."""
+    message: str
+
+
+# Union type used in type hints throughout the codebase.
+AgentEvent = Union[AgentTextChunk, AgentTextFinal, AgentToolCall, AgentToolResult, AgentError]
 
 
 # ---------------------------------------------------------------------------
