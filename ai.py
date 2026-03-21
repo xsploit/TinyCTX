@@ -7,9 +7,19 @@ Imports only aiohttp and stdlib. No internal project imports.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Any
 import aiohttp
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+    before_sleep_log,
+)
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -69,9 +79,28 @@ class LLM:
     ) -> AsyncIterator[LLMEvent]:
         """
         Stream a completion. Yields TextDelta, ToolCallAssembled, or LLMError.
+        Retries on transient connection errors (up to 3 attempts, exponential backoff).
         Tool call argument chunks are assembled before yielding — callers
         always receive complete, parseable args dicts.
         """
+        try:
+            async for event in self._stream_with_retry(messages, tools):
+                yield event
+        except aiohttp.ClientConnectionError as e:
+            yield LLMError(f"Connection failed after retries: {e}")
+
+    @retry(
+        retry=retry_if_exception_type(aiohttp.ClientConnectionError),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=8),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=False,
+    )
+    async def _stream_with_retry(
+        self,
+        messages: list[dict],
+        tools:    list[dict] | None = None,
+    ) -> AsyncIterator[LLMEvent]:
         payload: dict[str, Any] = {
             "model":       self.model,
             "messages":    messages,
@@ -147,8 +176,8 @@ class LLM:
                             args=args,
                         )
 
-        except aiohttp.ClientConnectionError as e:
-            yield LLMError(f"Connection failed: {e}")
+        except aiohttp.ClientConnectionError:
+            raise  # tenacity will retry on this
         except Exception as e:
             yield LLMError(str(e))
 

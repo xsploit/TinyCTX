@@ -8,3 +8,6 @@ mcp
 prompt_toolkit
 sqlite3
 numpy
+tiktoken
+structlog
+tenacity

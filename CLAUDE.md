@@ -22,6 +22,8 @@ In the CLI bridge: type `/reset` to clear context, `exit` to quit.
 
 Run tests: `python -m pytest -v`
 
+Deps: `pip install -r requirements.txt` (includes `structlog`, `tenacity`)
+
 ---
 
 ## Architecture
@@ -43,11 +45,11 @@ main.py
 |------|------|
 | `contracts.py` | Pure data types. No logic. Everything imports from here, never the reverse. |
 | `config/` | YAML loader + env var resolution. `WorkspaceConfig` (global workspace path). `ModelConfig` supports `kind: chat` (default) or `kind: embedding`. |
-| `router.py` | Session routing. One `Lane` (queue + worker task) per `SessionKey`. Bridges call `router.push()` and register platform/session handlers. |
+| `router.py` | Session routing. One `Lane` (bounded queue maxsize=32 + crash-recovering worker task) per `SessionKey`. `router.push()` returns `bool` — `False` means lane queue full. Bridges register platform/session handlers. |
 | `gateway/` | HTTP/SSE API gateway. External clients (SillyTavern, custom scripts, etc.) connect here. `run(router, cfg)` called by `main.py`. |
 | `agent.py` | The 6-stage loop. Owns `Context`, `ToolCallHandler`, and LLM pool. Yields `AgentEvent` stream. Skips embedding models when building LLM pool. |
 | `context.py` | Dialogue history + hook pipeline. Sync stages: `pre_assemble`, `filter_turn`, `transform_turn`, `post_assemble`. Async stage: `HOOK_PRE_ASSEMBLE_ASYNC` (awaited by agent before each `assemble()` call). Smart `delete()` / `edit()` / `strip_tool_calls()` for dialogue mutation. |
-| `ai.py` | Async OpenAI-compatible clients. `LLM` streams SSE → `TextDelta` / `ToolCallAssembled` / `LLMError`. `Embedder` calls `/v1/embeddings`, auto-batches, numpy fast-path. |
+| `ai.py` | Async OpenAI-compatible clients. `LLM` streams SSE → `TextDelta` / `ToolCallAssembled` / `LLMError`. Retries on `ClientConnectionError` (3 attempts, exp backoff via tenacity). `Embedder` calls `/v1/embeddings`, auto-batches, numpy fast-path. |
 | `utils/tool_handler.py` | Registers Python functions (sync or async) as LLM tools. Auto-extracts JSON schema from type hints + docstring `Args:` block. |
 
 **Session identity:**
@@ -133,8 +135,10 @@ DELETE /v1/sessions/{id}/history/{eid}     smart-delete entry + dependents
 POST   /v1/sessions/{id}/reset             wipe session context
 GET    /v1/workspace/files/{path}          read any file under workspace root
 PUT    /v1/workspace/files/{path}          write any file under workspace root
-GET    /v1/health                          status + active session list
+GET    /v1/health                          status, uptime_s, per-session queue_depth/queue_max/turns
 ```
+
+**Backpressure:** `POST /message` returns HTTP 429 if the session lane queue is full (default max 32 pending turns). Retry after backoff.
 
 **SSE event types** (`POST /message` with `stream: true`):
 ```json
@@ -191,6 +195,11 @@ Modules must not import from `router.py`, `gateway/`, or any bridge.
 - **Tool functions can be sync or async.** `ToolCallHandler.execute_tool_call` handles both.
 - **Context hooks run in priority order** (lower = first). `priority=0` for early hooks (dedup, memory), `priority=10+` for later (trim).
 - **Sessions persist** to `sessions/<session_key>/<N>.json` after every turn.
+- **Token budget telemetry:** agent logs at INFO when context hits 80% of `context:` limit, WARNING at 95%. These are signals to implement/trigger the compaction module.
+- **LLM retries:** `ai.LLM` retries `ClientConnectionError` up to 3× with exponential backoff (1–8s). Other errors (`LLMError`) pass through immediately.
+- **Queue backpressure:** Lane queues are bounded (32 by default, change `LANE_QUEUE_MAX` in `router.py`). Full queues return `False` from `router.push()` — gateway surfaces this as 429.
+- **Graceful shutdown:** SIGTERM/SIGINT drain in-flight turns before exit. `_flush_history()` completes before the process dies.
+- **Structured logging:** `structlog` with timestamped console output. All loggers use `logging.getLogger(__name__)` — no changes needed in modules.
 - **Always prefer dynamic discovery over hardcoding** — scan filesystem, infer from config, auto-register at runtime.
 - **Suggest before implementing.** For non-trivial changes, propose 2–3 approaches with tradeoffs before writing code.
 

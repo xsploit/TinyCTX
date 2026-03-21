@@ -181,6 +181,21 @@ class AgentLoop:
             tools    = self.tool_handler.get_tool_definitions() or None
             messages = self.context.assemble(tools=tools)
 
+            # Token budget telemetry
+            tokens_used  = self.context.state.get("tokens_used", 0)
+            token_limit  = self.config.context
+            token_pct    = tokens_used / token_limit if token_limit else 0
+            if token_pct >= 0.95:
+                logger.warning(
+                    "[%s] context at %.0f%% of token budget (%d/%d) — consider compaction",
+                    self.session_key, token_pct * 100, tokens_used, token_limit,
+                )
+            elif token_pct >= 0.80:
+                logger.info(
+                    "[%s] context at %.0f%% of token budget (%d/%d)",
+                    self.session_key, token_pct * 100, tokens_used, token_limit,
+                )
+
             # Stage 3: Inference — walk primary → fallback chain
             text_chunks: list[str]      = []
             tool_calls:  list[ToolCall] = []

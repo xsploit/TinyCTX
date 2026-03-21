@@ -31,7 +31,11 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+import logging
+
 from contracts import ToolCall, ToolResult
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +190,7 @@ class Context:
             try:
                 await fn(self)
             except Exception as exc:
-                print(f"[context] async hook '{fn.__name__}' raised: {exc}")
+                logger.exception("Async hook '%s' raised", fn.__name__)
 
     # ------------------------------------------------------------------
     # Prompt provider registration
@@ -365,7 +369,7 @@ class Context:
                 content = provider(self)
             except Exception as exc:
                 content = None
-                print(f"[context] prompt provider '{slot.pid}' raised: {exc}")
+                logger.exception("Prompt provider '%s' raised", slot.pid)
             if content is not None:
                 resolved.append((slot, content))
 

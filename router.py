@@ -24,6 +24,9 @@ EventHandler = Callable[[AgentEvent], Awaitable[None]]
 # Lane
 # ---------------------------------------------------------------------------
 
+LANE_QUEUE_MAX = 32  # max pending turns per lane before backpressure kicks in
+
+
 @dataclass
 class Lane:
     session_key:   SessionKey
@@ -31,12 +34,13 @@ class Lane:
     event_handler: EventHandler
     router:        "Router"
     loop:          AgentLoop = field(init=False)
-    queue:         asyncio.Queue = field(default_factory=asyncio.Queue)
+    queue:         asyncio.Queue = field(init=False)
     _worker:       asyncio.Task | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        self.queue = asyncio.Queue(maxsize=LANE_QUEUE_MAX)
         self.loop = AgentLoop(session_key=self.session_key, config=self.config)
-        self.loop.gateway = self.router  # agent.gateway still works as the push/reset surface
+        self.loop.gateway = self.router
 
     def start(self) -> None:
         if self._worker is None or self._worker.done():
@@ -44,8 +48,17 @@ class Lane:
                 self._drain(), name=f"lane:{self.session_key}"
             )
 
-    async def enqueue(self, msg: InboundMessage) -> None:
-        await self.queue.put(msg)
+    async def enqueue(self, msg: InboundMessage) -> bool:
+        """Enqueue a message. Returns False and drops the message if the queue is full."""
+        try:
+            self.queue.put_nowait(msg)
+            return True
+        except asyncio.QueueFull:
+            logger.warning(
+                "Lane %s queue full (%d/%d) — dropping message %s",
+                self.session_key, self.queue.qsize(), LANE_QUEUE_MAX, msg.trace_id,
+            )
+            return False
 
     async def _drain(self) -> None:
         while True:
@@ -57,7 +70,9 @@ class Lane:
                     except Exception:
                         logger.exception("Event handler raised for event %s", event.trace_id)
             except Exception:
-                logger.exception("AgentLoop raised for %s", self.session_key)
+                logger.exception(
+                    "AgentLoop raised for %s — lane continues", self.session_key
+                )
             finally:
                 self.queue.task_done()
 
@@ -85,10 +100,13 @@ class _SessionRouter:
         self._router        = router
         self._lanes: dict[SessionKey, Lane] = {}
 
-    async def route(self, msg: InboundMessage) -> None:
+    async def route(self, msg: InboundMessage) -> bool:
+        """Route a message to its lane. Returns False if the lane queue is full."""
         lane = self._get_or_create(msg.session_key)
-        await lane.enqueue(msg)
-        logger.debug("Enqueued %s -> %s", msg.trace_id, msg.session_key)
+        accepted = await lane.enqueue(msg)
+        if accepted:
+            logger.debug("Enqueued %s -> %s", msg.trace_id, msg.session_key)
+        return accepted
 
     def _get_or_create(self, key: SessionKey) -> Lane:
         if key not in self._lanes:
@@ -159,10 +177,11 @@ class Router:
     # Message push
     # ------------------------------------------------------------------
 
-    async def push(self, msg: InboundMessage) -> None:
+    async def push(self, msg: InboundMessage) -> bool:
+        """Push a message. Returns False if the session lane queue is full."""
         if msg.session_key.chat_type.value == "dm":
             self._dm_platforms[msg.session_key] = msg.author.platform.value
-        await self._session_router.route(msg)
+        return await self._session_router.route(msg)
 
     # ------------------------------------------------------------------
     # Event dispatch

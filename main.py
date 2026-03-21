@@ -103,4 +103,50 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import signal
+    import sys
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    shutdown_event = asyncio.Event()
+
+    def _request_shutdown():
+        logger.info("Shutdown signal received — draining tasks…")
+        loop.call_soon_threadsafe(shutdown_event.set)
+
+    # SIGINT (Ctrl-C) and SIGTERM both trigger graceful drain.
+    # Windows doesn't support SIGTERM via add_signal_handler, so we fall back
+    # to a KeyboardInterrupt catch at the run level.
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, _request_shutdown)
+    except NotImplementedError:
+        pass  # Windows — KeyboardInterrupt covers SIGINT
+
+    async def _run_with_shutdown():
+        main_task = loop.create_task(main())
+        await asyncio.wait(
+            [main_task, loop.create_task(shutdown_event.wait())],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not main_task.done():
+            logger.info("Cancelling all tasks for graceful shutdown…")
+            for t in asyncio.all_tasks(loop):
+                if t is not asyncio.current_task():
+                    t.cancel()
+            # Give tasks a moment to finish their finally blocks
+            await asyncio.sleep(0.5)
+
+    try:
+        loop.run_until_complete(_run_with_shutdown())
+    except KeyboardInterrupt:
+        logger.info("KeyboardInterrupt — shutting down")
+    finally:
+        pending = asyncio.all_tasks(loop)
+        for t in pending:
+            t.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        loop.close()
+        logger.info("Event loop closed.")

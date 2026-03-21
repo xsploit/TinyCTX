@@ -204,7 +204,13 @@ async def handle_message(request: web.Request) -> web.StreamResponse:
 
         router.register_session_handler(sk, _sse_handler)
         try:
-            await router.push(msg)
+            accepted = await router.push(msg)
+            if not accepted:
+                router.unregister_session_handler(sk)
+                raise web.HTTPTooManyRequests(
+                    content_type="application/json",
+                    body=json.dumps({"error": "session queue full, try again later"}),
+                )
             await done_event.wait()
             await response.write(b'data: {"type": "done"}\n\n')
         finally:
@@ -230,7 +236,13 @@ async def handle_message(request: web.Request) -> web.StreamResponse:
 
         router.register_session_handler(sk, _collect)
         try:
-            await router.push(msg)
+            accepted = await router.push(msg)
+            if not accepted:
+                router.unregister_session_handler(sk)
+                raise web.HTTPTooManyRequests(
+                    content_type="application/json",
+                    body=json.dumps({"error": "session queue full, try again later"}),
+                )
             await asyncio.wait_for(done_event.wait(), timeout=120)
         except asyncio.TimeoutError:
             pass
@@ -404,12 +416,22 @@ async def handle_workspace_put(request: web.Request) -> web.Response:
 
 
 async def handle_health(request: web.Request) -> web.Response:
-    router   = request.app["router"]
-    sessions = [str(sk) for sk in router.active_sessions]
-    return web.Response(
-        content_type="application/json",
-        body=json.dumps({"status": "ok", "sessions": sessions}),
-    )
+    router  = request.app["router"]
+    lanes   = router._session_router._lanes
+    uptime  = time.time() - request.app["start_time"]
+    payload = {
+        "status":   "ok",
+        "uptime_s": round(uptime, 1),
+        "sessions": {
+            str(sk): {
+                "queue_depth": lane.queue.qsize(),
+                "queue_max":   lane.queue.maxsize,
+                "turns":       lane.loop._turn_count,
+            }
+            for sk, lane in lanes.items()
+        },
+    }
+    return web.Response(content_type="application/json", body=json.dumps(payload))
 
 
 # ---------------------------------------------------------------------------
@@ -420,8 +442,9 @@ def _make_app(router, cfg: GatewayConfig) -> web.Application:
     workspace = Path(router._config.workspace.path).expanduser().resolve()
 
     app = web.Application(middlewares=[_auth_middleware(cfg.api_key)])
-    app["router"]    = router
-    app["workspace"] = workspace
+    app["router"]     = router
+    app["workspace"]  = workspace
+    app["start_time"] = time.time()
 
     app.router.add_post(  "/v1/sessions/{session_id}/message",            handle_message)
     app.router.add_get(   "/v1/sessions/{session_id}/history",            handle_history_get)

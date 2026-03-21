@@ -295,8 +295,24 @@ def load(path="config.yaml") -> Config:
 
 
 def apply_logging(cfg: LoggingConfig) -> None:
+    import structlog
+
     logging.basicConfig(
         level=getattr(logging, cfg.level),
-        format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
+        format="%(message)s",
         datefmt="%H:%M:%S",
+    )
+
+    structlog.configure(
+        processors=[
+            structlog.stdlib.add_log_level,
+            structlog.stdlib.add_logger_name,
+            structlog.processors.TimeStamper(fmt="%H:%M:%S", utc=False),
+            structlog.processors.StackInfoRenderer(),
+            structlog.dev.ConsoleRenderer(),
+        ],
+        wrapper_class=structlog.stdlib.BoundLogger,
+        context_class=dict,
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        cache_logger_on_first_use=True,
     )
