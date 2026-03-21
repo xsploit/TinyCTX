@@ -225,7 +225,7 @@ Token-budget trimming in `assemble()` follows the same rules: assistant turns wi
 | Module | What it does |
 |--------|-------------|
 | `memory` | Static: injects SOUL.md, AGENTS.md, MEMORY.md as system prompts. Dynamic: hybrid BM25+vector search over `workspace/memory/**/*.md` via async pre-assemble hook + `memory_search` tool. Config key: `memory_search:`. |
-| `filesystem` | Tools: `shell`, `view`, `create_file`, `str_replace`. Sandboxed to workspace. |
+| `filesystem` | Tools: `shell`, `view`, `create_file`, `str_replace`. Sandboxed to workspace. Shell execution split into `shell.py` (platform detection, blacklist, subprocess dispatch). On Linux/macOS runs via `bash -c`; on Windows via `powershell -NonInteractive`. Blacklist (`blacklist.txt`, glob patterns, case-insensitive) enforced on both platforms — covers bulk destruction, RCE, privilege escalation, persistence, system path writes, and more. Blocked commands return an error string. Blacklist loaded at `register()` time; restart to reload. |
 | `web` | Tools: `web_search` (DuckDuckGo), `http_request`, `navigate`/`click`/`type_text`/`extract_text`/`extract_html`/`screenshot`/`wait_for` (Playwright), `manage_browser`. |
 | `cron` | Scheduled agent turns. Jobs in `workspace/CRON.json`. Schedule kinds: `every`, `at`, `cron` (requires `croniter`). Tool: `cron_list`. Each job gets its own isolated session (`dm:cron-<id>`). `reset_after_run: true` wipes session context after each run. |
 | `heartbeat` | Periodic timer turns. Agent replies `HEARTBEAT_OK` if nothing needs attention; otherwise triggers a continuation loop. Configurable active hours. |
