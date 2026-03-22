@@ -46,6 +46,48 @@ LLMEvent = TextDelta | ToolCallAssembled | LLMError
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _inject_cache_control(messages: list[dict]) -> list[dict]:
+    """
+    Return a shallow copy of messages with Anthropic prompt-caching headers
+    injected on the last system message.
+
+    The last system message's content is converted to a content-block list
+    if it isn't already one, and a cache_control block is appended:
+        {"type": "text", "text": "...", "cache_control": {"type": "ephemeral"}}
+
+    If no system message is present, messages are returned unchanged.
+    """
+    # Find the last system message index
+    last_sys = next(
+        (i for i in range(len(messages) - 1, -1, -1) if messages[i].get("role") == "system"),
+        None,
+    )
+    if last_sys is None:
+        return messages
+
+    messages = list(messages)  # shallow copy — don't mutate caller's list
+    msg = dict(messages[last_sys])  # copy the message dict
+    content = msg.get("content", "")
+
+    if isinstance(content, str):
+        # Convert plain string to a content-block list with cache_control
+        msg["content"] = [{"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}]
+    elif isinstance(content, list) and content:
+        # Already a list — tag the last block
+        blocks = list(content)
+        last_block = dict(blocks[-1])
+        last_block["cache_control"] = {"type": "ephemeral"}
+        blocks[-1] = last_block
+        msg["content"] = blocks
+
+    messages[last_sys] = msg
+    return messages
+
+
+# ---------------------------------------------------------------------------
 # Chat client
 # ---------------------------------------------------------------------------
 
@@ -58,19 +100,25 @@ class LLM:
 
     def __init__(
         self,
-        base_url:    str,
-        api_key:     str,
-        model:       str,
-        max_tokens:  int   = 2048,
-        temperature: float = 0.7,
-        timeout:     int   = 60,
+        base_url:         str,
+        api_key:          str,
+        model:            str,
+        max_tokens:       int        = 2048,
+        temperature:      float      = 0.7,
+        timeout:          int        = 60,
+        budget_tokens:    int | None = None,
+        reasoning_effort: str | None = None,
+        cache_prompts:    bool       = False,
     ) -> None:
-        self.model       = model
-        self.endpoint    = f"{base_url.rstrip('/')}/chat/completions"
-        self.api_key     = api_key
-        self.max_tokens  = max_tokens
-        self.temperature = temperature
-        self.timeout     = aiohttp.ClientTimeout(total=timeout)
+        self.model            = model
+        self.endpoint         = f"{base_url.rstrip('/')}/chat/completions"
+        self.api_key          = api_key
+        self.max_tokens       = max_tokens
+        self.temperature      = temperature
+        self.timeout          = aiohttp.ClientTimeout(total=timeout)
+        self.budget_tokens    = budget_tokens
+        self.reasoning_effort = reasoning_effort
+        self.cache_prompts    = cache_prompts
 
     async def stream(
         self,
@@ -101,15 +149,33 @@ class LLM:
         messages: list[dict],
         tools:    list[dict] | None = None,
     ) -> AsyncIterator[LLMEvent]:
+        # --- cache_prompts: inject ephemeral cache_control on last system message ---
+        if self.cache_prompts:
+            messages = _inject_cache_control(messages)
+
+        # --- budget_tokens: Anthropic extended thinking ---
+        temperature = self.temperature
+        if self.budget_tokens is not None:
+            if temperature != 1.0:
+                logger.warning(
+                    "budget_tokens requires temperature=1; overriding %.2f → 1.0 for model %s",
+                    temperature, self.model,
+                )
+                temperature = 1.0
+
         payload: dict[str, Any] = {
             "model":       self.model,
             "messages":    messages,
-            "temperature": self.temperature,
+            "temperature": temperature,
             "max_tokens":  self.max_tokens,
             "stream":      True,
         }
         if tools:
             payload["tools"] = tools
+        if self.budget_tokens is not None:
+            payload["thinking"] = {"type": "enabled", "budget_tokens": self.budget_tokens}
+        if self.reasoning_effort is not None:
+            payload["reasoning_effort"] = self.reasoning_effort
 
         headers = {
             "Content-Type":  "application/json",

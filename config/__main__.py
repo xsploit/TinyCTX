@@ -23,8 +23,11 @@ class ModelConfig:
     base_url:    str
     kind:        str   = "chat"       # "chat" | "embedding"
     api_key_env: str   = "ANTHROPIC_API_KEY"
-    max_tokens:  int   = 2048
-    temperature: float = 0.7
+    max_tokens:       int        = 2048
+    temperature:      float      = 0.7
+    budget_tokens:    int | None = None   # Anthropic extended thinking: budget_tokens > 0
+    reasoning_effort: str | None = None   # OpenAI-compat: "low" | "medium" | "high"
+    cache_prompts:    bool        = False  # Anthropic prompt caching on last system message
 
     @property
     def api_key(self) -> str:
@@ -185,6 +188,18 @@ def _parse_model(raw: dict) -> ModelConfig:
     kind = raw.get("kind", "chat").lower()
     if kind not in ("chat", "embedding"):
         raise ValueError(f"Model kind must be 'chat' or 'embedding', got '{kind}'")
+    reasoning_effort = raw.get("reasoning_effort")
+    if reasoning_effort is not None and reasoning_effort not in ("low", "medium", "high"):
+        raise ValueError(
+            f"reasoning_effort must be 'low', 'medium', or 'high', got '{reasoning_effort}'"
+        )
+
+    budget_tokens = raw.get("budget_tokens")
+    if budget_tokens is not None:
+        budget_tokens = int(budget_tokens)
+        if budget_tokens <= 0:
+            raise ValueError(f"budget_tokens must be > 0, got {budget_tokens}")
+
     return ModelConfig(
         model=raw["model"],
         base_url=raw["base_url"],
@@ -192,6 +207,9 @@ def _parse_model(raw: dict) -> ModelConfig:
         api_key_env=raw.get("api_key_env", "ANTHROPIC_API_KEY"),
         max_tokens=int(raw.get("max_tokens", 2048)),
         temperature=float(raw.get("temperature", 0.7)),
+        budget_tokens=budget_tokens,
+        reasoning_effort=reasoning_effort,
+        cache_prompts=bool(raw.get("cache_prompts", False)),
     )
 
 

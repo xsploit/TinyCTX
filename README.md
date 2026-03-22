@@ -180,7 +180,9 @@ Layout:
 ├── AGENTS.md      # Sub-agent or persona definitions
 ├── MEMORY.md      # Long-term facts always in context
 ├── memory/        # Semantic search corpus — any *.md files here are searchable
+│   ├── session-YYYY-MM-DD.md   # Session notes written by the agent
 │   └── ...
+├── uploads/       # Files and images sent by users via bridges; agent can read these
 ├── CRON.json      # Scheduled jobs (cron module)
 └── skills/        # Skill folders
     └── mytool/

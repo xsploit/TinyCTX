@@ -57,7 +57,6 @@ MODULES_DIR = Path("modules")
 
 
 def _build_llm(cfg: ModelConfig) -> LLM:
-    api_key = cfg.api_key if cfg.api_key_env.upper() != "N/A" else "no-key"
     try:
         api_key = cfg.api_key
     except EnvironmentError:
@@ -68,6 +67,9 @@ def _build_llm(cfg: ModelConfig) -> LLM:
         model=cfg.model,
         max_tokens=cfg.max_tokens,
         temperature=cfg.temperature,
+        budget_tokens=cfg.budget_tokens,
+        reasoning_effort=cfg.reasoning_effort,
+        cache_prompts=cfg.cache_prompts,
     )
 
 

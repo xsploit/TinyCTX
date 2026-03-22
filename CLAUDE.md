@@ -266,6 +266,8 @@ The memory module has two layers:
 | `AGENTS.md` | Definitions of sub-agents, personas, or role instructions. |
 | `MEMORY.md` | Long-term facts the agent should always have in context. |
 | `memory/*.md` | Arbitrary knowledge files — searched semantically each turn. Subdirectories supported. |
+| `memory/session-{date}.md` | Session-scoped notes written by the agent on nudge (ongoing tasks, decisions, per-session context). |
+| `uploads/` | Files and images delivered by users via any bridge. Small files may be inlined as base64; larger ones are saved here and the agent is notified to read them via filesystem tools. |
 | `CRON.json` | Scheduled jobs (cron module). |
 | `HEARTBEAT.md` | Standing instructions for heartbeat ticks (read by agent via filesystem tools). |
 | `skills/` | Skill folders following agentskills.io convention, each containing `SKILL.md`. |
