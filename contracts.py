@@ -24,7 +24,18 @@ class Platform(str, Enum):
 
 
 class ContentType(str, Enum):
-    TEXT = "text"
+    TEXT             = "text"
+    MIXED            = "mixed"            # text + attachments
+    ATTACHMENT_ONLY  = "attachment_only"  # attachments with no text
+
+
+def content_type_for(text: str, has_attachments: bool) -> "ContentType":
+    """Derive the correct ContentType from message text and attachment presence."""
+    if has_attachments and text:
+        return ContentType.MIXED
+    if has_attachments:
+        return ContentType.ATTACHMENT_ONLY
+    return ContentType.TEXT
 
 
 class AttachmentKind(str, Enum):

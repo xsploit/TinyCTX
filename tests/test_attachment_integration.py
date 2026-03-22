@@ -56,10 +56,11 @@ def _png_bytes() -> bytes:
 
 
 def _make_msg(text="hi", attachments=()) -> InboundMessage:
+    from contracts import content_type_for
     return InboundMessage(
         session_key=SessionKey.dm("u1"),
         author=UserIdentity(platform=Platform.CLI, user_id="u1", username="alice"),
-        content_type=ContentType.TEXT if not attachments else ContentType.MIXED,
+        content_type=content_type_for(text, bool(attachments)),
         text=text,
         message_id="msg-1",
         timestamp=0.0,
@@ -132,9 +133,17 @@ class TestInboundMessageAttachments:
         with pytest.raises((AttributeError, TypeError)):
             msg.text = "changed"  # type: ignore
 
-    def test_content_type_mixed_when_attachments_present(self):
-        msg = _make_msg(attachments=(_att(),))
+    def test_content_type_mixed_when_text_and_attachments(self):
+        msg = _make_msg(text="hi", attachments=(_att(),))
         assert msg.content_type == ContentType.MIXED
+
+    def test_content_type_attachment_only_when_no_text(self):
+        msg = _make_msg(text="", attachments=(_att(),))
+        assert msg.content_type == ContentType.ATTACHMENT_ONLY
+
+    def test_content_type_text_when_no_attachments(self):
+        msg = _make_msg(text="hello")
+        assert msg.content_type == ContentType.TEXT
 
 
 # ---------------------------------------------------------------------------

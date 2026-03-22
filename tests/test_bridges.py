@@ -134,16 +134,44 @@ def _stub_nio():
             self.body = body
             self.event_id = event_id
             self.server_timestamp = int(time.time() * 1000)  # fresh
+            self.source = {}
+
+    class RoomMessageMedia:
+        def __init__(self, sender="@user:server", body="file", url="mxc://server/abc", event_id="$media1"):
+            self.sender = sender
+            self.body = body
+            self.url = url
+            self.event_id = event_id
+            self.server_timestamp = int(time.time() * 1000)
+            self.source = {"content": {"body": body}}
+            self.info = {"mimetype": "application/octet-stream"}
+
+    class RoomMessageImage(RoomMessageMedia):
+        pass
+
+    class RoomMessageFile(RoomMessageMedia):
+        pass
+
+    class RoomMessageAudio(RoomMessageMedia):
+        pass
+
+    class RoomMessageVideo(RoomMessageMedia):
+        pass
 
     class SyncError:
         pass
 
-    nio.AsyncClient       = AsyncClient
-    nio.AsyncClientConfig = AsyncClientConfig
-    nio.LoginResponse     = LoginResponse
-    nio.MatrixRoom        = MatrixRoom
-    nio.RoomMessageText   = RoomMessageText
-    nio.SyncError         = SyncError
+    nio.AsyncClient        = AsyncClient
+    nio.AsyncClientConfig  = AsyncClientConfig
+    nio.LoginResponse      = LoginResponse
+    nio.MatrixRoom         = MatrixRoom
+    nio.RoomMessageText    = RoomMessageText
+    nio.RoomMessageMedia   = RoomMessageMedia
+    nio.RoomMessageImage   = RoomMessageImage
+    nio.RoomMessageFile    = RoomMessageFile
+    nio.RoomMessageAudio   = RoomMessageAudio
+    nio.RoomMessageVideo   = RoomMessageVideo
+    nio.SyncError          = SyncError
     sys.modules["nio"] = nio
     return nio
 

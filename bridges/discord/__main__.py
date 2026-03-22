@@ -49,7 +49,9 @@ from contracts import (
     AgentTextFinal,
     AgentToolCall,
     AgentToolResult,
+    Attachment,
     ContentType,
+    content_type_for,
     InboundMessage,
     Platform,
     SessionKey,
@@ -264,7 +266,23 @@ class DiscordBridge:
                 text = text[len(self._prefix):]
             text = text.strip()
 
-        if not text:
+        # Collect attachments from the Discord message.
+        attachments: tuple[Attachment, ...] = ()
+        if message.attachments:
+            fetched = []
+            for a in message.attachments:
+                try:
+                    import aiohttp
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(a.url) as resp:
+                            data = await resp.read()
+                    mime = a.content_type or "application/octet-stream"
+                    fetched.append(Attachment(filename=a.filename, data=data, mime_type=mime))
+                except Exception:
+                    logger.warning("Discord: failed to download attachment %s", a.filename)
+            attachments = tuple(fetched)
+
+        if not text and not attachments:
             return
 
         author = UserIdentity(
@@ -275,10 +293,11 @@ class DiscordBridge:
         msg = InboundMessage(
             session_key=session_key,
             author=author,
-            content_type=ContentType.TEXT,
+            content_type=content_type_for(text, bool(attachments)),
             text=text,
             message_id=str(message.id),
             timestamp=time.time(),
+            attachments=attachments,
         )
 
         session_key_str = str(session_key)

@@ -56,6 +56,21 @@ from nio import (
     RoomMessageText,
     SyncError,
 )
+# Media event types were added in matrix-nio 0.20+. Import defensively so the
+# bridge still loads on older installs — media attachments just won't work.
+try:
+    from nio import (
+        RoomMessageAudio,
+        RoomMessageFile,
+        RoomMessageImage,
+        RoomMessageMedia,
+        RoomMessageVideo,
+    )
+    _HAS_MEDIA_EVENTS = True
+except ImportError:
+    RoomMessageAudio = RoomMessageFile = RoomMessageImage = None  # type: ignore
+    RoomMessageMedia = RoomMessageVideo = None                     # type: ignore
+    _HAS_MEDIA_EVENTS = False
 
 from contracts import (
     AgentError,
@@ -63,7 +78,9 @@ from contracts import (
     AgentTextFinal,
     AgentToolCall,
     AgentToolResult,
+    Attachment,
     ContentType,
+    content_type_for,
     InboundMessage,
     Platform,
     SessionKey,
@@ -161,6 +178,13 @@ class MatrixBridge:
 
         # session_key_str → _ReplyAccumulator for the active turn
         self._accumulators: dict[str, _ReplyAccumulator] = {}
+
+        # event_id → list[Attachment] — media events queued until their
+        # paired text event (or standalone) is ready to dispatch.
+        # Matrix sends media as separate events, not inline with text.
+        # We buffer them keyed by sender+room so they attach to the next
+        # message from that sender in that room.
+        self._pending_attachments: dict[str, list[Attachment]] = {}
 
         # Populated in run() after login
         self._client: AsyncClient | None = None
@@ -280,13 +304,19 @@ class MatrixBridge:
             user_id=event.sender,
             username=room.user_name(event.sender) or event.sender,
         )
+        # Collect any attachment for this sender+room that arrived just before
+        # this text event (Matrix sends media as a separate event).
+        att_key = f"{event.sender}:{room.room_id}"
+        attachments = tuple(self._pending_attachments.pop(att_key, []))
+
         msg = InboundMessage(
             session_key=session_key,
             author=author,
-            content_type=ContentType.TEXT,
+            content_type=content_type_for(text, bool(attachments)),
             text=text,
             message_id=event.event_id,
             timestamp=time.time(),
+            attachments=attachments,
         )
 
         session_key_str = str(session_key)
@@ -296,6 +326,52 @@ class MatrixBridge:
         asyncio.create_task(
             self._handle_turn(msg, room.room_id, session_key_str, acc)
         )
+
+    async def _on_media(self, room: MatrixRoom, event: RoomMessageMedia) -> None:
+        """Handle m.image / m.file / m.audio / m.video events.
+
+        Matrix media arrives as a separate event from any accompanying text.
+        We download the bytes immediately and stash them in
+        _pending_attachments keyed by sender+room.  The next _on_message
+        call from the same sender in the same room picks them up.
+
+        If no text follows within the same turn, the media is lost — bridges
+        are expected to send a text message alongside media (or the agent will
+        only receive a reference note via build_content_blocks).
+        """
+        if event.sender == self._own_user_id:
+            return
+        if not self._is_allowed(event.sender):
+            return
+
+        if self._client is None:
+            return
+
+        url: str = getattr(event, "url", "") or ""
+        filename: str = (
+            (event.source.get("content") or {}).get("body")
+            or getattr(event, "body", None)
+            or "attachment"
+        )
+        # Infer MIME from the event info dict or fall back to octet-stream.
+        info: dict = getattr(event, "info", None) or {}
+        mime: str = info.get("mimetype", "application/octet-stream")
+
+        if not url:
+            logger.warning("Matrix: media event from %s has no url", event.sender)
+            return
+
+        try:
+            resp = await self._client.download(url)
+            data: bytes = resp.body if hasattr(resp, "body") else bytes(resp)
+        except Exception:
+            logger.warning("Matrix: failed to download media from %s", event.sender)
+            return
+
+        att = Attachment(filename=filename, data=data, mime_type=mime)
+        key = f"{event.sender}:{room.room_id}"
+        self._pending_attachments.setdefault(key, []).append(att)
+        logger.debug("Matrix: buffered attachment %s (%s) from %s", filename, mime, event.sender)
 
     async def _handle_turn(
         self,
@@ -375,8 +451,16 @@ class MatrixBridge:
 
         self._router.register_platform_handler(Platform.MATRIX.value, self.handle_event)
 
-        # Register the nio callback.
+        # Register nio callbacks — text and all media types.
         client.add_event_callback(self._on_message, RoomMessageText)
+        if _HAS_MEDIA_EVENTS:
+            for media_cls in (RoomMessageImage, RoomMessageFile, RoomMessageAudio, RoomMessageVideo):
+                client.add_event_callback(self._on_media, media_cls)
+        else:
+            logger.warning(
+                "Matrix bridge: media event types not available in this nio version — "
+                "file/image attachments will not be received. Upgrade matrix-nio."
+            )
 
         logger.info("Matrix bridge: starting sync loop")
         try:

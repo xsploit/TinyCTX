@@ -64,7 +64,7 @@ from aiohttp import web
 
 from config import GatewayConfig
 from contracts import (
-    Platform, ContentType,
+    Platform, ContentType, content_type_for,
     SessionKey, UserIdentity, InboundMessage, Attachment,
     AgentTextChunk, AgentTextFinal, AgentToolCall, AgentToolResult, AgentError,
 )
@@ -172,7 +172,7 @@ async def handle_message(request: web.Request) -> web.StreamResponse:
     msg = InboundMessage(
         session_key=sk,
         author=_API_AUTHOR,
-        content_type=ContentType.TEXT if not attachments else ContentType.MIXED,
+        content_type=content_type_for(text, bool(attachments)),
         text=text,
         message_id=str(time.time_ns()),
         timestamp=time.time(),
