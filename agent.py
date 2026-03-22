@@ -43,12 +43,12 @@ from typing import AsyncIterator
 
 from contracts import (
     InboundMessage, AgentEvent,
-    AgentTextChunk, AgentTextFinal, AgentToolCall, AgentToolResult, AgentError,
+    AgentThinkingChunk, AgentTextChunk, AgentTextFinal, AgentToolCall, AgentToolResult, AgentError,
     ToolCall, ToolResult, SessionKey,
 )
 from context import Context, HistoryEntry, HOOK_PRE_ASSEMBLE_ASYNC
 from config import Config, ModelConfig
-from ai import LLM, TextDelta, ToolCallAssembled, LLMError
+from ai import LLM, TextDelta, ThinkingDelta, ToolCallAssembled, LLMError
 from utils.tool_handler import ToolCallHandler
 from utils.attachments import build_content_blocks
 
@@ -230,7 +230,10 @@ class AgentLoop:
                 last_http_status = None
 
                 async for llm_event in llm.stream(messages, tools=tools):
-                    if isinstance(llm_event, TextDelta):
+                    if isinstance(llm_event, ThinkingDelta):
+                        yield AgentThinkingChunk(text=llm_event.text, **ev)
+
+                    elif isinstance(llm_event, TextDelta):
                         text_chunks.append(llm_event.text)
                         # Only stream text on the final cycle (no tool calls yet).
                         # If tool calls arrive later this cycle, we've already

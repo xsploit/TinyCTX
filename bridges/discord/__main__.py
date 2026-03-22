@@ -45,6 +45,7 @@ import discord
 
 from contracts import (
     AgentError,
+    AgentThinkingChunk,
     AgentTextChunk,
     AgentTextFinal,
     AgentToolCall,
@@ -76,6 +77,9 @@ DEFAULTS = {
     "command_prefix": "!",
     "max_reply_length": 1900,
     "typing_indicator": True,
+    "typing_on_thinking": True,
+    "typing_on_tools": True,
+    "typing_on_reply": True,
 }
 
 
@@ -133,6 +137,9 @@ class DiscordBridge:
         self._opts = {**DEFAULTS, **options}
         self._max_len: int = int(self._opts["max_reply_length"])
         self._typing: bool = bool(self._opts["typing_indicator"])
+        self._typing_on_thinking: bool = bool(self._opts["typing_on_thinking"])
+        self._typing_on_tools: bool = bool(self._opts["typing_on_tools"])
+        self._typing_on_reply: bool = bool(self._opts["typing_on_reply"])
         self._prefix: str = str(self._opts["command_prefix"])
         self._prefix_required: bool = bool(self._opts["prefix_required"])
         self._dm_enabled: bool = bool(self._opts["dm_enabled"])
@@ -144,6 +151,8 @@ class DiscordBridge:
 
         # session_key → _ReplyAccumulator for the active turn
         self._accumulators: dict[str, _ReplyAccumulator] = {}
+        # session_key → asyncio.Event signalling that typing should be active
+        self._typing_active: dict[str, asyncio.Event] = {}
 
         intents = discord.Intents.default()
         intents.message_content = True      # privileged — enable in Dev Portal
@@ -171,13 +180,23 @@ class DiscordBridge:
             logger.debug("Discord: received event for unknown session %s", session_key_str)
             return
 
-        if isinstance(event, AgentTextChunk):
+        typing_ev = self._typing_active.get(session_key_str)
+
+        if isinstance(event, AgentThinkingChunk):
+            if typing_ev and self._typing_on_thinking:
+                typing_ev.set()
+
+        elif isinstance(event, AgentTextChunk):
+            if typing_ev and self._typing_on_reply:
+                typing_ev.set()
             acc.feed(event.text)
 
         elif isinstance(event, AgentTextFinal):
             acc.finish(event.text)
 
         elif isinstance(event, AgentToolCall):
+            if typing_ev and self._typing_on_tools:
+                typing_ev.set()
             logger.debug(
                 "Discord: tool call %s(%s) in session %s",
                 event.tool_name,
@@ -311,6 +330,27 @@ class DiscordBridge:
             self._handle_turn(msg, message.channel, session_key_str, acc)
         )
 
+    async def _typing_keepalive(
+        self,
+        channel: discord.abc.Messageable,
+        active_event: asyncio.Event,
+        done_event: asyncio.Event,
+    ) -> None:
+        """Sends typing indicators while active_event is set, until done_event fires."""
+        while not done_event.is_set():
+            await active_event.wait()
+            if done_event.is_set():
+                break
+            try:
+                await channel.typing().__aenter__()
+            except Exception:
+                pass
+            # Discord typing lasts ~10s; re-trigger every 8s
+            try:
+                await asyncio.wait_for(done_event.wait(), timeout=8.0)
+            except asyncio.TimeoutError:
+                pass
+
     async def _handle_turn(
         self,
         msg: InboundMessage,
@@ -318,6 +358,10 @@ class DiscordBridge:
         session_key_str: str,
         acc: _ReplyAccumulator,
     ) -> None:
+        done_event = asyncio.Event()
+        typing_ev = asyncio.Event()
+        self._typing_active[session_key_str] = typing_ev
+
         try:
             accepted = await self._router.push(msg)
             if not accepted:
@@ -325,14 +369,23 @@ class DiscordBridge:
                 return
 
             if self._typing:
-                async with channel.typing():
+                keepalive = asyncio.create_task(
+                    self._typing_keepalive(channel, typing_ev, done_event)
+                )
+                try:
                     await acc.wait_and_send()
+                finally:
+                    done_event.set()
+                    typing_ev.set()  # unblock keepalive if still waiting
+                    keepalive.cancel()
             else:
                 await acc.wait_and_send()
         except Exception:
             logger.exception("Discord: error handling turn for session %s", session_key_str)
         finally:
+            done_event.set()
             self._accumulators.pop(session_key_str, None)
+            self._typing_active.pop(session_key_str, None)
 
     # ------------------------------------------------------------------
     # Entry point

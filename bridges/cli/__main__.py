@@ -21,7 +21,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from contracts import (
     Platform, ContentType,
     SessionKey, UserIdentity, InboundMessage,
-    AgentTextChunk, AgentTextFinal, AgentToolCall, AgentToolResult, AgentError,
+    AgentThinkingChunk, AgentTextChunk, AgentTextFinal, AgentToolCall, AgentToolResult, AgentError,
 )
 
 logger = logging.getLogger(__name__)
@@ -36,15 +36,27 @@ class CLIBridge:
         self._gateway    = gateway
         self._reply_done = asyncio.Event()
         self._streaming  = False  # True once we've printed "agent: " prefix
+        self._thinking   = False  # True while reasoning_content tokens are arriving
 
     async def handle_event(self, event) -> None:
+        if isinstance(event, AgentThinkingChunk):
+            if not self._thinking:
+                print("\n...Thinking...", end="", flush=True)
+                self._thinking = True
+            return
+
         if isinstance(event, AgentTextChunk):
+            if self._thinking:
+                # Clear the thinking indicator before first reply token
+                print("\r                \r", end="", flush=True)
+                self._thinking = False
             if not self._streaming:
                 print("\nagent: ", end="", flush=True)
                 self._streaming = True
             print(event.text, end="", flush=True)
 
         elif isinstance(event, AgentTextFinal):
+            self._thinking = False
             if self._streaming:
                 if event.text:
                     # Non-streaming fallback: full text arrived at once.
@@ -58,6 +70,9 @@ class CLIBridge:
             self._reply_done.set()
 
         elif isinstance(event, AgentToolCall):
+            if self._thinking:
+                print("\r                \r", end="", flush=True)
+                self._thinking = False
             args_str = ", ".join(f"{k}={v!r}" for k, v in event.args.items())
             print(f"\n[tool → {event.tool_name}({args_str})]")
 

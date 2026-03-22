@@ -74,6 +74,7 @@ except ImportError:
 
 from contracts import (
     AgentError,
+    AgentThinkingChunk,
     AgentTextChunk,
     AgentTextFinal,
     AgentToolCall,
@@ -107,6 +108,10 @@ DEFAULTS = {
     "command_prefix": "!",
     "max_reply_length": 16000,
     "sync_timeout_ms": 30000,
+    "typing_indicator": True,
+    "typing_on_thinking": True,
+    "typing_on_tools": True,
+    "typing_on_reply": True,
 }
 
 
@@ -162,6 +167,10 @@ class MatrixBridge:
         self._dm_enabled: bool = bool(self._opts["dm_enabled"])
         self._room_ids: set[str] = set(self._opts["room_ids"])
         self._sync_timeout: int = int(self._opts["sync_timeout_ms"])
+        self._typing: bool = bool(self._opts["typing_indicator"])
+        self._typing_on_thinking: bool = bool(self._opts["typing_on_thinking"])
+        self._typing_on_tools: bool = bool(self._opts["typing_on_tools"])
+        self._typing_on_reply: bool = bool(self._opts["typing_on_reply"])
 
         # allowed_users: empty set = open access (warn at startup)
         raw_allowed: list = self._opts["allowed_users"]
@@ -178,6 +187,8 @@ class MatrixBridge:
 
         # session_key_str → _ReplyAccumulator for the active turn
         self._accumulators: dict[str, _ReplyAccumulator] = {}
+        # session_key_str → asyncio.Event signalling that typing should be active
+        self._typing_active: dict[str, asyncio.Event] = {}
 
         # event_id → list[Attachment] — media events queued until their
         # paired text event (or standalone) is ready to dispatch.
@@ -244,12 +255,25 @@ class MatrixBridge:
             logger.debug("Matrix: received event for unknown session %s", session_key_str)
             return
 
-        if isinstance(event, AgentTextChunk):
+        typing_ev = self._typing_active.get(session_key_str)
+
+        if isinstance(event, AgentThinkingChunk):
+            if typing_ev and self._typing_on_thinking:
+                typing_ev.set()
+
+        elif isinstance(event, AgentTextChunk):
+            if typing_ev and self._typing_on_reply:
+                typing_ev.set()
             acc.feed(event.text)
+
         elif isinstance(event, AgentTextFinal):
             acc.finish(event.text)
+
         elif isinstance(event, AgentToolCall):
+            if typing_ev and self._typing_on_tools:
+                typing_ev.set()
             logger.debug("Matrix: tool call %s in session %s", event.tool_name, session_key_str)
+
         elif isinstance(event, AgentToolResult):
             logger.debug(
                 "Matrix: tool result %s (%s) in session %s",
@@ -257,6 +281,7 @@ class MatrixBridge:
                 "error" if event.is_error else "ok",
                 session_key_str,
             )
+
         elif isinstance(event, AgentError):
             acc.error(event.message)
 
@@ -373,6 +398,34 @@ class MatrixBridge:
         self._pending_attachments.setdefault(key, []).append(att)
         logger.debug("Matrix: buffered attachment %s (%s) from %s", filename, mime, event.sender)
 
+    async def _typing_keepalive(
+        self,
+        room_id: str,
+        active_event: asyncio.Event,
+        done_event: asyncio.Event,
+    ) -> None:
+        """Sends typing notifications while active_event is set, until done_event fires."""
+        while not done_event.is_set():
+            await active_event.wait()
+            if done_event.is_set():
+                break
+            if self._client:
+                try:
+                    await self._client.room_typing(room_id, typing_state=True, timeout=30000)
+                except Exception:
+                    pass
+            # Re-send every 25s (Matrix typing times out at 30s)
+            try:
+                await asyncio.wait_for(done_event.wait(), timeout=25.0)
+            except asyncio.TimeoutError:
+                pass
+        # Clear typing indicator when done
+        if self._client:
+            try:
+                await self._client.room_typing(room_id, typing_state=False)
+            except Exception:
+                pass
+
     async def _handle_turn(
         self,
         msg: InboundMessage,
@@ -380,19 +433,37 @@ class MatrixBridge:
         session_key_str: str,
         acc: _ReplyAccumulator,
     ) -> None:
+        done_event = asyncio.Event()
+        typing_ev = asyncio.Event()
+        self._typing_active[session_key_str] = typing_ev
+
         try:
             accepted = await self._router.push(msg)
             if not accepted:
                 await self._send(room_id, "⏳ I'm busy — please try again in a moment.")
                 return
 
-            chunks = await acc.wait()
+            if self._typing:
+                keepalive = asyncio.create_task(
+                    self._typing_keepalive(room_id, typing_ev, done_event)
+                )
+                try:
+                    chunks = await acc.wait()
+                finally:
+                    done_event.set()
+                    typing_ev.set()  # unblock keepalive if still waiting
+                    keepalive.cancel()
+            else:
+                chunks = await acc.wait()
+
             for chunk in chunks:
                 await self._send(room_id, chunk)
         except Exception:
             logger.exception("Matrix: error handling turn for session %s", session_key_str)
         finally:
+            done_event.set()
             self._accumulators.pop(session_key_str, None)
+            self._typing_active.pop(session_key_str, None)
 
     async def _send(self, room_id: str, text: str) -> None:
         if self._client is None:

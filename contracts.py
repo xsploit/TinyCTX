@@ -164,6 +164,12 @@ class _AgentEventBase:
 
 
 @dataclass(frozen=True)
+class AgentThinkingChunk(_AgentEventBase):
+    """One reasoning/thinking token (reasoning_content field). Never stored in context."""
+    text: str
+
+
+@dataclass(frozen=True)
 class AgentTextChunk(_AgentEventBase):
     """One streaming text token. is_partial is always True."""
     text: str
@@ -202,7 +208,7 @@ class AgentError(_AgentEventBase):
 
 
 # Union type used in type hints throughout the codebase.
-AgentEvent = Union[AgentTextChunk, AgentTextFinal, AgentToolCall, AgentToolResult, AgentError]
+AgentEvent = Union[AgentThinkingChunk, AgentTextChunk, AgentTextFinal, AgentToolCall, AgentToolResult, AgentError]
 
 
 # ---------------------------------------------------------------------------

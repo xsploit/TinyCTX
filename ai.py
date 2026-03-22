@@ -31,6 +31,10 @@ class TextDelta:
     text: str
 
 @dataclass
+class ThinkingDelta:
+    text: str
+
+@dataclass
 class ToolCallAssembled:
     """Emitted once per tool call, after all argument chunks are assembled."""
     call_id:   str
@@ -42,7 +46,7 @@ class LLMError:
     message: str
 
 
-LLMEvent = TextDelta | ToolCallAssembled | LLMError
+LLMEvent = TextDelta | ThinkingDelta | ToolCallAssembled | LLMError
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +216,10 @@ class LLM:
                         if not choices:
                             continue
                         delta = choices[0].get("delta", {})
+
+                        # Reasoning/thinking tokens (DeepSeek-R1 / llama-swap style)
+                        if reasoning := delta.get("reasoning_content"):
+                            yield ThinkingDelta(text=reasoning)
 
                         # Text content
                         if text := delta.get("content"):
