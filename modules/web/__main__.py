@@ -548,6 +548,32 @@ def register(agent) -> None:
         else:
             return f"Error: unknown action '{action}'. Valid: {valid}"
 
+    # Defaults: web_search and navigate are always_on; the rest are deferred.
+    # Can be overridden per-tool via config: web.tools.<tool_name>: always_on|deferred|disabled
+    try:
+        from modules.web import EXTENSION_META as _META
+        _tools_cfg: dict = _META.get("default_config", {}).get("tools", {})
+    except ImportError:
+        _tools_cfg = {}
+    # Also allow runtime config.yaml override under web.tools:
+    _runtime_tools_cfg: dict = {}
+    if hasattr(agent.config, "extra") and isinstance(agent.config.extra, dict):
+        _runtime_tools_cfg = agent.config.extra.get("web", {}).get("tools", {})
+    _tools_cfg = {**_tools_cfg, **_runtime_tools_cfg}
+
+    _WEB_DEFAULTS: dict[str, bool] = {
+        "web_search":    True,
+        "navigate":      True,
+        "http_request":  False,
+        "click":         False,
+        "type_text":     False,
+        "extract_text":  False,
+        "extract_html":  False,
+        "screenshot":    False,
+        "wait_for":      False,
+        "manage_browser": False,
+    }
+
     for fn in (
         web_search,
         http_request,
@@ -560,4 +586,8 @@ def register(agent) -> None:
         wait_for,
         manage_browser,
     ):
-        agent.tool_handler.register_tool(fn)
+        vis = str(_tools_cfg.get(fn.__name__, "")).lower().strip()
+        if vis == "disabled":
+            continue
+        always_on = _WEB_DEFAULTS[fn.__name__] if vis == "" else vis == "always_on"
+        agent.tool_handler.register_tool(fn, always_on=always_on)

@@ -419,11 +419,13 @@ class TestReset:
         assert agent._turn_count == 0
 
     @pytest.mark.asyncio
-    async def test_reset_increments_version(self, make_agent):
+    async def test_reset_preserves_version(self, make_agent):
+        """reset() clears context but keeps the same session version.
+        Use next_session() to advance the version."""
         agent = make_agent(_text_stream("ok"))
         v_before = agent._session_version
         agent.reset()
-        assert agent._session_version == v_before + 1
+        assert agent._session_version == v_before
 
 
 # ---------------------------------------------------------------------------
@@ -457,12 +459,13 @@ class TestHistoryPersistence:
         assert any("my reply" in c for c in contents)
 
     @pytest.mark.asyncio
-    async def test_version_increments_in_file_after_reset(self, make_agent, tmp_path):
+    async def test_version_increments_after_next_session(self, make_agent, tmp_path):
+        """next_session() is what bumps the version; reset() does not."""
         agent = make_agent(_text_stream("ok"))
         await _collect(agent, _make_msg("hi"))
         v1 = agent._session_version
 
-        agent.reset()
+        agent.next_session()
         await _collect(agent, _make_msg("hi again"))
         v2 = agent._session_version
 

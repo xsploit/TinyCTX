@@ -253,6 +253,64 @@ memory_search:
   # auto_inject: true
   # search_priority: 25
 
+  # Per-tool visibility (default: always_on):
+  # tools:
+  #   memory_search: always_on  # or deferred, disabled
+
+# ---------------------------------------------------------------------------
+# skills:  (consumed by modules/skills)
+#
+# use_skill is always_on by default — the index prompt already tells the LLM
+# which skills exist; use_skill loads the full body on demand.
+# ---------------------------------------------------------------------------
+# skills:
+#   tools:
+#     use_skill: always_on  # or deferred, disabled
+
+# ---------------------------------------------------------------------------
+# web:  (consumed by modules/web)
+#
+# Per-tool visibility — defaults:
+#   web_search, navigate:  always_on
+#   all other tools:       deferred
+#
+# Override individual tools:
+# ---------------------------------------------------------------------------
+# web:
+#   tools:
+#     web_search:    always_on
+#     navigate:      always_on
+#     http_request:  deferred
+#     screenshot:    disabled
+
+# ---------------------------------------------------------------------------
+# mcp:  (consumed by modules/mcp)
+#
+# Each server entry under mcp.servers supports an optional 'tools:' block
+# that controls per-tool visibility in the LLM's tool list.
+#
+# Per-tool visibility values:
+#   always_on  — tool is registered and immediately enabled every turn
+#   deferred   — tool is registered but hidden; agent must call tools_search (default)
+#   disabled   — tool is never registered at all
+#
+# If no 'tools:' block is present, all tools from that server default to 'deferred'.
+# ---------------------------------------------------------------------------
+# mcp:
+#   servers:
+#     filesystem:
+#       command: npx
+#       args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+#       tools:
+#         read_file:    always_on
+#         write_file:   deferred
+#         delete_file:  disabled
+#
+#     postgres:
+#       command: uvx
+#       args: ["mcp-server-postgres", "--db-url", "postgresql://localhost/mydb"]
+#       # no tools: block — all tools default to deferred
+
 # ---------------------------------------------------------------------------
 # logging:
 # ---------------------------------------------------------------------------

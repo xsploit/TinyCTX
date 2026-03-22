@@ -107,7 +107,7 @@ def register(agent) -> None:
         p.write_text(original.replace(old_str, new_str, 1), encoding="utf-8")
         return f"[replaced 1 occurrence in {p}]"
 
-    agent.tool_handler.register_tool(shell)
-    agent.tool_handler.register_tool(view)
-    agent.tool_handler.register_tool(write_file)
-    agent.tool_handler.register_tool(str_replace)
+    agent.tool_handler.register_tool(shell,      always_on=True)
+    agent.tool_handler.register_tool(view,       always_on=True)
+    agent.tool_handler.register_tool(write_file, always_on=True)
+    agent.tool_handler.register_tool(str_replace, always_on=True)

@@ -1,4 +1,6 @@
 PyYAML
+pytest
+pytest-asyncio
 requests
 aiohttp
 pyyaml

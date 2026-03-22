@@ -18,14 +18,24 @@ Config (config.yaml):
           args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
           env:
             SOME_VAR: value   # optional extra env vars (merged with os.environ)
+          tools:
+            read_file:    always_on   # always in the LLM's tool list
+            write_file:   deferred    # available via tools_search (default)
+            delete_file:  disabled    # never registered
 
         postgres:
           command: uvx
           args: ["mcp-server-postgres", "--db-url", "postgresql://localhost/mydb"]
+          # No 'tools' block — all tools default to 'deferred'
 
         everything:
           command: npx
           args: ["-y", "@modelcontextprotocol/server-everything"]
+
+Per-tool visibility (under servers.<name>.tools):
+  always_on  — registered and immediately enabled (in every LLM call)
+  deferred   — registered but not enabled; agent must call tools_search (default)
+  disabled   — not registered at all
 
 Each server's tools are namespaced as mcp__<server>__<tool> to avoid
 collisions. The tool description passed to the LLM includes the original
@@ -171,6 +181,9 @@ def register(agent) -> None:
 
     # ------------------------------------------------------------------ build server objects
     servers: list[_MCPServer] = []
+    # Map server name -> per-tool visibility config dict
+    tools_cfgs: dict[str, dict] = {}
+
     for name, cfg in servers_cfg.items():
         if not isinstance(cfg, dict):
             logger.warning("[mcp] server '%s' config is not a dict — skipping", name)
@@ -186,13 +199,14 @@ def register(agent) -> None:
             env={str(k): str(v) for k, v in cfg.get("env", {}).items()},
         )
         servers.append(srv)
+        tools_cfgs[name] = {str(k): str(v) for k, v in cfg.get("tools", {}).items()}
 
     # ------------------------------------------------------------------ startup
     async def _start_all() -> None:
         for srv in servers:
             try:
                 await srv.connect()
-                _register_server_tools(agent, srv)
+                _register_server_tools(agent, srv, tools_cfgs.get(srv.name, {}))
             except ImportError:
                 logger.error(
                     "[mcp] 'mcp' package not installed — run: pip install mcp"
@@ -232,12 +246,39 @@ def register(agent) -> None:
 # Per-server tool registration
 # ---------------------------------------------------------------------------
 
-def _register_server_tools(agent, srv: _MCPServer) -> None:
+# Sentinel set used to track which tool names were removed from tool_handler
+# during a reset so _start_all can cleanly re-register them.
+_VALID_VISIBILITY = frozenset({"always_on", "deferred", "disabled"})
+
+
+def _resolve_visibility(tools_cfg: dict, tool_name: str) -> str:
+    """
+    Return the visibility for a specific tool name.
+    tools_cfg maps tool_name -> "always_on" | "deferred" | "disabled".
+    Defaults to "deferred" if not specified.
+    """
+    vis = str(tools_cfg.get(tool_name, "deferred")).lower().strip()
+    if vis not in _VALID_VISIBILITY:
+        logger.warning(
+            "[mcp] unknown visibility '%s' for tool '%s' — defaulting to 'deferred'",
+            vis, tool_name,
+        )
+        return "deferred"
+    return vis
+
+
+def _register_server_tools(agent, srv: _MCPServer, tools_cfg: dict) -> None:
     for tool in srv.tools:
-        _register_one_tool(agent, srv, tool)
+        _register_one_tool(agent, srv, tool, tools_cfg)
 
 
-def _register_one_tool(agent, srv: _MCPServer, tool) -> None:
+def _register_one_tool(agent, srv: _MCPServer, tool, tools_cfg: dict) -> None:
+    visibility = _resolve_visibility(tools_cfg, tool.name)
+
+    if visibility == "disabled":
+        logger.debug("[mcp] tool '%s.%s' disabled — skipping", srv.name, tool.name)
+        return
+
     fn_name     = _tool_fn_name(srv.name, tool.name)
     description = tool.description or f"MCP tool '{tool.name}' from server '{srv.name}'"
     schema      = _mcp_schema_to_json(tool)
@@ -267,7 +308,11 @@ def _register_one_tool(agent, srv: _MCPServer, tool) -> None:
         "required":    required,
     }
 
-    logger.debug("[mcp] registered tool '%s'", fn_name)
+    if visibility == "always_on":
+        agent.tool_handler.enabled.add(fn_name)
+        logger.debug("[mcp] registered tool '%s' (always_on)", fn_name)
+    else:
+        logger.debug("[mcp] registered tool '%s' (deferred)", fn_name)
 
 
 def _prop_to_json_schema(prop: dict) -> dict:

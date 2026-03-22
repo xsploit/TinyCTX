@@ -137,9 +137,13 @@ def _build_index_prompt(registry: dict[str, dict]) -> str | None:
 def register(agent) -> None:
     try:
         from modules.skills import EXTENSION_META
-        cfg: dict = EXTENSION_META.get("default_config", {})
+        cfg: dict = dict(EXTENSION_META.get("default_config", {}))
     except ImportError:
         cfg = {}
+    # Merge config.yaml overrides (under top-level 'skills:' key)
+    if hasattr(agent.config, "extra") and isinstance(agent.config.extra, dict):
+        for k, v in agent.config.extra.get("skills", {}).items():
+            cfg[k] = v
 
     workspace = Path(agent.config.workspace.path).expanduser().resolve()
 
@@ -201,7 +205,12 @@ def register(agent) -> None:
         except Exception as exc:
             return f"[error reading skill '{name}': {exc}]"
 
-    agent.tool_handler.register_tool(use_skill)
+    # Default: always_on. Override via config.yaml under skills.tools.use_skill: deferred|disabled
+    _sk_vis = str(
+        cfg.get("tools", {}).get("use_skill", "always_on")
+    ).lower().strip()
+    if _sk_vis != "disabled":
+        agent.tool_handler.register_tool(use_skill, always_on=(_sk_vis != "deferred"))
 
     initial = _refresh()
     if initial:

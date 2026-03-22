@@ -104,6 +104,11 @@ class AgentLoop:
             if not mc.is_embedding
         }
 
+        # tools_search is always available — it's the gateway to all deferred tools
+        self.tool_handler.register_tool(
+            self.tool_handler.tools_search, always_on=True
+        )
+
         self._load_modules()
 
     # ------------------------------------------------------------------
@@ -353,7 +358,6 @@ class AgentLoop:
         """Hard reset — clear in-memory context and overwrite session JSON with empty dialogue."""
         self.context.clear()
         self._turn_count = 0
-        # Overwrite the current session file with empty dialogue
         safe_key = str(self.session_key).replace(":", "_")
         sessions_dir = Path("sessions") / safe_key
         sessions_dir.mkdir(parents=True, exist_ok=True)

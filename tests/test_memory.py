@@ -559,8 +559,9 @@ class _FakeAgentConfig:
 
 
 class _FakeToolHandler:
-    def register_tool(self, fn):       pass
+    def register_tool(self, fn, always_on=False, **kwargs): pass
     def get_tool_definitions(self):    return []
+    def enable(self, name):            return True
 
 
 class _FakeAgent:

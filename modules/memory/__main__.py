@@ -357,7 +357,12 @@ def register(agent) -> None:
             return "[no memory found for that query]"
         return formatted
 
-    agent.tool_handler.register_tool(memory_search)
+    # Default: always_on. Override via config.yaml: memory_search.tools.memory_search: deferred|disabled
+    _ms_vis = str(
+        cfg.get("tools", {}).get("memory_search", "always_on")
+    ).lower().strip()
+    if _ms_vis != "disabled":
+        agent.tool_handler.register_tool(memory_search, always_on=(_ms_vis != "deferred"))
 
     logger.info(
         "[memory] ready — dir: %s | db: %s | strategy: %s | embedder: %s | auto_inject: %s",

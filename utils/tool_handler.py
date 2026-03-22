@@ -5,12 +5,14 @@ from datetime import datetime
 
 class ToolCallHandler:
     def __init__(self):
-        self.tools = {}
-    
-    def register_tool(self, 
-                      func: Callable, 
-                      name: Optional[str] = None, 
-                      description: Optional[str] = None):
+        self.tools: Dict[str, Any] = {}
+        self.enabled: set[str] = set()
+
+    def register_tool(self,
+                      func: Callable,
+                      name: Optional[str] = None,
+                      description: Optional[str] = None,
+                      always_on: bool = False):
         """Register a tool function - auto-extracts name and description if not provided
         
         Args:
@@ -46,6 +48,8 @@ class ToolCallHandler:
             'properties': properties,
             'required': required
         }
+        if always_on:
+            self.enabled.add(name)
 
     def _extract_docstring_parts(self, func: Callable) -> tuple[str, Dict[str, str]]:
         """
@@ -88,9 +92,44 @@ class ToolCallHandler:
         }
         return mapping.get(annotation, {"type": "string"})
 
+    def enable(self, name: str) -> bool:
+        """Enable a registered tool by name. Returns True if found, False if unknown."""
+        if name not in self.tools:
+            return False
+        self.enabled.add(name)
+        return True
+
+    def tools_search(self, query: str) -> str:
+        """Search for available tools by keyword and enable them for use.
+
+        Args:
+            query: Keyword or description of the capability you're looking for.
+        """
+        q = query.lower()
+        matches = [
+            name for name, tool in self.tools.items()
+            if name not in self.enabled
+            and (q in name.lower() or q in tool['description'].lower())
+        ]
+        self.enabled.update(matches)
+        if not matches:
+            # Also report what's already enabled that matched, for context
+            already = [
+                name for name, tool in self.tools.items()
+                if name in self.enabled
+                and (q in name.lower() or q in tool['description'].lower())
+            ]
+            if already:
+                return f"No new tools found. Already enabled: {', '.join(already)}"
+            return "No tools found matching that query."
+        return f"Enabled: {', '.join(matches)}"
+
     def get_tool_definitions(self) -> List[Dict[str, Any]]:
         definitions = []
-        for name, tool in self.tools.items():
+        for name in self.enabled:
+            tool = self.tools.get(name)
+            if tool is None:
+                continue
             definitions.append({
                 "type": "function",
                 "function": {
