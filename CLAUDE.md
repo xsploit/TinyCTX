@@ -24,6 +24,9 @@ Run tests: `python -m pytest -v`
 
 Deps: `pip install -r requirements.txt` (includes `structlog`, `tenacity`)
 
+Note: `matrix-nio[e2e]` requires cmake + libolm to compile. It is commented out in
+`requirements.txt` by default. Only uncomment if you have a C build environment and need E2EE.
+
 ---
 
 ## Architecture
@@ -44,13 +47,14 @@ main.py
 | File | Role |
 |------|------|
 | `contracts.py` | Pure data types. No logic. Everything imports from here, never the reverse. |
-| `config/` | YAML loader + env var resolution. `WorkspaceConfig` (global workspace path). `ModelConfig` supports `kind: chat` (default) or `kind: embedding`. |
+| `config/` | YAML loader + env var resolution. `WorkspaceConfig` (global workspace path). `ModelConfig` supports `kind: chat` (default) or `kind: embedding`, plus `vision: bool`. `AttachmentConfig` (inline thresholds). |
 | `router.py` | Session routing. One `Lane` (bounded queue maxsize=32 + crash-recovering worker task) per `SessionKey`. `router.push()` returns `bool` — `False` means lane queue full. Bridges register platform/session handlers. |
-| `gateway/` | HTTP/SSE API gateway. External clients (SillyTavern, custom scripts, etc.) connect here. `run(router, cfg)` called by `main.py`. |
-| `agent.py` | The 6-stage loop. Owns `Context`, `ToolCallHandler`, and LLM pool. Yields `AgentEvent` stream. Skips embedding models when building LLM pool. |
-| `context.py` | Dialogue history + hook pipeline. Sync stages: `pre_assemble`, `filter_turn`, `transform_turn`, `post_assemble`. Async stage: `HOOK_PRE_ASSEMBLE_ASYNC` (awaited by agent before each `assemble()` call). Smart `delete()` / `edit()` / `strip_tool_calls()` for dialogue mutation. |
+| `gateway/` | HTTP/SSE API gateway. External clients (SillyTavern, custom scripts, etc.) connect here. `run(router, cfg)` called by `main.py`. Accepts `attachments: [{name, data_b64, mime_type}]` on POST /message. |
+| `agent.py` | The 6-stage loop. Owns `Context`, `ToolCallHandler`, and LLM pool. Yields `AgentEvent` stream. Skips embedding models when building LLM pool. Stage 1 calls `build_content_blocks` when `msg.attachments` is non-empty. |
+| `context.py` | Dialogue history + hook pipeline. Sync stages: `pre_assemble`, `filter_turn`, `transform_turn`, `post_assemble`. Async stage: `HOOK_PRE_ASSEMBLE_ASYNC` (awaited by agent before each `assemble()` call). Smart `delete()` / `edit()` / `strip_tool_calls()` for dialogue mutation. `HistoryEntry.content` is `str \| list` — list for user turns with attachments. |
 | `ai.py` | Async OpenAI-compatible clients. `LLM` streams SSE → `TextDelta` / `ToolCallAssembled` / `LLMError`. Retries on `ClientConnectionError` (3 attempts, exp backoff via tenacity). `Embedder` calls `/v1/embeddings`, auto-batches, numpy fast-path. |
 | `utils/tool_handler.py` | Registers Python functions (sync or async) as LLM tools. Auto-extracts JSON schema from type hints + docstring `Args:` block. |
+| `utils/attachments.py` | Attachment classification, saving, and LLM content-block assembly. Pure utility — no tools, hooks, or prompts. Called by bridges and the gateway. |
 
 **Session identity:**
 
@@ -77,6 +81,73 @@ main.py
 
 ---
 
+## Attachments
+
+Attachments flow from bridges → `InboundMessage.attachments` → `agent.py` Stage 1 → `utils/attachments.py` → `HistoryEntry.content` (list of content blocks).
+
+**`contracts.py` types:**
+
+- `Attachment(filename, data: bytes, mime_type, kind: AttachmentKind)` — frozen dataclass
+- `AttachmentKind`: `IMAGE`, `TEXT`, `DOCUMENT`, `BINARY`
+- `ContentType`: `TEXT`, `MIXED` (text + attachments), `ATTACHMENT_ONLY` (no text)
+- `content_type_for(text, has_attachments)` — helper used by all bridges and gateway
+
+**`utils/attachments.py`:**
+
+- `classify(att)` — sniffs `AttachmentKind` from mime_type + extension. Extension takes priority for text types (bridges lie about MIME).
+- `save_upload(att, uploads_dir)` — writes bytes to `workspace/uploads/`, collision-avoids with `_1`, `_2` suffixes. Always runs, even for reference-only files.
+- `build_content_blocks(text, attachments, model_cfg, att_cfg, workspace)` — returns `list[dict]` (OpenAI-compat content blocks) or plain `str` if all files are reference-only.
+
+**Content block strategies:**
+
+| Kind | Vision model | Non-vision / non-vision model |
+|------|-------------|-------------------------------|
+| `IMAGE` | `{"type": "image_url", "image_url": {"url": "data:<mime>;base64,..."}}` | Reference note only |
+| `TEXT` | Fenced code block in `{"type": "text", ...}` | Same |
+| `DOCUMENT` (.pdf) | Text extracted via `pdfplumber` if installed, else reference note | Same |
+| `DOCUMENT` (.docx) | Text extracted via `python-docx` if installed, else reference note | Same |
+| `BINARY` | Reference note only | Reference note only |
+
+Both `pdfplumber` and `python-docx` are soft dependencies — the bridge degrades gracefully to a reference note if they are absent.
+
+**Inline thresholds** (`AttachmentConfig`, configurable via `attachments:` in config.yaml):
+
+```yaml
+attachments:
+  inline_max_files: 3       # max files to inline per message (default 3)
+  inline_max_bytes: 204800  # max total raw bytes to inline (default ~200 KB)
+  uploads_dir: uploads      # relative to workspace root
+```
+
+Once either threshold is exceeded, remaining files become reference-only regardless of kind.
+
+**Vision flag** on `ModelConfig`:
+
+```yaml
+models:
+  smart:
+    model: claude-sonnet-4-20250514
+    vision: true   # enables image_url blocks for this model
+```
+
+Default is `false`. Images sent to a non-vision model become a reference note instead.
+
+**Bridge attachment handling:**
+
+- **Discord** — downloads each `message.attachment` via aiohttp from Discord's CDN. `content_type` from `a.content_type`, filename from `a.filename`.
+- **Matrix** — registers `_on_media` callbacks for `RoomMessageImage`, `RoomMessageFile`, `RoomMessageAudio`, `RoomMessageVideo` (requires matrix-nio ≥ 0.20; degrades gracefully with a warning on older versions). Media events are buffered in `_pending_attachments[sender:room_id]` and attached to the next text message from that sender in that room.
+- **Gateway** — accepts `attachments: [{name, data_b64, mime_type}]` in POST /message JSON body. Decodes base64 server-side.
+
+**`HistoryEntry.content` as list:**
+
+When a user turn has inlineable attachments, `content` is a `list[dict]` of OpenAI-compat content blocks rather than a plain `str`. This is transparent to most of the pipeline:
+- `_render()` in `context.py` passes it through unchanged.
+- The merge guard in `assemble()` never merges two adjacent turns when either has list content (images must stay distinct).
+- `_count_tokens()` handles both str and list content.
+- `_flush_history` / `_restore_history` in `agent.py` JSON round-trips lists correctly.
+
+---
+
 ## Config structure
 
 ```yaml
@@ -89,6 +160,7 @@ models:
     api_key_env: ANTHROPIC_API_KEY
     max_tokens: 4096
     temperature: 0.7
+    vision: true                # set true for multimodal models
   embed:                        # kind: embedding — excluded from llm: routing
     kind: embedding
     base_url: http://localhost:11434/v1
@@ -110,6 +182,11 @@ gateway:                        # HTTP/SSE API gateway (external clients)
 
 workspace:
   path: ~/.tinyctx              # global — all modules resolve paths here
+
+attachments:                    # optional — shown with defaults
+  inline_max_files: 3
+  inline_max_bytes: 204800
+  uploads_dir: uploads
 
 # router: (internal TCP config, rarely needed)
 #   host: 127.0.0.1
@@ -140,6 +217,19 @@ GET    /v1/health                          status, uptime_s, per-session queue_d
 
 **Backpressure:** `POST /message` returns HTTP 429 if the session lane queue is full (default max 32 pending turns). Retry after backoff.
 
+**POST /message body:**
+```json
+{
+  "text": "what is in this image?",
+  "stream": true,
+  "session_type": "dm",
+  "attachments": [
+    {"name": "photo.png", "data_b64": "<base64>", "mime_type": "image/png"}
+  ]
+}
+```
+`text` or `attachments` (or both) must be present.
+
 **SSE event types** (`POST /message` with `stream: true`):
 ```json
 {"type": "text_chunk",  "text": "..."}
@@ -163,9 +253,10 @@ GET    /v1/health                          status, uptime_s, per-session queue_d
 1. Create `bridges/<n>/__main__.py` with an async `run(router)` function.
 2. Register a platform handler: `router.register_platform_handler("<n>", handler)`.
 3. Push messages: `await router.push(InboundMessage(...))`.
-4. Handle `AgentEvent` objects in the handler — switch on type.
-5. Add entry to `config.yaml` under `bridges:` with `enabled: true`.
-6. Tokens from env vars only — do not add bridge-specific dataclasses to `config/`.
+4. Use `content_type_for(text, bool(attachments))` from `contracts.py` to set `content_type`.
+5. Handle `AgentEvent` objects in the handler — switch on type.
+6. Add entry to `config.yaml` under `bridges:` with `enabled: true`.
+7. Tokens from env vars only — do not add bridge-specific dataclasses to `config/`.
 
 ---
 
@@ -192,9 +283,10 @@ Modules must not import from `router.py`, `gateway/`, or any bridge.
 - **Config is generic.** `BridgeConfig(enabled, options)` for all bridges. Tokens from env vars.
 - **Workspace is `agent.config.workspace.path`** — a resolved absolute `Path`. All modules use this. Default `~/.tinyctx`.
 - **Embedding models** use `kind: embedding` in `models:`. Access via `agent.config.get_embedding_model("name")`. Build with `Embedder.from_config(cfg)` from `ai.py`.
+- **Vision models** use `vision: true` in `models:`. Non-vision models receive a reference note instead of image blocks.
 - **Tool functions can be sync or async.** `ToolCallHandler.execute_tool_call` handles both.
 - **Context hooks run in priority order** (lower = first). `priority=0` for early hooks (dedup, memory), `priority=10+` for later (trim).
-- **Sessions persist** to `sessions/<session_key>/<N>.json` after every turn.
+- **Sessions persist** to `sessions/<session_key>/<N>.json` after every turn. `content` fields may be `str` or `list` — both round-trip correctly.
 - **Token budget telemetry:** agent logs at INFO when context hits 80% of `context:` limit, WARNING at 95%. These are signals to implement/trigger the compaction module.
 - **LLM retries:** `ai.LLM` retries `ClientConnectionError` up to 3× with exponential backoff (1–8s). Other errors (`LLMError`) pass through immediately.
 - **Queue backpressure:** Lane queues are bounded (32 by default, change `LANE_QUEUE_MAX` in `router.py`). Full queues return `False` from `router.push()` — gateway surfaces this as 429.
@@ -216,7 +308,7 @@ Modules must not import from `router.py`, `gateway/`, or any bridge.
 | `strip_tool_calls(entry_id)` | Remove `tool_calls` from an assistant entry and drop its results, preserving the assistant's text content. |
 | `clear()` | Wipe entire dialogue. |
 
-Token-budget trimming in `assemble()` follows the same rules: assistant turns with text content preserve the text when tool calls are trimmed.
+Token-budget trimming in `assemble()` follows the same rules: assistant turns with text content preserve the text when tool calls are trimmed. Adjacent user/assistant turns are only merged when both have plain-string content — list content (attachment blocks) is never merged.
 
 ---
 
@@ -267,7 +359,7 @@ The memory module has two layers:
 | `MEMORY.md` | Long-term facts the agent should always have in context. |
 | `memory/*.md` | Arbitrary knowledge files — searched semantically each turn. Subdirectories supported. |
 | `memory/session-{date}.md` | Session-scoped notes written by the agent on nudge (ongoing tasks, decisions, per-session context). |
-| `uploads/` | Files and images delivered by users via any bridge. Small files may be inlined as base64; larger ones are saved here and the agent is notified to read them via filesystem tools. |
+| `uploads/` | Files and images delivered by users via any bridge. Saved by `utils/attachments.py`. Small/inlineable files are encoded into content blocks; larger or binary files are saved here and the agent receives a reference note. |
 | `CRON.json` | Scheduled jobs (cron module). |
 | `HEARTBEAT.md` | Standing instructions for heartbeat ticks (read by agent via filesystem tools). |
 | `skills/` | Skill folders following agentskills.io convention, each containing `SKILL.md`. |
