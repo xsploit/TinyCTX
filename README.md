@@ -130,7 +130,7 @@ export MATRIX_PASSWORD=your-password-here
 
 DM detection is based on room member count (2 = DM). In group rooms the bot only responds when @mentioned or when the message starts with `command_prefix` (if `prefix_required: true`).
 
-For E2EE support install `matrix-nio[e2e]` and set `encryption_enabled=True` in the bridge source.
+For E2EE support set `encryption_enabled=True` in the bridge source.
 
 **Session routing:**
 - 1-on-1 rooms → `SessionKey.dm(sender_mxid)` — platform-agnostic

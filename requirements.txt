@@ -12,3 +12,4 @@ structlog
 tenacity
 discord.py
 matrix-nio
+matrix-nio[e2e]
