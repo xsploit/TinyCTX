@@ -1,7 +1,7 @@
 """
 modules/filesystem/__main__.py
 
-Registers filesystem tools (shell, view, create_file, str_replace) into the
+Registers filesystem tools (shell, view, write_file, str_replace) into the
 agent loop's tool_handler. No imports from utils or contracts — everything
 arrives through the agent argument.
 
@@ -72,19 +72,20 @@ def register(agent) -> None:
             f"{i:>6}\t{l}" for i, l in enumerate(lines, 1)
         )
 
-    def create_file(path: str, content: str) -> str:
-        """Create a new file with content. Fails if the file already exists — use str_replace to edit existing files.
+    def write_file(path: str, content: str = "") -> str:
+        """Write content to a file. Creates the file and any missing parent directories if they don't exist.
+        Overwrites the file if it already exists. Pass empty string to create an empty file or truncate an existing one.
 
         Args:
-            path: Path to the new file.
-            content: Full file content.
+            path: Path to the file.
+            content: Full file content. Omit or pass empty string to create/truncate to empty.
         """
         p = resolve(path)
-        if p.exists():
-            return f"[error: file already exists: {p} — use str_replace to edit it]"
         p.parent.mkdir(parents=True, exist_ok=True)
+        existed = p.exists()
         p.write_text(content, encoding="utf-8")
-        return f"[created {p} ({len(content)} chars)]"
+        action = "truncated" if existed and content == "" else ("overwrote" if existed else "created")
+        return f"[{action} {p} ({len(content)} chars)]"
 
     def str_replace(path: str, old_str: str, new_str: str = "") -> str:
         """Replace a unique string in an existing file. old_str must appear exactly once.
@@ -108,5 +109,5 @@ def register(agent) -> None:
 
     agent.tool_handler.register_tool(shell)
     agent.tool_handler.register_tool(view)
-    agent.tool_handler.register_tool(create_file)
+    agent.tool_handler.register_tool(write_file)
     agent.tool_handler.register_tool(str_replace)

@@ -139,21 +139,27 @@ def register(agent) -> None:
     agents_path = _resolve(cfg["agents_file"])
     memory_path = _resolve(cfg["memory_file"])
 
+    # Build macro resolver for injected files. Built-ins ({date}, {datetime},
+    # {workspace}) are handled by make_provider automatically.
+    from modules.memory.inject import MacroResolver, make_provider
+
+    resolver = MacroResolver()
+
     agent.context.register_prompt(
         "soul",
-        lambda _ctx: _read_file(soul_path),
+        make_provider(soul_path, workspace, extra_macros=resolver),
         role="system",
         priority=int(cfg["soul_priority"]),
     )
     agent.context.register_prompt(
         "agents",
-        lambda _ctx: _read_file(agents_path),
+        make_provider(agents_path, workspace, extra_macros=resolver),
         role="system",
         priority=int(cfg["agents_priority"]),
     )
     agent.context.register_prompt(
         "memory",
-        lambda _ctx: _read_file(memory_path),
+        make_provider(memory_path, workspace, extra_macros=resolver),
         role="system",
         priority=int(cfg["memory_priority"]),
     )
