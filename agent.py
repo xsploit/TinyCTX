@@ -81,7 +81,7 @@ class AgentLoop:
     Yields OutboundReply chunks that the Lane forwards to the gateway.
     """
 
-    def __init__(self, session_key: SessionKey, config: Config) -> None:
+    def __init__(self, session_key: SessionKey, config: Config, version_override: int | None = None) -> None:
         self.session_key      = session_key
         self.config           = config
         self.context          = Context(token_limit=config.context)
@@ -89,8 +89,12 @@ class AgentLoop:
         self._turn_count      = 0
         self.gateway          = None  # set by Lane.__post_init__ after construction
 
-        self._session_version = self._load_latest_version()
-        self._restore_history()
+        if version_override is not None:
+            self._session_version = version_override
+            logger.info("[%s] starting at version override v%d", session_key, version_override)
+        else:
+            self._session_version = self._load_latest_version()
+            self._restore_history()
 
         # Build the full model pool from config.models.
         # Embedding models (kind='embedding') are skipped — they're not LLM instances.
@@ -346,10 +350,26 @@ class AgentLoop:
     # ------------------------------------------------------------------
 
     def reset(self) -> None:
+        """Hard reset — wipe current session JSON from disk and clear in-memory context."""
+        safe_key = str(self.session_key).replace(":", "_")
+        path = Path("sessions") / safe_key / f"{self._session_version}.json"
+        if path.exists():
+            try:
+                path.unlink()
+                logger.info("[%s] deleted session v%d from disk", self.session_key, self._session_version)
+            except Exception as exc:
+                logger.warning("[%s] failed to delete session JSON: %s", self.session_key, exc)
         self.context.clear()
         self._turn_count = 0
         self._session_version += 1
         logger.info("[%s] context reset (now v%d)", self.session_key, self._session_version)
+
+    def next_session(self) -> None:
+        """Archive current session JSON and start a fresh version."""
+        self.context.clear()
+        self._turn_count = 0
+        self._session_version += 1
+        logger.info("[%s] new session v%d (history preserved on disk)", self.session_key, self._session_version)
 
     def _load_latest_version(self) -> int:
         safe_key = str(self.session_key).replace(":", "_")

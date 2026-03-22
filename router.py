@@ -29,17 +29,22 @@ LANE_QUEUE_MAX = 32  # max pending turns per lane before backpressure kicks in
 
 @dataclass
 class Lane:
-    session_key:   SessionKey
-    config:        Config
-    event_handler: EventHandler
-    router:        "Router"
-    loop:          AgentLoop = field(init=False)
-    queue:         asyncio.Queue = field(init=False)
-    _worker:       asyncio.Task | None = field(default=None, init=False, repr=False)
+    session_key:      SessionKey
+    config:           Config
+    event_handler:    EventHandler
+    router:           "Router"
+    version_override: int | None = None
+    loop:             AgentLoop = field(init=False)
+    queue:            asyncio.Queue = field(init=False)
+    _worker:          asyncio.Task | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.queue = asyncio.Queue(maxsize=LANE_QUEUE_MAX)
-        self.loop = AgentLoop(session_key=self.session_key, config=self.config)
+        self.loop = AgentLoop(
+            session_key=self.session_key,
+            config=self.config,
+            version_override=self.version_override,
+        )
         self.loop.gateway = self.router
 
     def start(self) -> None:
@@ -99,6 +104,8 @@ class _SessionRouter:
         self._event_handler = event_handler
         self._router        = router
         self._lanes: dict[SessionKey, Lane] = {}
+        # version overrides set by next_session() before a lane exists
+        self._version_overrides: dict[SessionKey, int] = {}
 
     async def route(self, msg: InboundMessage) -> bool:
         """Route a message to its lane. Returns False if the lane queue is full."""
@@ -110,11 +117,13 @@ class _SessionRouter:
 
     def _get_or_create(self, key: SessionKey) -> Lane:
         if key not in self._lanes:
+            version_override = self._version_overrides.pop(key, None)
             lane = Lane(
                 session_key=key,
                 config=self._config,
                 event_handler=self._event_handler,
                 router=self._router,
+                version_override=version_override,
             )
             lane.start()
             self._lanes[key] = lane
@@ -224,12 +233,30 @@ class Router:
     # ------------------------------------------------------------------
 
     def reset_session(self, key: SessionKey) -> None:
-        """Reset a session's context. No-op if session doesn't exist yet."""
+        """Hard reset — wipe session JSON from disk and clear context."""
         lane = self._session_router._lanes.get(key)
         if lane:
             lane.reset()
         else:
             logger.debug("reset_session: no lane for %s", key)
+
+    def next_session(self, key: SessionKey) -> None:
+        """Archive current session JSON and start a fresh version."""
+        lane = self._session_router._lanes.get(key)
+        if lane:
+            lane.loop.next_session()
+        else:
+            # Lane doesn't exist yet — compute the next version from disk
+            # and store it as an override so the lane starts there when created.
+            safe_key = str(key).replace(":", "_")
+            from pathlib import Path
+            sessions_dir = Path("sessions") / safe_key
+            existing = [
+                int(p.stem) for p in sessions_dir.glob("*.json") if p.stem.isdigit()
+            ] if sessions_dir.exists() else []
+            next_version = max(existing, default=1) + 1
+            self._session_router._version_overrides[key] = next_version
+            logger.info("next_session: no lane for %s — set version override to v%d", key, next_version)
 
     async def shutdown(self) -> None:
         await self._session_router.close_all()

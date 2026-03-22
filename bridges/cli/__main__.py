@@ -109,7 +109,15 @@ class CLIBridge:
                 if text.lower() == "/reset":
                     self._gateway.reset_session(CLI_SESSION)
                     self._streaming = False
-                    print("\n[context cleared]\n")
+                    self._thinking = False
+                    print("\n[context cleared — session JSON deleted]\n")
+                    continue
+
+                if text.lower() == "/next":
+                    self._gateway.next_session(CLI_SESSION)
+                    self._streaming = False
+                    self._thinking = False
+                    print("\n[new session started — previous history archived]\n")
                     continue
 
                 msg = InboundMessage(
