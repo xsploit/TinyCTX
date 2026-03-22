@@ -262,7 +262,13 @@ def load(path="config.yaml") -> Config:
     for name, br in raw.get("bridges", {}).items():
         if isinstance(br, dict):
             enabled = bool(br.get("enabled", False))
-            options = {k: v for k, v in br.items() if k != "enabled"}
+            # Support both flat keys and a nested 'options:' sub-key.
+            # If an 'options' dict is present, use it directly; otherwise
+            # collect all non-'enabled' keys as the options dict.
+            if "options" in br and isinstance(br["options"], dict):
+                options = br["options"]
+            else:
+                options = {k: v for k, v in br.items() if k != "enabled"}
             bridges[name] = BridgeConfig(enabled=enabled, options=options)
 
     # ------------------------------------------------------------------ gateway

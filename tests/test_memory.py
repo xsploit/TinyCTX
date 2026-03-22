@@ -507,6 +507,216 @@ class TestMemoryIndexer:
 
 
 # ---------------------------------------------------------------------------
+# Context nudge
+# ---------------------------------------------------------------------------
+
+from context import Context, HistoryEntry, HOOK_PRE_ASSEMBLE_ASYNC
+
+
+class _FakeAgentConfig:
+    """Minimal config stub that register() needs to set up the nudge hook."""
+
+    class _WorkspaceConfig:
+        path = "/tmp/tinyctx_nudge_test"
+
+    class _LLMConfig:
+        primary  = "default"
+        fallback = []
+
+        class _FallbackOn:
+            any_error  = False
+            http_codes = []
+
+        fallback_on = _FallbackOn()
+
+    workspace = _WorkspaceConfig()
+    llm       = _LLMConfig()
+    context   = 10_000  # 10k token limit
+
+    def __init__(self, nudge_threshold=0.8, nudge_message=None):
+        self.extra = {
+            "memory_search": {
+                # Disable everything we don't care about for nudge tests
+                "embedding_model":    "",
+                "auto_inject":        False,
+                "nudge_threshold":    nudge_threshold,
+                "nudge_message":      nudge_message or (
+                    "Context is getting full. Write to memory/session-{date}.md."
+                ),
+                # Point files somewhere that won't exist (providers return None)
+                "soul_file":          "/nonexistent/SOUL.md",
+                "agents_file":        "/nonexistent/AGENTS.md",
+                "memory_file":        "/nonexistent/MEMORY.md",
+                "memory_dir":         "/nonexistent/memory",
+                "db_file":            "/tmp/nudge_test_cache.db",
+                "chunk_strategy":     "chars",
+                "top_k":              3,
+                "bm25_weight":        0.5,
+                "memory_budget_tokens": 256,
+            }
+        }
+        self.models = {}
+
+
+class _FakeToolHandler:
+    def register_tool(self, fn):       pass
+    def get_tool_definitions(self):    return []
+
+
+class _FakeAgent:
+    """Minimal agent stub — just enough for register() to run."""
+    def __init__(self, cfg):
+        self.config       = cfg
+        self.context      = Context(token_limit=cfg.context)
+        self.tool_handler = _FakeToolHandler()
+
+
+def _make_agent(nudge_threshold=0.8, nudge_message=None):
+    cfg   = _FakeAgentConfig(nudge_threshold=nudge_threshold, nudge_message=nudge_message)
+    agent = _FakeAgent(cfg)
+    # register() wires all hooks including _nudge_hook
+    from modules.memory.__main__ import register
+    register(agent)
+    return agent
+
+
+class TestContextNudge:
+    """Tests for the delta-based context nudge injected by modules/memory."""
+
+    async def test_no_nudge_below_threshold(self):
+        """Nudge must NOT fire when new token delta is below threshold."""
+        agent = _make_agent(nudge_threshold=0.8)
+        ctx   = agent.context
+
+        # Simulate last turn used 50% of the window (5 000 tokens)
+        ctx.state["tokens_used"]              = 5_000
+        ctx.state["memory_nudge_tokens_at_last"] = 0
+
+        # Delta = 5 000; threshold = 0.8 * 10 000 = 8 000 → no nudge
+        await ctx.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
+
+        nudge_turns = [e for e in ctx.dialogue if "Context is getting full" in e.content]
+        assert nudge_turns == []
+
+    async def test_nudge_fires_at_threshold(self):
+        """Nudge fires exactly when delta >= threshold * token_limit."""
+        agent = _make_agent(nudge_threshold=0.8)
+        ctx   = agent.context
+
+        # Delta = 8 000 == threshold → should fire
+        ctx.state["tokens_used"]              = 8_000
+        ctx.state["memory_nudge_tokens_at_last"] = 0
+
+        await ctx.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
+
+        nudge_turns = [e for e in ctx.dialogue if "Context is getting full" in e.content]
+        assert len(nudge_turns) == 1
+
+    async def test_nudge_fires_above_threshold(self):
+        """Nudge fires when delta exceeds the threshold."""
+        agent = _make_agent(nudge_threshold=0.8)
+        ctx   = agent.context
+
+        ctx.state["tokens_used"]              = 9_500
+        ctx.state["memory_nudge_tokens_at_last"] = 0
+
+        await ctx.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
+
+        nudge_turns = [e for e in ctx.dialogue if "Context is getting full" in e.content]
+        assert len(nudge_turns) == 1
+
+    async def test_nudge_does_not_repeat_before_new_delta(self):
+        """
+        After nudging, the baseline advances. A second hook run with the same
+        tokens_used must NOT fire a second nudge (delta = 0).
+        """
+        agent = _make_agent(nudge_threshold=0.8)
+        ctx   = agent.context
+
+        ctx.state["tokens_used"]              = 9_000
+        ctx.state["memory_nudge_tokens_at_last"] = 0
+
+        # First run — nudge fires
+        await ctx.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
+        assert len([e for e in ctx.dialogue if "Context is getting full" in e.content]) == 1
+
+        # Second run — same token count, delta is now 0
+        await ctx.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
+        nudge_turns = [e for e in ctx.dialogue if "Context is getting full" in e.content]
+        assert len(nudge_turns) == 1  # still only one
+
+    async def test_nudge_recurs_after_sufficient_new_delta(self):
+        """
+        After the first nudge, once another threshold-worth of tokens
+        accumulates, the nudge fires again.
+        """
+        agent = _make_agent(nudge_threshold=0.8)
+        ctx   = agent.context
+
+        # First nudge at 8 000
+        ctx.state["tokens_used"]              = 8_000
+        ctx.state["memory_nudge_tokens_at_last"] = 0
+        await ctx.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
+        assert len([e for e in ctx.dialogue if "Context is getting full" in e.content]) == 1
+
+        # Conversation continues; 8 000 more tokens accumulated since the nudge
+        # baseline is now 8 000, so delta = 16 000 - 8 000 = 8 000 >= threshold
+        ctx.state["tokens_used"] = 16_000
+        await ctx.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
+        nudge_turns = [e for e in ctx.dialogue if "Context is getting full" in e.content]
+        assert len(nudge_turns) == 2
+
+    async def test_nudge_message_contains_date(self):
+        """The {date} placeholder is filled with today's date."""
+        import datetime
+        agent = _make_agent(
+            nudge_threshold=0.0001,  # near-zero: fires on any new token
+            nudge_message="Save to session-{date}.md now.",
+        )
+        ctx = agent.context
+        ctx.state["tokens_used"]              = 1
+        ctx.state["memory_nudge_tokens_at_last"] = 0
+
+        await ctx.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
+
+        today = datetime.date.today().strftime("%d-%m-%Y")
+        nudge_turns = [e for e in ctx.dialogue if today in e.content]
+        assert len(nudge_turns) == 1
+
+    async def test_nudge_disabled_when_threshold_zero(self):
+        """
+        nudge_threshold=0.0 is the opt-out sentinel: register() treats it as
+        'disabled' and skips hook registration entirely. No nudge ever fires.
+        Note: 0.0 does NOT mean 'always fire' — use a small positive value for that.
+        """
+        # threshold=0.0 → register() logs 'disabled' and skips hook registration
+        agent = _make_agent(nudge_threshold=0.0)
+        ctx   = agent.context
+
+        ctx.state["tokens_used"]              = 9_999
+        ctx.state["memory_nudge_tokens_at_last"] = 0
+
+        await ctx.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
+
+        nudge_turns = [e for e in ctx.dialogue if "Context is getting full" in e.content]
+        assert nudge_turns == []
+
+    async def test_nudge_injects_user_turn(self):
+        """The nudge is injected as a user-role HistoryEntry."""
+        agent = _make_agent(nudge_threshold=0.8)
+        ctx   = agent.context
+
+        ctx.state["tokens_used"]              = 8_500
+        ctx.state["memory_nudge_tokens_at_last"] = 0
+
+        await ctx.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
+
+        injected = [e for e in ctx.dialogue if "Context is getting full" in e.content]
+        assert len(injected) == 1
+        assert injected[0].role == "user"
+
+
+# ---------------------------------------------------------------------------
 # _format_results budget trimmer
 # ---------------------------------------------------------------------------
 
