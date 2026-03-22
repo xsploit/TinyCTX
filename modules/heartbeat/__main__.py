@@ -198,6 +198,8 @@ async def _tick(
 
 async def _run_turn(agent, text: str, session_key: "SessionKey") -> str:
     """Inject a synthetic message and collect the full reply."""
+    from contracts import AgentTextChunk, AgentTextFinal, AgentError
+
     msg = InboundMessage(
         session_key=session_key,
         author=_HEARTBEAT_AUTHOR,
@@ -208,9 +210,16 @@ async def _run_turn(agent, text: str, session_key: "SessionKey") -> str:
     )
     parts: list[str] = []
     async for chunk in agent.run(msg):
-        parts.append(chunk.text)
-        if not chunk.is_partial:
+        if isinstance(chunk, AgentTextChunk):
+            parts.append(chunk.text)
+        elif isinstance(chunk, AgentTextFinal):
+            if chunk.text:
+                parts.append(chunk.text)
             break
+        elif isinstance(chunk, AgentError):
+            logger.warning("[heartbeat] agent error during turn: %s", chunk.message)
+            break
+        # AgentThinkingChunk, AgentToolCall, AgentToolResult — skip
     return "".join(parts).strip()
 
 
