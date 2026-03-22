@@ -1,12 +1,5 @@
 # TinyCTX — TODO
 
-## Memory / search
-- [ ] **Temporal decay in hybrid search** — down-weight older chunks in cosine scoring;
-      add an `indexed_at` or `chunk_mtime` column to the store and apply a decay
-      function (e.g. exponential on age in days) to the final hybrid score before ranking.
-      Closes the gap with OpenClaw's QMD backend. Config knobs: `decay_halflife_days`,
-      `decay_weight` (0 = off).
-
 ## Bridges / input
 - [ ] **Image and file attachments** — when a user attaches an image or file in any bridge:
       1. Always save to `workspace/uploads/<filename>` (permanent record, agent can read later).

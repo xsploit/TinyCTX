@@ -170,9 +170,11 @@ def register(agent) -> None:
     db_path    = _resolve(cfg["db_file"])
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    top_k       = int(cfg["top_k"])
-    bm25_weight = float(cfg["bm25_weight"])
-    auto_inject = bool(cfg["auto_inject"])
+    top_k               = int(cfg["top_k"])
+    bm25_weight         = float(cfg["bm25_weight"])
+    decay_halflife_days = float(cfg.get("decay_halflife_days", 30.0))
+    decay_weight        = float(cfg.get("decay_weight", 0.0))
+    auto_inject         = bool(cfg["auto_inject"])
 
     from modules.memory.chunkers import get_strategy
     chunk_kwargs: dict = cfg.get("chunk_kwargs") or {}
@@ -235,7 +237,11 @@ def register(agent) -> None:
             except Exception as exc:
                 logger.warning("[memory] query embedding failed: %s — using BM25 only", exc)
 
-        results = store.hybrid_search(query, query_vector, top_k, bm25_weight)
+        results = store.hybrid_search(
+            query, query_vector, top_k, bm25_weight,
+            decay_halflife_days=decay_halflife_days,
+            decay_weight=decay_weight,
+        )
         ctx.state["memory_search_results"] = results
 
         if results:
@@ -332,7 +338,11 @@ def register(agent) -> None:
             except Exception as exc:
                 logger.warning("[memory] tool query embedding failed: %s", exc)
 
-        results = store.hybrid_search(query, q_vec, top_k, bm25_weight)
+        results = store.hybrid_search(
+            query, q_vec, top_k, bm25_weight,
+            decay_halflife_days=decay_halflife_days,
+            decay_weight=decay_weight,
+        )
         if not results:
             return "[no memory found for that query]"
 

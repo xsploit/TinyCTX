@@ -59,6 +59,8 @@ import struct
 import time
 from pathlib import Path
 
+_LN2 = math.log(2)
+
 # numpy is optional — used for fast vectorised cosine when present
 try:
     import numpy as np
@@ -350,33 +352,61 @@ class MemoryStore:
         query_vector: list[float] | None,
         top_k: int,
         bm25_weight: float = 0.3,
+        decay_halflife_days: float = 30.0,
+        decay_weight: float = 0.0,
     ) -> list[dict]:
         """
-        Hybrid BM25 + cosine search.
+        Hybrid BM25 + cosine search with optional temporal decay.
         Falls back to BM25-only when query_vector is None.
-        Returns list of {file, path, text, score} dicts, descending score.
+        Returns list of {file, path, text, score, mtime} dicts, descending score.
+
+        Temporal decay
+        --------------
+        When decay_weight > 0, the raw hybrid score is multiplied by a decay
+        factor based on the source file's last-modified time (st_mtime stored
+        at index time in the files table):
+
+            age_days = (now - file.mtime) / 86400
+            decay    = exp(-ln(2) * age_days / decay_halflife_days)
+            score    = raw_score * ((1 - decay_weight) + decay_weight * decay)
+
+        At decay_weight=0 (default) the formula is a no-op — existing
+        behaviour is fully preserved. At decay_weight=1.0 the score is
+        multiplied entirely by the decay factor; values in between blend the
+        two. A halflife of 30 means a 30-day-old file scores ~50% of a fresh
+        file; 60 days old → ~25%, etc.
         """
         fetch_n   = top_k * 4
         bm25_rows = self.bm25_search(query, fetch_n)
 
         # BM25-only fallback
         if query_vector is None:
-            return [
-                {"file": Path(r[1]).name, "path": r[1], "text": r[2], "score": r[3]}
+            results = [
+                {"file": Path(r[1]).name, "path": r[1], "text": r[2], "score": r[3], "mtime": 0.0}
                 for r in bm25_rows[:top_k]
             ]
+            if decay_weight > 0:
+                results = self._apply_decay(results, decay_halflife_days, decay_weight)
+            return results
 
-        # Load all vectors (blobs) for cosine scoring
+        # Load all vectors (blobs) for cosine scoring — also fetch mtime via join
         all_blob_rows = self._conn.execute(
-            "SELECT id, file_path, text, embedding FROM chunks WHERE embedding IS NOT NULL"
+            """
+            SELECT c.id, c.file_path, c.text, c.embedding
+            FROM   chunks c
+            WHERE  c.embedding IS NOT NULL
+            """
         ).fetchall()
 
         if not all_blob_rows:
             # No embeddings stored at all — BM25 only
-            return [
-                {"file": Path(r[1]).name, "path": r[1], "text": r[2], "score": r[3]}
+            results = [
+                {"file": Path(r[1]).name, "path": r[1], "text": r[2], "score": r[3], "mtime": 0.0}
                 for r in bm25_rows[:top_k]
             ]
+            if decay_weight > 0:
+                results = self._apply_decay(results, decay_halflife_days, decay_weight)
+            return results
 
         # Vectorised cosine for all stored chunks
         vec_scores = _cosine_matrix(query_vector, all_blob_rows)
@@ -404,6 +434,7 @@ class MemoryStore:
                     "file":  Path(info["fp"]).name,
                     "path":  info["fp"],
                     "text":  info["text"],
+                    "mtime": 0.0,  # filled by _apply_decay if needed
                     "score": bm25_weight * (info["bm25"] / bm25_max)
                              + w_v * (info["vec"] / vec_max),
                 }
@@ -412,7 +443,42 @@ class MemoryStore:
             key=lambda x: x["score"],
             reverse=True,
         )
-        return ranked[:top_k]
+        results = ranked[:top_k]
+        if decay_weight > 0:
+            results = self._apply_decay(results, decay_halflife_days, decay_weight)
+        return results
+
+    def _apply_decay(
+        self,
+        results: list[dict],
+        halflife_days: float,
+        decay_weight: float,
+    ) -> list[dict]:
+        """
+        Fetch mtime for each result's source file and apply exponential decay
+        to the score. Re-sorts results after rescoring.
+        """
+        if not results or halflife_days <= 0:
+            return results
+
+        now   = time.time()
+        paths = list({r["path"] for r in results})
+        rows  = self._conn.execute(
+            f"SELECT path, mtime FROM files WHERE path IN ({','.join('?' * len(paths))})",
+            paths,
+        ).fetchall()
+        mtime_map: dict[str, float] = {r[0]: r[1] for r in rows}
+
+        out = []
+        for r in results:
+            mtime    = mtime_map.get(r["path"], now)
+            age_days = max(0.0, (now - mtime) / 86400.0)
+            decay    = math.exp(-_LN2 * age_days / halflife_days)
+            new_score = r["score"] * ((1.0 - decay_weight) + decay_weight * decay)
+            out.append({**r, "mtime": mtime, "score": new_score})
+
+        out.sort(key=lambda x: x["score"], reverse=True)
+        return out
 
     # ------------------------------------------------------------------
     # Housekeeping

@@ -39,6 +39,12 @@ EXTENSION_META = {
         "top_k": 5,
         # BM25 share of hybrid score (vector weight = 1 - bm25_weight).
         "bm25_weight": 0.3,
+        # Temporal decay — down-weights chunks from older files.
+        # decay_weight=0.0 disables decay entirely (default, preserves existing behaviour).
+        # decay_weight=1.0 multiplies score fully by the decay factor.
+        # decay_halflife_days: age in days at which a file's score is halved.
+        "decay_halflife_days": 30.0,
+        "decay_weight": 0.0,
 
         # --- Memory budget ---
         # Maximum tokens the injected <memory> block may occupy in the system
