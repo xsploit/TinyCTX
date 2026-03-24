@@ -4,7 +4,7 @@ One instance per session, owned by its Lane.
 Yields AgentEvent objects; never calls the gateway directly.
 
 Stages:
-  1. Intake           — add user message to Context
+  1. Intake           — add user message to Context  (skipped when msg is None)
   2. Context Assembly — await async hooks, then build message list via Context.assemble()
   3. Inference        — stream LLM, collect text + tool calls
   4. Tool Execution   — dispatch ToolCalls via tool_handler
@@ -12,32 +12,33 @@ Stages:
   6. Streaming Reply  — yield AgentEvent objects to Lane
 
 Streaming behaviour:
-  Tool-call cycles (cycles 0..N-1) buffer text — we can't stream text that
-  may be followed by a tool call mid-response.
-  The final cycle streams AgentTextChunk events directly to the Lane, with
-  a closing AgentTextFinal at the end. Tool-use cycles yield AgentToolCall
-  and AgentToolResult events so bridges can display tool activity live.
+  Tool-call cycles buffer text. The final cycle streams AgentTextChunk events
+  live with a closing AgentTextFinal. Tool-use cycles yield AgentToolCall /
+  AgentToolResult so bridges can display tool activity live.
+
+Abort:
+  Lane passes its abort_event to run(). The loop checks it between every
+  inference cycle and inside the LLM stream. If set, yields AgentError and
+  exits cleanly. No flush on abort — history is consistent because no partial
+  assistant entry was committed.
 
 Model pool:
-  All named models from config.models are pre-instantiated into self._models.
-  Inference walks primary → fallback list, triggering fallback according to
-  config.llm.fallback_on (any_error or specific http_codes).
-  Modules call agent.get_model(name) to get a named LLM instance for their
-  own use (e.g. compaction with a cheaper model).
+  All named chat models from config.models are pre-instantiated.
+  Inference walks primary → fallback list per config.llm.fallback_on.
+  Modules call agent.get_model(name) to get a named LLM instance.
 
 Module loading:
-  On init, scans modules/ directory for packages exposing register(agent).
-  Each module receives self and wires in whatever it needs — tools, prompt
-  providers, context hooks. No hardcoding of module names anywhere.
+  Scans modules/ for packages exposing register(agent). No hardcoding.
 """
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
 import logging
-import os
 import time
+import uuid
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -75,19 +76,13 @@ def _build_llm(cfg: ModelConfig) -> LLM:
 
 
 class AgentLoop:
-    """
-    Owns one session's Context, tool_handler, and LLM pool.
-    Called by Lane once per inbound message.
-    Yields OutboundReply chunks that the Lane forwards to the gateway.
-    """
-
     def __init__(self, session_key: SessionKey, config: Config, version_override: int | None = None) -> None:
         self.session_key      = session_key
         self.config           = config
         self.context          = Context(token_limit=config.context)
         self.tool_handler     = ToolCallHandler()
         self._turn_count      = 0
-        self.gateway          = None  # set by Lane.__post_init__ after construction
+        self.gateway          = None  # set by Lane after construction
 
         if version_override is not None:
             self._session_version = version_override
@@ -96,19 +91,13 @@ class AgentLoop:
             self._session_version = self._load_latest_version()
             self._restore_history()
 
-        # Build the full model pool from config.models.
-        # Embedding models (kind='embedding') are skipped — they're not LLM instances.
         self._models: dict[str, LLM] = {
             name: _build_llm(mc)
             for name, mc in config.models.items()
             if not mc.is_embedding
         }
 
-        # tools_search is always available — it's the gateway to all deferred tools
-        self.tool_handler.register_tool(
-            self.tool_handler.tools_search, always_on=True
-        )
-
+        self.tool_handler.register_tool(self.tool_handler.tools_search, always_on=True)
         self._load_modules()
 
     # ------------------------------------------------------------------
@@ -116,19 +105,10 @@ class AgentLoop:
     # ------------------------------------------------------------------
 
     def get_model(self, name: str) -> LLM:
-        """
-        Return a named LLM instance from the pool.
-        Falls back to the primary model if name is not in the pool.
-        Modules use this to request a specific model (e.g. cheap/fast for
-        compaction or memory flush) without knowing API keys or base_urls.
-        """
         if name in self._models:
             return self._models[name]
         primary = self.config.llm.primary
-        logger.warning(
-            "get_model('%s') — not found, falling back to primary '%s'",
-            name, primary,
-        )
+        logger.warning("get_model('%s') — not found, falling back to primary '%s'", name, primary)
         return self._models[primary]
 
     # ------------------------------------------------------------------
@@ -137,17 +117,12 @@ class AgentLoop:
 
     def _load_modules(self) -> None:
         if not MODULES_DIR.exists():
-            logger.debug("No modules/ directory found, skipping module load.")
             return
-
         for entry in sorted(MODULES_DIR.iterdir()):
             if not entry.is_dir():
                 continue
-            has_main = (entry / "__main__.py").exists()
-            has_init = (entry / "__init__.py").exists()
-            if not (has_main or has_init):
+            if not ((entry / "__main__.py").exists() or (entry / "__init__.py").exists()):
                 continue
-
             module_name = f"modules.{entry.name}"
             try:
                 for suffix in (".__main__", ""):
@@ -169,47 +144,70 @@ class AgentLoop:
     # Main entry point
     # ------------------------------------------------------------------
 
-    async def run(self, msg: InboundMessage) -> AsyncIterator[AgentEvent]:
-        self._turn_count += 1
-        logger.debug("[%s] turn %d", self.session_key, self._turn_count)
+    async def run(
+        self,
+        msg: InboundMessage | None = None,
+        abort_event: asyncio.Event | None = None,
+    ) -> AsyncIterator[AgentEvent]:
+        """
+        Run one agent turn.
 
-        # Shared kwargs for every event yielded this turn.
+        msg=None  — synthetic turn: skip Stage 1, generate against current
+                    context as-is (used by PUT /v1/sessions/{id}/generation).
+        msg=<msg> — normal turn: add user message to context, then generate.
+        """
+        self._turn_count += 1
+        logger.debug("[%s] turn %d (synthetic=%s)", self.session_key, self._turn_count, msg is None)
+
+        if msg is not None:
+            trace_id   = msg.trace_id
+            msg_id     = msg.message_id
+        else:
+            trace_id   = str(uuid.uuid4())
+            msg_id     = "synthetic"
+
         ev = dict(
             session_key=self.session_key,
-            trace_id=msg.trace_id,
-            reply_to_message_id=msg.message_id,
+            trace_id=trace_id,
+            reply_to_message_id=msg_id,
         )
 
-        # Stage 1: Intake
-        # If the message has attachments, build a content block list;
-        # otherwise just use the plain text string.
-        if msg.attachments:
-            primary_cfg = self.config.get_model_config(self.config.llm.primary)
-            user_content = build_content_blocks(
-                text=msg.text,
-                attachments=msg.attachments,
-                model_cfg=primary_cfg,
-                att_cfg=self.config.attachments,
-                workspace=self.config.workspace.path,
-            )
-        else:
-            user_content = msg.text
-        self.context.add(HistoryEntry.user(user_content))
+        # Stage 1: Intake (skipped for synthetic turns)
+        if msg is not None:
+            if msg.attachments:
+                primary_cfg  = self.config.get_model_config(self.config.llm.primary)
+                user_content = build_content_blocks(
+                    text=msg.text,
+                    attachments=msg.attachments,
+                    model_cfg=primary_cfg,
+                    att_cfg=self.config.attachments,
+                    workspace=self.config.workspace.path,
+                )
+            else:
+                user_content = msg.text
+            self.context.add(HistoryEntry.user(user_content))
 
-        max_cycles = self.config.max_tool_cycles
-        final_text = ""
+        max_cycles       = self.config.max_tool_cycles
+        final_text       = ""
         streaming_active = False
 
         for cycle in range(max_cycles):
+
+            # Abort check between cycles
+            if abort_event and abort_event.is_set():
+                logger.info("[%s] aborted before cycle %d", self.session_key, cycle)
+                yield AgentError(message="[generation aborted]", **ev)
+                return
+
             # Stage 2: Context Assembly
             await self.context.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
             tools    = self.tool_handler.get_tool_definitions() or None
             messages = self.context.assemble(tools=tools)
 
             # Token budget telemetry
-            tokens_used  = self.context.state.get("tokens_used", 0)
-            token_limit  = self.config.context
-            token_pct    = tokens_used / token_limit if token_limit else 0
+            tokens_used = self.context.state.get("tokens_used", 0)
+            token_limit = self.config.context
+            token_pct   = tokens_used / token_limit if token_limit else 0
             if token_pct >= 0.95:
                 logger.warning(
                     "[%s] context at %.0f%% of token budget (%d/%d) — consider compaction",
@@ -222,16 +220,16 @@ class AgentLoop:
                 )
 
             # Stage 3: Inference — walk primary → fallback chain
-            text_chunks: list[str]      = []
-            tool_calls:  list[ToolCall] = []
-            error:       str | None     = None
-            streaming_active            = False
-            last_http_status: int | None = None
+            text_chunks:      list[str]      = []
+            tool_calls:       list[ToolCall] = []
+            error:            str | None     = None
+            streaming_active                 = False
+            last_http_status: int | None     = None
 
             model_chain = [self.config.llm.primary] + list(self.config.llm.fallback)
 
             for model_name in model_chain:
-                llm = self._models[model_name]
+                llm              = self._models[model_name]
                 text_chunks      = []
                 tool_calls       = []
                 error            = None
@@ -239,15 +237,16 @@ class AgentLoop:
                 last_http_status = None
 
                 async for llm_event in llm.stream(messages, tools=tools):
+                    if abort_event and abort_event.is_set():
+                        logger.info("[%s] aborted mid-stream", self.session_key)
+                        yield AgentError(message="[generation aborted]", **ev)
+                        return
+
                     if isinstance(llm_event, ThinkingDelta):
                         yield AgentThinkingChunk(text=llm_event.text, **ev)
 
                     elif isinstance(llm_event, TextDelta):
                         text_chunks.append(llm_event.text)
-                        # Only stream text on the final cycle (no tool calls yet).
-                        # If tool calls arrive later this cycle, we've already
-                        # streamed text we can't unsend — that's acceptable;
-                        # the final AgentTextFinal will carry the full text.
                         if not tool_calls:
                             streaming_active = True
                             yield AgentTextChunk(text=llm_event.text, **ev)
@@ -278,8 +277,7 @@ class AgentLoop:
 
                 fo = self.config.llm.fallback_on
                 should_fallback = fo.any_error or (
-                    last_http_status is not None
-                    and last_http_status in fo.http_codes
+                    last_http_status is not None and last_http_status in fo.http_codes
                 )
                 if should_fallback and model_name != model_chain[-1]:
                     logger.warning(
@@ -305,15 +303,10 @@ class AgentLoop:
                 final_text = response_text
                 break
 
-            # Stage 4 & 5: Tool execution + result backfill
+            # Stages 4 & 5: Tool execution + result backfill
             logger.debug("[%s] cycle %d — %d tool call(s)", self.session_key, cycle, len(tool_calls))
             for tc in tool_calls:
-                yield AgentToolCall(
-                    call_id=tc.call_id,
-                    tool_name=tc.tool_name,
-                    args=tc.args,
-                    **ev,
-                )
+                yield AgentToolCall(call_id=tc.call_id, tool_name=tc.tool_name, args=tc.args, **ev)
                 result = await self._execute_tool(tc)
                 self.context.add(HistoryEntry.tool_result(result))
                 yield AgentToolResult(
@@ -328,13 +321,11 @@ class AgentLoop:
             logger.warning("[%s] hit max_tool_cycles (%d)", self.session_key, max_cycles)
             final_text = final_text or "[Tool cycle limit reached.]"
 
-        # Stage 6: Final reply event
         yield AgentTextFinal(text=final_text if not streaming_active else "", **ev)
-
         await self._flush_history()
 
     # ------------------------------------------------------------------
-    # Stage 4: Tool execution
+    # Tool execution
     # ------------------------------------------------------------------
 
     async def _execute_tool(self, call: ToolCall) -> ToolResult:
@@ -355,10 +346,9 @@ class AgentLoop:
     # ------------------------------------------------------------------
 
     def reset(self) -> None:
-        """Hard reset — clear in-memory context and overwrite session JSON with empty dialogue."""
         self.context.clear()
         self._turn_count = 0
-        safe_key = str(self.session_key).replace(":", "_")
+        safe_key     = str(self.session_key).replace(":", "_")
         sessions_dir = Path("sessions") / safe_key
         sessions_dir.mkdir(parents=True, exist_ok=True)
         path = sessions_dir / f"{self._session_version}.json"
@@ -374,38 +364,30 @@ class AgentLoop:
             logger.info("[%s] reset session v%d on disk", self.session_key, self._session_version)
         except Exception as exc:
             logger.warning("[%s] failed to write reset session JSON: %s", self.session_key, exc)
-        logger.info("[%s] context reset (v%d)", self.session_key, self._session_version)
 
     def next_session(self) -> None:
-        """Archive current session JSON and start a fresh version."""
         self.context.clear()
-        self._turn_count = 0
+        self._turn_count      = 0
         self._session_version += 1
-        logger.info("[%s] new session v%d (history preserved on disk)", self.session_key, self._session_version)
+        logger.info("[%s] new session v%d", self.session_key, self._session_version)
 
     def _load_latest_version(self) -> int:
-        safe_key = str(self.session_key).replace(":", "_")
+        safe_key     = str(self.session_key).replace(":", "_")
         sessions_dir = Path("sessions") / safe_key
         if not sessions_dir.exists():
             return 1
-        existing = [
-            int(p.stem) for p in sessions_dir.glob("*.json") if p.stem.isdigit()
-        ]
+        existing = [int(p.stem) for p in sessions_dir.glob("*.json") if p.stem.isdigit()]
         return max(existing, default=1)
 
     def _restore_history(self) -> None:
         safe_key = str(self.session_key).replace(":", "_")
-        path = Path("sessions") / safe_key / f"{self._session_version}.json"
-
+        path     = Path("sessions") / safe_key / f"{self._session_version}.json"
         if not path.exists():
             return
-
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             self._turn_count = data.get("turn", 0)
             for raw in data.get("dialogue", []):
-                # content may be a str (plain text) or list (content blocks with
-                # images/attachments) — preserve whichever was serialised.
                 raw_content = raw.get("content", "")
                 entry = HistoryEntry(
                     role=raw["role"],
@@ -418,19 +400,17 @@ class AgentLoop:
                 )
                 self.context.dialogue.append(entry)
             logger.info(
-                "[%s] restored %d dialogue entries from v%d",
+                "[%s] restored %d entries from v%d",
                 self.session_key, len(self.context.dialogue), self._session_version,
             )
         except Exception as exc:
             logger.warning("[%s] _restore_history failed: %s", self.session_key, exc)
 
     async def _flush_history(self) -> None:
-        safe_key = str(self.session_key).replace(":", "_")
+        safe_key     = str(self.session_key).replace(":", "_")
         sessions_dir = Path("sessions") / safe_key
         sessions_dir.mkdir(parents=True, exist_ok=True)
-
         path = sessions_dir / f"{self._session_version}.json"
-
         dialogue_raw = [
             {
                 "id":           e.id,
@@ -443,7 +423,6 @@ class AgentLoop:
             }
             for e in self.context.dialogue
         ]
-
         data = {
             "session_key": str(self.session_key),
             "version":     self._session_version,
@@ -451,12 +430,8 @@ class AgentLoop:
             "saved_at":    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "dialogue":    dialogue_raw,
         }
-
         try:
-            path.write_text(
-                json.dumps(data, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
+            path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
             logger.debug("[%s] flushed v%d -> %s", self.session_key, self._session_version, path)
         except Exception as exc:
             logger.warning("[%s] _flush_history failed: %s", self.session_key, exc)
