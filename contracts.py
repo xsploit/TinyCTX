@@ -38,6 +38,38 @@ def content_type_for(text: str, has_attachments: bool) -> "ContentType":
     return ContentType.TEXT
 
 
+# ---------------------------------------------------------------------------
+# Group policy
+# ---------------------------------------------------------------------------
+
+class ActivationMode(str, Enum):
+    MENTION = "mention"   # respond only when @mentioned or prefix used (default)
+    PREFIX  = "prefix"    # respond only when command prefix is present
+    ALWAYS  = "always"    # respond to every message in the group
+
+
+@dataclass(frozen=True)
+class GroupPolicy:
+    """
+    Per-group activation and buffering policy.
+
+    Bridges attach this to InboundMessage for group sessions.
+    GroupLane in router.py enforces it — bridges pass raw message text.
+
+    activation:       MENTION | PREFIX | ALWAYS
+    trigger_prefix:   command prefix string (e.g. "!")
+    bot_mxid:         full @user:server MXID (Matrix) or empty string
+    bot_localpart:    @localpart derived from bot_mxid, or empty string
+    buffer_timeout_s: seconds to wait before flushing buffered non-trigger
+                      messages without a trigger arriving. 0 = disabled.
+    """
+    activation:       ActivationMode = ActivationMode.MENTION
+    trigger_prefix:   str            = "!"
+    bot_mxid:         str            = ""
+    bot_localpart:    str            = ""
+    buffer_timeout_s: float          = 0.0
+
+
 class AttachmentKind(str, Enum):
     IMAGE    = "image"     # image/* — inline as image_url block (vision models)
     TEXT     = "text"      # text/*, .md, .py, .json etc. — read + inline as text
@@ -131,6 +163,10 @@ class Attachment:
 class InboundMessage:
     """
     Canonical message produced by bridges. Nothing platform-specific leaks here.
+
+    For group sessions, bridges should set group_policy so the router's
+    GroupLane can enforce trigger detection, stripping, and buffering.
+    Bridges pass raw (unstripped) text; GroupLane handles everything.
     """
     session_key:  SessionKey
     author:       UserIdentity
@@ -138,9 +174,10 @@ class InboundMessage:
     text:         str
     message_id:   str
     timestamp:    float
-    reply_to_id:  str | None = None
+    reply_to_id:  str | None    = None
     attachments:  tuple["Attachment", ...] = field(default_factory=tuple)
-    trace_id:     str = field(default_factory=lambda: str(uuid.uuid4()))
+    trace_id:     str           = field(default_factory=lambda: str(uuid.uuid4()))
+    group_policy: "GroupPolicy | None" = None  # set by bridge for group messages
 
 
 # ---------------------------------------------------------------------------

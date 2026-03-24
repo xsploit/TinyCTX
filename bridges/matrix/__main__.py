@@ -75,6 +75,7 @@ except ImportError:
     _HAS_MEDIA_EVENTS = False
 
 from contracts import (
+    ActivationMode,
     AgentError,
     AgentThinkingChunk,
     AgentTextChunk,
@@ -83,6 +84,7 @@ from contracts import (
     AgentToolResult,
     Attachment,
     content_type_for,
+    GroupPolicy,
     InboundMessage,
     Platform,
     SessionKey,
@@ -125,6 +127,11 @@ DEFAULTS = {
 # Matrix plain-body mentions are already human-readable (@user:server), but
 # formatted bodies use HTML <a href="https://matrix.to/#/@user:server">Name</a>.
 # We normalize both to @localpart for LLM readability.
+#
+# Note: trigger detection, prefix/mention stripping, and non-trigger
+# buffering are handled by GroupLane in router.py via GroupPolicy.
+# This bridge only needs to humanize HTML anchor mentions before passing
+# the raw text down (Matrix-specific formatting concern).
 # ---------------------------------------------------------------------------
 
 _MATRIX_HTML_MENTION = re.compile(
@@ -160,72 +167,6 @@ def _humanize_matrix_mentions(text: str, own_mxid: str) -> str:
 
     text = _MATRIX_PLAIN_MXID.sub(_replace_plain, text)
     return text.strip()
-
-
-# ---------------------------------------------------------------------------
-# GroupBuffer (identical logic to Discord bridge)
-# ---------------------------------------------------------------------------
-
-@dataclass
-class _BufferedLine:
-    user_id: str
-    display_name: str
-    text: str
-
-
-class GroupBuffer:
-    def __init__(self, timeout_s: float) -> None:
-        self._timeout_s = timeout_s
-        self._lines: list[_BufferedLine] = []
-        self._flush_task: asyncio.Task | None = None
-        self._flush_callback = None
-
-    def set_flush_callback(self, cb) -> None:
-        self._flush_callback = cb
-
-    def add(self, user_id: str, display_name: str, text: str) -> None:
-        self._lines.append(_BufferedLine(user_id, display_name, text))
-        if self._timeout_s > 0:
-            self._reset_timer()
-
-    def flush(
-        self,
-        trigger_user_id: str | None = None,
-        trigger_display_name: str | None = None,
-        trigger_text: str | None = None,
-    ) -> list[_BufferedLine]:
-        self._cancel_timer()
-        lines = list(self._lines)
-        if trigger_text and trigger_user_id and trigger_display_name:
-            lines.append(_BufferedLine(trigger_user_id, trigger_display_name, trigger_text))
-        self._lines.clear()
-        return lines
-
-    def clear(self) -> None:
-        self._cancel_timer()
-        self._lines.clear()
-
-    def _reset_timer(self) -> None:
-        self._cancel_timer()
-        if self._flush_callback:
-            self._flush_task = asyncio.create_task(self._timeout_flush())
-
-    def _cancel_timer(self) -> None:
-        if self._flush_task and not self._flush_task.done():
-            self._flush_task.cancel()
-        self._flush_task = None
-
-    async def _timeout_flush(self) -> None:
-        try:
-            await asyncio.sleep(self._timeout_s)
-            if self._lines and self._flush_callback:
-                await self._flush_callback()
-        except asyncio.CancelledError:
-            pass
-
-
-def _format_buffer(lines: list[_BufferedLine]) -> str:
-    return "\n".join(f"[{line.display_name}]: {line.text}" for line in lines)
 
 
 # ---------------------------------------------------------------------------
@@ -300,8 +241,6 @@ class MatrixBridge:
         self._accumulators: dict[str, _ReplyAccumulator] = {}
         # session_key_str → asyncio.Event signalling typing should be active
         self._typing_active: dict[str, asyncio.Event] = {}
-        # room_id → GroupBuffer
-        self._group_buffers: dict[str, GroupBuffer] = {}
         # sender+room_id → pending Attachments (media arrives before text in Matrix)
         self._pending_attachments: dict[str, list[Attachment]] = {}
 
@@ -323,59 +262,20 @@ class MatrixBridge:
     def _is_dm_room(self, room: MatrixRoom) -> bool:
         return room.member_count == 2
 
-    def _get_or_create_buffer(self, room_id: str) -> GroupBuffer:
-        if room_id not in self._group_buffers:
-            self._group_buffers[room_id] = GroupBuffer(self._buffer_timeout_s)
-        return self._group_buffers[room_id]
-
     def _display_name(self, room: MatrixRoom, sender: str) -> str:
         return room.user_name(sender) or sender.split(":")[0].lstrip("@")
 
-    def _is_mentioned(self, body: str) -> bool:
-        """Check whether the bot's MXID or local part appears in the message."""
-        local = self._username.split(":")[0].lstrip("@")
-        return self._username in body or f"@{local}" in body
-
-    def _strip_trigger(self, text: str) -> str:
-        """Strip bot mention and command prefix from message text."""
-        local = self._username.split(":")[0].lstrip("@")
-        text = text.replace(self._username, "").replace(f"@{local}", "")
-        if text.startswith(self._prefix):
-            text = text[len(self._prefix):]
-        return text.strip()
-
-    def _extract_text(
-        self, room, event
-    ) -> str | None:
-        """
-        Extract and normalise the user-visible text from a Matrix message.
-
-        Returns the text the agent should receive, or None if the message
-        should be silently ignored (group room, trigger required, no trigger).
-
-        DM rooms:   always return the stripped body.
-        Group rooms:
-          - If the message starts with the command prefix or mentions the bot
-            → strip the trigger and return the remainder.
-          - Otherwise, if prefix_required is True → return None.
-          - Otherwise → return the stripped body.
-        """
-        body = event.body.strip()
-
-        if self._is_dm_room(room):
-            return body
-
-        # Group room
-        mentioned = self._is_mentioned(body)
-        prefixed = body.startswith(self._prefix)
-
-        if mentioned or prefixed:
-            return self._strip_trigger(body)
-
-        if self._prefix_required:
-            return None
-
-        return body
+    def _build_group_policy(self) -> GroupPolicy:
+        """Build the GroupPolicy for this room from bridge config."""
+        localpart = self._username.split(":")[0].lstrip("@")
+        activation = ActivationMode.ALWAYS if not self._prefix_required else ActivationMode.MENTION
+        return GroupPolicy(
+            activation=activation,
+            trigger_prefix=self._prefix,
+            bot_mxid=self._username,
+            bot_localpart=localpart,
+            buffer_timeout_s=self._buffer_timeout_s,
+        )
 
     # ------------------------------------------------------------------
     # Event handler registered with Router
@@ -473,12 +373,10 @@ class MatrixBridge:
         # Group room path
         # ----------------------------------------------------------------
         session_key = SessionKey.group(Platform.MATRIX, room.room_id)
-        buf = self._get_or_create_buffer(room.room_id)
 
-        # /reset — admin only
+        # /reset — admin only (handled before routing)
         if body == self._reset_command:
             if self._is_admin(event.sender):
-                buf.clear()
                 self._router.reset_session(session_key)
                 await self._send(room.room_id, "✅ Session reset.")
                 logger.info(
@@ -489,46 +387,34 @@ class MatrixBridge:
                 await self._send(room.room_id, "⛔ Only admins can reset the session.")
             return
 
-        mentioned = self._is_mentioned(body)
-        prefixed = body.startswith(self._prefix)
-        is_trigger = mentioned or prefixed
+        # Humanize HTML mention markup (Matrix-specific formatting only).
+        # Trigger detection and stripping are handled by GroupLane via GroupPolicy.
+        humanized_body = _humanize_matrix_mentions(body, self._own_user_id)
 
-        display = self._display_name(room, event.sender)
-
-        if self._prefix_required and not is_trigger:
-            # Non-trigger: humanize mentions and buffer.
-            humanized = _humanize_matrix_mentions(body, self._own_user_id)
-
-            async def _timeout_flush_cb(
-                _buf=buf, _room=room, _session_key=session_key,
-            ):
-                await self._flush_group_buffer(
-                    _buf, _room, _session_key,
-                    trigger_user_id=None, trigger_display_name=None, trigger_text=None,
-                )
-
-            buf.set_flush_callback(_timeout_flush_cb)
-            buf.add(event.sender, display, humanized)
-            logger.debug(
-                "Matrix: buffered non-trigger message from %s in room %s",
-                display, room.room_id,
-            )
-            return
-
-        # Trigger: strip bot mention/prefix, humanize, collect attachments, flush.
-        stripped = self._strip_trigger(body)
-        humanized_trigger = _humanize_matrix_mentions(stripped, self._own_user_id)
-
-        att_key = f"{event.sender}:{room.room_id}"
+        display    = self._display_name(room, event.sender)
+        att_key    = f"{event.sender}:{room.room_id}"
         attachments = tuple(self._pending_attachments.pop(att_key, []))
 
-        await self._flush_group_buffer(
-            buf, room, session_key,
-            trigger_user_id=event.sender,
-            trigger_display_name=display,
-            trigger_text=humanized_trigger,
+        author = UserIdentity(
+            platform=Platform.MATRIX,
+            user_id=event.sender,
+            username=display,
+        )
+        msg = InboundMessage(
+            session_key=session_key,
+            author=author,
+            content_type=content_type_for(humanized_body, bool(attachments)),
+            text=humanized_body,
+            message_id=event.event_id,
+            timestamp=time.time(),
             attachments=attachments,
-            trigger_event_id=event.event_id,
+            group_policy=self._build_group_policy(),
+        )
+        session_key_str = str(session_key)
+        acc = _ReplyAccumulator(self._max_len)
+        self._accumulators[session_key_str] = acc
+        asyncio.create_task(
+            self._handle_turn(msg, room.room_id, session_key_str, acc)
         )
 
     async def _on_media(self, room: MatrixRoom, event) -> None:
@@ -564,63 +450,6 @@ class MatrixBridge:
         key = f"{event.sender}:{room.room_id}"
         self._pending_attachments.setdefault(key, []).append(att)
         logger.debug("Matrix: buffered attachment %s (%s) from %s", filename, mime, event.sender)
-
-    # ------------------------------------------------------------------
-    # Group flush
-    # ------------------------------------------------------------------
-
-    async def _flush_group_buffer(
-        self,
-        buf: GroupBuffer,
-        room: MatrixRoom,
-        session_key: SessionKey,
-        trigger_user_id: str | None,
-        trigger_display_name: str | None,
-        trigger_text: str | None,
-        attachments: tuple = (),
-        trigger_event_id: str | None = None,
-    ) -> None:
-        lines = buf.flush(
-            trigger_user_id=trigger_user_id,
-            trigger_display_name=trigger_display_name,
-            trigger_text=trigger_text,
-        )
-        if not lines and not attachments:
-            return
-
-        combined_text = _format_buffer(lines)
-
-        if trigger_user_id:
-            author_uid = trigger_user_id
-            author_name = trigger_display_name or trigger_user_id
-            msg_id = trigger_event_id or str(time.time_ns())
-        else:
-            first = lines[0] if lines else None
-            author_uid = first.user_id if first else "unknown"
-            author_name = first.display_name if first else "unknown"
-            msg_id = str(time.time_ns())
-
-        author = UserIdentity(
-            platform=Platform.MATRIX,
-            user_id=author_uid,
-            username=author_name,
-        )
-        msg = InboundMessage(
-            session_key=session_key,
-            author=author,
-            content_type=content_type_for(combined_text, bool(attachments)),
-            text=combined_text,
-            message_id=msg_id,
-            timestamp=time.time(),
-            attachments=attachments,
-        )
-
-        session_key_str = str(session_key)
-        acc = _ReplyAccumulator(self._max_len)
-        self._accumulators[session_key_str] = acc
-        asyncio.create_task(
-            self._handle_turn(msg, room.room_id, session_key_str, acc)
-        )
 
     # ------------------------------------------------------------------
     # Turn handling

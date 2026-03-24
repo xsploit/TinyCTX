@@ -648,68 +648,9 @@ class TestMatrixDMDetection:
         assert b._is_dm_room(room) is False
 
 
-class TestMatrixTextExtraction:
-    def _bridge(self, prefix="!", prefix_required=True):
-        return MatrixBridge(_make_router(), {
-            "homeserver": "https://matrix.org",
-            "username": "@bot:matrix.org",
-            "command_prefix": prefix,
-            "prefix_required": prefix_required,
-        })
-
-    def _dm_room(self):
-        import nio
-        return nio.MatrixRoom(member_count=2)
-
-    def _group_room(self):
-        import nio
-        return nio.MatrixRoom(room_id="!group:matrix.org", member_count=5)
-
-    def _event(self, body):
-        import nio
-        return nio.RoomMessageText(sender="@user:matrix.org", body=body)
-
-    def test_dm_returns_full_body(self):
-        b = self._bridge()
-        text = b._extract_text(self._dm_room(), self._event("  hello world  "))
-        assert text == "hello world"
-
-    def test_group_prefix_triggers(self):
-        b = self._bridge(prefix="!")
-        text = b._extract_text(self._group_room(), self._event("!hello there"))
-        assert text == "hello there"
-
-    def test_group_full_mention_triggers(self):
-        b = self._bridge()
-        text = b._extract_text(self._group_room(), self._event("@bot:matrix.org do the thing"))
-        assert text == "do the thing"
-
-    def test_group_short_mention_triggers(self):
-        b = self._bridge()
-        text = b._extract_text(self._group_room(), self._event("@bot do the thing"))
-        assert text == "do the thing"
-
-    def test_group_no_trigger_returns_none_when_required(self):
-        b = self._bridge(prefix_required=True)
-        text = b._extract_text(self._group_room(), self._event("just chatting"))
-        assert text is None
-
-    def test_group_no_trigger_returns_body_when_not_required(self):
-        b = self._bridge(prefix_required=False)
-        text = b._extract_text(self._group_room(), self._event("just chatting"))
-        assert text == "just chatting"
-
-    def test_prefix_stripped_from_result(self):
-        b = self._bridge(prefix="!")
-        text = b._extract_text(self._group_room(), self._event("!hello"))
-        assert not text.startswith("!")
-        assert text == "hello"
-
-    def test_mention_stripped_from_result(self):
-        b = self._bridge()
-        text = b._extract_text(self._group_room(), self._event("@bot:matrix.org what time is it"))
-        assert "@bot" not in text
-        assert "what time is it" in text
+# TestMatrixTextExtraction removed — trigger detection, stripping, and
+# buffering are now handled by GroupLane in router.py via GroupPolicy.
+# See tests/test_router.py :: TestGroupLane for the equivalent coverage.
 
 
 class TestMatrixMessageFiltering:
