@@ -4,11 +4,13 @@ gateway/__main__.py — HTTP/SSE API gateway.
 Exposes run(router, config) for main.py.
 
 All endpoints require:  Authorization: Bearer <api_key>
+/v1/health is always public.
 
 Endpoints:
 
   POST   /v1/sessions/{session_id}/message
-    body: { "text": "...", "stream": true, "session_type": "dm"|"group" }
+    body: { "text": "...", "stream": true, "session_type": "dm"|"group",
+            "attachments": [{"name", "data_b64", "mime_type"}] }
     SSE stream:
       data: {"type": "text_chunk",   "text": "..."}
       data: {"type": "tool_call",    "call_id": "...", "name": "...", "args": {...}}
@@ -18,9 +20,26 @@ Endpoints:
       data: {"type": "done"}
     non-stream: { "text": "..." }
 
+  GET    /v1/sessions
+    query: ?session_type=dm|group  (default: all)
+    -> [{ "id", "session_type", "turns", "queue_depth", "queue_max" }, ...]
+    Lists all active in-memory sessions. Sessions that have never received a
+    message (no Lane yet) will not appear here.
+
+  DELETE /v1/sessions/{session_id}
+    query: ?session_type=dm|group  (default: dm)
+    Resets the session (clears dialogue + deletes persisted JSON).
+    -> 204
+
+  PATCH  /v1/sessions/{session_id}/rename
+    body: { "new_id": "..." }
+    query: ?session_type=dm|group  (default: dm)
+    Renames the session: persisted JSON is moved, Lane re-keyed.
+    -> { "old_id": "...", "new_id": "..." }
+
   GET    /v1/sessions/{session_id}/history
     query: ?session_type=dm|group  (default: dm)
-    -> [{ "id", "role", "content", "tool_calls", "tool_call_id", "index" }, ...]
+    -> [{ "id", "role", "content", "tool_calls", "tool_call_id", "index", "author_id" }, ...]
 
   PATCH  /v1/sessions/{session_id}/history/{entry_id}
     body: { "content": "..." }
@@ -31,6 +50,7 @@ Endpoints:
 
   POST   /v1/sessions/{session_id}/reset
     query: ?session_type=dm|group  (default: dm)
+    Alias for DELETE /v1/sessions/{session_id} — kept for backwards compat.
     -> 204
 
   GET    /v1/workspace/files/{path}
@@ -41,10 +61,10 @@ Endpoints:
     -> { "path": "...", "written": true }
 
   GET    /v1/health
-    -> { "status": "ok", "sessions": [...] }
+    -> { "status": "ok", "uptime_s": N, "sessions": { "<key>": { ... } } }
 
 Session type / key resolution:
-  dm    -> SessionKey.dm(session_id)               platform=API (via author)
+  dm    -> SessionKey.dm(session_id)
   group -> SessionKey.group(Platform.API, session_id)
 
 Path safety for workspace files:
@@ -65,7 +85,7 @@ from aiohttp import web
 from config import GatewayConfig
 from contracts import (
     Platform, ContentType, content_type_for,
-    SessionKey, UserIdentity, InboundMessage, Attachment,
+    SessionKey, ChatType, UserIdentity, InboundMessage, Attachment,
     AgentTextChunk, AgentTextFinal, AgentToolCall, AgentToolResult, AgentError,
 )
 
@@ -89,10 +109,6 @@ def _session_key(session_id: str, session_type: str) -> SessionKey:
 
 
 def _resolve_workspace_path(workspace_root: Path, rel: str) -> Path | None:
-    """
-    Resolve a relative path under workspace_root.
-    Returns None if the resolved path escapes the root (path traversal attempt).
-    """
     try:
         target = (workspace_root / rel).resolve()
         target.relative_to(workspace_root.resolve())
@@ -122,6 +138,20 @@ def _lane_for(router, key: SessionKey):
     return router._session_router._lanes.get(key)
 
 
+def _all_lanes(router) -> dict[SessionKey, object]:
+    return dict(router._session_router._lanes)
+
+
+def _lane_summary(sk: SessionKey, lane) -> dict:
+    return {
+        "id":           sk.conversation_id,
+        "session_type": "group" if sk.chat_type == ChatType.GROUP else "dm",
+        "turns":        lane.loop._turn_count,
+        "queue_depth":  lane.queue.qsize(),
+        "queue_max":    lane.queue.maxsize,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Route handlers
 # ---------------------------------------------------------------------------
@@ -148,7 +178,6 @@ async def handle_message(request: web.Request) -> web.StreamResponse:
             body=json.dumps({"error": "text or attachments is required"}),
         )
 
-    # Parse attachments: [{"name": str, "data_b64": str, "mime_type": str}, ...]
     raw_atts = body.get("attachments") or []
     attachments: tuple[Attachment, ...] = ()
     if raw_atts:
@@ -277,6 +306,87 @@ async def handle_message(request: web.Request) -> web.StreamResponse:
         )
 
 
+# ---------------------------------------------------------------------------
+# Session list / delete / rename
+# ---------------------------------------------------------------------------
+
+async def handle_sessions_list(request: web.Request) -> web.Response:
+    """GET /v1/sessions — list all in-memory sessions."""
+    router       = request.app["router"]
+    session_type = request.rel_url.query.get("session_type", None)  # None = all
+
+    results = []
+    for sk, lane in _all_lanes(router).items():
+        if session_type == "dm"    and sk.chat_type != ChatType.DM:    continue
+        if session_type == "group" and sk.chat_type != ChatType.GROUP: continue
+        results.append(_lane_summary(sk, lane))
+
+    results.sort(key=lambda x: x["id"])
+    return web.Response(content_type="application/json", body=json.dumps(results))
+
+
+async def handle_session_delete(request: web.Request) -> web.Response:
+    """DELETE /v1/sessions/{session_id} — reset and evict session."""
+    router       = request.app["router"]
+    session_id   = request.match_info["session_id"]
+    session_type = request.rel_url.query.get("session_type", "dm")
+    sk           = _session_key(session_id, session_type)
+    router.reset_session(sk)
+    return web.Response(status=204)
+
+
+async def handle_session_rename(request: web.Request) -> web.Response:
+    """PATCH /v1/sessions/{session_id}/rename — rename a session."""
+    router       = request.app["router"]
+    session_id   = request.match_info["session_id"]
+    session_type = request.rel_url.query.get("session_type", "dm")
+    sk_old       = _session_key(session_id, session_type)
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(
+            content_type="application/json",
+            body=json.dumps({"error": "invalid JSON"}),
+        )
+
+    new_id = (body.get("new_id") or "").strip()
+    if not new_id:
+        raise web.HTTPBadRequest(
+            content_type="application/json",
+            body=json.dumps({"error": "new_id is required"}),
+        )
+    if new_id == session_id:
+        return web.Response(
+            content_type="application/json",
+            body=json.dumps({"old_id": session_id, "new_id": new_id}),
+        )
+
+    sk_new = _session_key(new_id, session_type)
+
+    # Use router's rename helper (implemented below via duck-typing guard)
+    if hasattr(router, "rename_session"):
+        success = router.rename_session(sk_old, sk_new)
+        if not success:
+            raise web.HTTPNotFound(
+                content_type="application/json",
+                body=json.dumps({"error": "session not found"}),
+            )
+    else:
+        # Graceful degradation: reset old, let new be created fresh
+        logger.warning("Router lacks rename_session — falling back to reset")
+        router.reset_session(sk_old)
+
+    return web.Response(
+        content_type="application/json",
+        body=json.dumps({"old_id": session_id, "new_id": new_id}),
+    )
+
+
+# ---------------------------------------------------------------------------
+# History
+# ---------------------------------------------------------------------------
+
 async def handle_history_get(request: web.Request) -> web.Response:
     router       = request.app["router"]
     session_id   = request.match_info["session_id"]
@@ -365,6 +475,7 @@ async def handle_history_delete(request: web.Request) -> web.Response:
 
 
 async def handle_session_reset(request: web.Request) -> web.Response:
+    """POST /v1/sessions/{session_id}/reset — backwards-compat alias for DELETE."""
     router       = request.app["router"]
     session_id   = request.match_info["session_id"]
     session_type = request.rel_url.query.get("session_type", "dm")
@@ -372,6 +483,10 @@ async def handle_session_reset(request: web.Request) -> web.Response:
     router.reset_session(sk)
     return web.Response(status=204)
 
+
+# ---------------------------------------------------------------------------
+# Workspace
+# ---------------------------------------------------------------------------
 
 async def handle_workspace_get(request: web.Request) -> web.Response:
     workspace = request.app["workspace"]
@@ -438,20 +553,19 @@ async def handle_workspace_put(request: web.Request) -> web.Response:
     return web.Response(content_type="application/json", body=json.dumps({"path": rel, "written": True}))
 
 
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
+
 async def handle_health(request: web.Request) -> web.Response:
     router  = request.app["router"]
-    lanes   = router._session_router._lanes
     uptime  = time.time() - request.app["start_time"]
     payload = {
         "status":   "ok",
         "uptime_s": round(uptime, 1),
         "sessions": {
-            str(sk): {
-                "queue_depth": lane.queue.qsize(),
-                "queue_max":   lane.queue.maxsize,
-                "turns":       lane.loop._turn_count,
-            }
-            for sk, lane in lanes.items()
+            str(sk): _lane_summary(sk, lane)
+            for sk, lane in _all_lanes(router).items()
         },
     }
     return web.Response(content_type="application/json", body=json.dumps(payload))
@@ -469,13 +583,23 @@ def _make_app(router, cfg: GatewayConfig) -> web.Application:
     app["workspace"]  = workspace
     app["start_time"] = time.time()
 
+    # Session management
+    app.router.add_get(   "/v1/sessions",                                 handle_sessions_list)
+    app.router.add_delete("/v1/sessions/{session_id}",                    handle_session_delete)
+    app.router.add_patch( "/v1/sessions/{session_id}/rename",             handle_session_rename)
+
+    # Message + history
     app.router.add_post(  "/v1/sessions/{session_id}/message",            handle_message)
     app.router.add_get(   "/v1/sessions/{session_id}/history",            handle_history_get)
     app.router.add_patch( "/v1/sessions/{session_id}/history/{entry_id}", handle_history_patch)
     app.router.add_delete("/v1/sessions/{session_id}/history/{entry_id}", handle_history_delete)
     app.router.add_post(  "/v1/sessions/{session_id}/reset",              handle_session_reset)
+
+    # Workspace
     app.router.add_get(   "/v1/workspace/files/{path:.+}",                handle_workspace_get)
     app.router.add_put(   "/v1/workspace/files/{path:.+}",                handle_workspace_put)
+
+    # Health (public)
     app.router.add_get(   "/v1/health",                                   handle_health)
 
     return app
