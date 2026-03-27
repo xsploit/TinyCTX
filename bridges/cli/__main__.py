@@ -29,9 +29,15 @@ logger = logging.getLogger(__name__)
 try:
     from sympy import pretty
     from sympy.parsing.latex import parse_latex as _parse_latex
+    # antlr4 is required at runtime — probe it now so we don't silently fall back later
+    _parse_latex(r'x^2')
     _SYMPY = True
-except ImportError:
+except Exception:
     _SYMPY = False
+    logger.warning(
+        "LaTeX -> unicode rendering disabled. "
+        "Install sympy + antlr4-python3-runtime==4.11.0 to enable it."
+    )
 
 def _latex_to_unicode(latex: str) -> str:
     if not _SYMPY:
@@ -47,19 +53,47 @@ _BLOCK_MATH_DOLLARS  = re.compile(r'\$\$(.+?)\$\$', re.DOTALL)
 _BLOCK_MATH_BRACKET  = re.compile(r'\\\[(.+?)\\\]', re.DOTALL)
 _INLINE_MATH_DOLLARS = re.compile(r'(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)', re.DOTALL)
 _INLINE_MATH_PAREN   = re.compile(r'\\\((.+?)\\\)', re.DOTALL)
+_FENCED_LATEX        = re.compile(r'^```[ \t]*(latex|math|tex)\s*\n(.+?)\n```[ \t]*$', re.DOTALL | re.MULTILINE | re.IGNORECASE)
+_FENCED_CODE         = re.compile(r'^```[ \t]*(\w+)[ \t]*\n(.*?)\n```[ \t]*$', re.DOTALL | re.MULTILINE)
+_FENCED_PLAIN        = re.compile(r'^```[ \t]*\n(.*?)\n```[ \t]*$', re.DOTALL | re.MULTILINE)
+
+def _render_block(content: str) -> str:
+    """Render a latex string as an indented unicode block."""
+    rendered = _latex_to_unicode(content)
+    indented = "\n".join("    " + line for line in rendered.splitlines())
+    return f"\n{indented}\n"
+
+def _preprocess_code_labels(text: str) -> str:
+    """Prepend a dim language label above fenced code blocks since Rich drops it."""
+    def _label(m: re.Match) -> str:
+        lang = m.group(1)
+        body = m.group(2)
+        return f'*{lang}*\n```{lang}\n{body}\n```'
+    return _FENCED_CODE.sub(_label, text)
 
 def _preprocess_latex(text: str) -> str:
     """Replaces LaTeX spans with unicode before Markdown rendering.
-    Handles all four delimiter styles: $$, $, \\[, \\(
+    Handles fenced ```latex blocks and all four math delimiter styles.
     """
+    def _fenced(m: re.Match) -> str:
+        return _render_block(m.group(2))
+
     def _block(m: re.Match) -> str:
-        rendered = _latex_to_unicode(m.group(1))
-        indented = "\n".join("    " + line for line in rendered.splitlines())
-        return f"\n{indented}\n"
+        return _render_block(m.group(1))
 
     def _inline(m: re.Match) -> str:
         return _latex_to_unicode(m.group(1))
 
+    def _plain_fenced(m: re.Match) -> str:
+        # No language tag — attempt LaTeX, fall back to plain code block
+        content = m.group(1)
+        rendered = _latex_to_unicode(content)
+        if rendered != content:  # sympy changed it, treat as math
+            return _render_block(content)
+        return m.group(0)  # leave untouched for Rich to render
+
+    text = _FENCED_LATEX.sub(_fenced, text)
+    text = _FENCED_PLAIN.sub(_plain_fenced, text)
     text = _BLOCK_MATH_DOLLARS.sub(_block, text)
     text = _BLOCK_MATH_BRACKET.sub(_block, text)
     text = _INLINE_MATH_DOLLARS.sub(_inline, text)
@@ -132,6 +166,7 @@ class CLIBridge:
 
             final_text = (self._current_content + (event.text or "")).strip()
             processed = _preprocess_latex(final_text)
+            processed = _preprocess_code_labels(processed)
 
             self._console.print(f"[{c('agent_label')}]{t('agent_label')}:[/{c('agent_label')}]")
             self._console.print(Markdown(processed))
