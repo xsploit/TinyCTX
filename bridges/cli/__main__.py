@@ -11,10 +11,11 @@ import logging
 from dataclasses import dataclass, field
 
 import pyfiglet
-from rich.console import Console
+from rich.console import Console, Group
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.text import Text
+from rich.live import Live
 
 from contracts import (
     Platform, ContentType,
@@ -74,46 +75,82 @@ class CLIBridge:
         self._reply_done = asyncio.Event()
 
         self._current_content = ""
-        self._is_thinking = False
-        self._thinking_shown = False
+        self._live: Live | None = None
+
+    def _get_live_render(self, content: str, is_thinking: bool = False) -> Group:
+        """Helper to create a renderable group for the Live display."""
+        c = self._theme.c
+        t = self._theme.t
+        
+        parts = []
+        # Add the agent label header
+        parts.append(Text(f"{t('agent_label')}:", style=c('agent_label')))
+        
+        if is_thinking and not content:
+            parts.append(Text(" ⠋ thinking...", style=c('thinking')))
+        
+        if content:
+            # Preprocess and render the markdown accumulated so far
+            parts.append(Markdown(_preprocess(content)))
+            
+        return Group(*parts)
+
+    def _stop_live(self):
+        """Helper to safely stop and clear the live reference."""
+        if self._live:
+            self._live.stop()
+            self._live = None
+
+    def _ensure_live(self, is_thinking: bool = False):
+        """Helper to ensure the live display is running."""
+        if not self._live:
+            self._live = Live(
+                self._get_live_render(self._current_content, is_thinking),
+                console=self._console,
+                refresh_per_second=12,
+                vertical_overflow="visible"
+            )
+            self._live.start()
 
     async def handle_event(self, event) -> None:
         c = self._theme.c
         t = self._theme.t
 
         if isinstance(event, AgentThinkingChunk):
-            if not self._thinking_shown:
-                self._thinking_shown = True
-                self._console.print(
-                    f"[{c('thinking')}]{t('agent_label')}: ⠋ thinking...[/{c('thinking')}]",
-                    end="\r"
-                )
+            self._ensure_live(is_thinking=True)
+            self._live.update(self._get_live_render(self._current_content, is_thinking=True))
 
         elif isinstance(event, AgentTextChunk):
-            self._is_thinking = False
             self._current_content += event.text
+            self._ensure_live()
+            self._live.update(self._get_live_render(self._current_content))
 
         elif isinstance(event, AgentTextFinal):
-            if self._thinking_shown:
-                self._console.print(" " * 60, end="\r")
-
+            # Finalize the current stream
             final_text = (self._current_content + (event.text or "")).strip()
-            processed = _preprocess(final_text)
-
-            self._console.print(f"[{c('agent_label')}]{t('agent_label')}:[/{c('agent_label')}]")
-            self._console.print(Markdown(processed))
-            self._console.print()
-
+            self._current_content = final_text
+            
+            if self._live:
+                self._live.update(self._get_live_render(self._current_content))
+            
+            self._stop_live()
+            self._console.print() # Final spacer
+            
+            # Reset state for next turn
             self._current_content = ""
-            self._is_thinking = False
-            self._thinking_shown = False
             self._reply_done.set()
 
         elif isinstance(event, AgentToolCall):
+            # 1. Stop streaming so the tool call prints below the text
+            self._stop_live()
+            
             args_str = ", ".join(f"{k}={v!r}" for k, v in event.args.items())
             self._console.print(f"  [{c('tool_call')}]⟶  {event.tool_name}({args_str})[/{c('tool_call')}]")
 
         elif isinstance(event, AgentToolResult):
+            # 2. Results also print outside the live context
+            self._stop_live()
+            
             status_color = c("tool_error") if event.is_error else c("tool_ok")
             icon = "✗" if event.is_error else "✓"
             preview = event.output[:100].replace("\n", " ") + ("..." if len(event.output) > 100 else "")
@@ -121,6 +158,7 @@ class CLIBridge:
             self._console.print(preview, markup=False, style="bright_black")
 
         elif isinstance(event, AgentError):
+            self._stop_live()
             self._console.print(f"\n[{c('error')}]error: {event.message}[/{c('error')}]\n")
             self._reply_done.set()
 
