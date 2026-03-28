@@ -5,7 +5,7 @@ requests
 aiohttp
 pyyaml
 playwright
-duckduckgo-search
+ddgs
 mcp
 numpy
 tiktoken

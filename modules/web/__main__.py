@@ -256,7 +256,7 @@ def register(agent) -> None:
             query: The search query string.
             num_results: How many results to return (default 5).
         """
-        from duckduckgo_search import DDGS
+        from ddgs import DDGS
         try:
             with DDGS() as ddgs:
                 results = list(ddgs.text(query, max_results=num_results))

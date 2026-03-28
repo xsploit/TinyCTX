@@ -33,6 +33,7 @@ Convention: register(agent) — no imports from gateway, bridges, or contracts.
 """
 from __future__ import annotations
 
+import atexit
 import logging
 from pathlib import Path
 
@@ -188,6 +189,7 @@ def register(agent) -> None:
 
     from modules.memory.store import MemoryStore
     store = MemoryStore(db_path)
+    atexit.register(store.close)
 
     embedder        = None
     embedding_model = cfg.get("embedding_model", "").strip()

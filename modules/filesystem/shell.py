@@ -11,7 +11,7 @@ Blacklist is always enforced regardless of platform.
 Patterns are glob-style, case-insensitive, loaded from blacklist.txt.
 """
 from __future__ import annotations
-
+import re
 import fnmatch
 import logging
 import platform
@@ -24,13 +24,15 @@ _IS_WINDOWS = platform.system() == "Windows"
 
 BLACKLIST_PATH = Path(__file__).parent / "blacklist.txt"
 
+def glob_to_regex(pattern: str) -> re.Pattern:
+    """Convert a blacklist glob to a regex, treating backslash as literal."""
+    # Escape everything, then restore * and ? wildcards
+    escaped = re.escape(pattern)
+    # re.escape turns * into \* and ? into \? — unescape them as wildcards
+    escaped = escaped.replace(r'\*', '.*').replace(r'\?', '.')
+    return re.compile(escaped, re.IGNORECASE)
 
-def load_blacklist(path: Path = BLACKLIST_PATH) -> list[str]:
-    """
-    Load glob patterns from a blacklist file.
-    Lines starting with # and blank lines are ignored.
-    All patterns are lowercased for case-insensitive matching.
-    """
+def load_blacklist(path: Path = BLACKLIST_PATH) -> list[re.Pattern]:
     if not path.exists():
         logger.warning("filesystem: blacklist not found at %s — shell is unrestricted", path)
         return []
@@ -38,23 +40,15 @@ def load_blacklist(path: Path = BLACKLIST_PATH) -> list[str]:
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
-            patterns.append(line.lower())
+            patterns.append(glob_to_regex(line))
     logger.debug("filesystem: loaded %d blacklist patterns from %s", len(patterns), path)
     return patterns
 
-
-def check_blacklist(command: str, patterns: list[str]) -> str | None:
-    """
-    Check a command string against blacklist patterns.
-    Returns the first matching pattern if blocked, None if allowed.
-    Matching is case-insensitive and glob-style (fnmatch).
-    """
-    cmd_lower = command.lower()
+def check_blacklist(command: str, patterns: list[re.Pattern]) -> str | None:
     for pattern in patterns:
-        if fnmatch.fnmatch(cmd_lower, pattern):
-            return pattern
+        if pattern.fullmatch(command.lower()):
+            return pattern.pattern
     return None
-
 
 def run_command(command: str, cwd: Path, timeout: int, blacklist: list[str]) -> str:
     """

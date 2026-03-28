@@ -494,6 +494,12 @@ class MemoryStore:
     def close(self) -> None:
         self._conn.close()
 
+    def __enter__(self) -> MemoryStore:
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
