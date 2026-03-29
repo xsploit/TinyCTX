@@ -86,19 +86,33 @@ def register(agent) -> None:
             f"{i:>6}\t{l}" for i, l in enumerate(lines, 1)
         )
 
-    def write_file(path: str, content: str = "") -> str:
+    def write_file(path: str, content: str = "", mode: str = "append") -> str:
         """Write content to a file. Creates the file and any missing parent directories if they don't exist.
-        Overwrites the file if it already exists. Pass empty string to create an empty file or truncate an existing one.
 
         Args:
             path: Path to the file.
-            content: Full file content. Omit or pass empty string to create/truncate to empty.
+            content: Content to write. Omit or pass empty string to create/truncate to empty.
+            mode: How to write the content.
+                  'append'    — add content after existing content (default).
+                  'prepend'   — insert content before existing content.
+                  'overwrite' — replace the entire file with content.
         """
         p = resolve(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         existed = p.exists()
-        p.write_text(content, encoding="utf-8")
-        action = "truncated" if existed and content == "" else ("overwrote" if existed else "created")
+
+        if mode == "overwrite" or not existed:
+            p.write_text(content, encoding="utf-8")
+            action = "truncated" if existed and content == "" else ("overwrote" if existed else "created")
+        elif mode == "prepend":
+            existing = p.read_text(encoding="utf-8")
+            p.write_text(content + existing, encoding="utf-8")
+            action = "prepended"
+        else:  # append (default)
+            with p.open("a", encoding="utf-8") as f:
+                f.write(content)
+            action = "appended"
+
         return f"[{action} {p} ({len(content)} chars)]"
 
     def str_replace(path: str, old_str: str, new_str: str = "") -> str:
