@@ -26,7 +26,6 @@ from contracts import (
 )
 
 logger = logging.getLogger(__name__)
-logging.getLogger("markdown_it").setLevel(logging.WARNING)
 
 # --- Code block label injection ---
 # Rich's Markdown renderer syntax-highlights fenced blocks but drops the language label.
@@ -177,8 +176,14 @@ class CLIBridge:
     async def run(self) -> None:
         # Route all logging through Rich so log lines don't interleave with
         # the input() prompt or Live panels (fixes heartbeat log bleed).
+        config = getattr(self._gateway, "_config", None)
+        log_level = logging.WARNING
+        if config and hasattr(config, "logging"):
+            level_str = getattr(config.logging, "level", "WARNING")
+            log_level = getattr(logging, level_str.upper(), logging.WARNING)
+
         logging.basicConfig(
-            level=logging.DEBUG,
+            level=log_level,
             format="%(message)s",
             datefmt="[%X]",
             handlers=[RichHandler(console=self._console, rich_tracebacks=True, markup=False)],
