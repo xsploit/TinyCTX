@@ -72,6 +72,7 @@ def run_command(command: str, cwd: Path, timeout: int, blacklist: list[str]) -> 
         result = subprocess.run(
             exec_args, cwd=cwd,
             capture_output=True, text=True, timeout=timeout,
+            encoding="utf-8", errors="replace",
         )
         parts = []
         if result.stdout:
