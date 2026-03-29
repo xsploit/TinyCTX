@@ -77,7 +77,6 @@ class CLIBridge:
 
         self._current_content = ""
         self._live: Live | None = None
-        self._header_printed = False  # True once the Agent: label is shown this turn
         self._cursor: str | None = None  # node_id for this CLI session
 
     def _get_live_render(self, content: str, is_thinking: bool = False) -> Group:
@@ -85,10 +84,7 @@ class CLIBridge:
         c = self._theme.c
         t = self._theme.t
         
-        parts = []
-        # Only show the agent label header on the first live panel of this turn.
-        if not self._header_printed:
-            parts.append(Text(f"{t('agent_label')}:", style=c('agent_label')))
+        parts = [Text(f"{t('agent_label')}:", style=c('agent_label'))]
         
         if is_thinking and not content:
             parts.append(Text(" ⠋ thinking...", style=c('thinking')))
@@ -115,7 +111,6 @@ class CLIBridge:
                 vertical_overflow="visible"
             )
             self._live.start()
-            self._header_printed = True
 
     async def handle_event(self, event) -> None:
         c = self._theme.c
@@ -143,7 +138,6 @@ class CLIBridge:
             
             # Reset state for next turn
             self._current_content = ""
-            self._header_printed = False
             self._reply_done.set()
 
         elif isinstance(event, AgentToolCall):
@@ -166,7 +160,6 @@ class CLIBridge:
         elif isinstance(event, AgentError):
             self._stop_live()
             self._console.print(f"\n[{c('error')}]error: {event.message}[/{c('error')}]\n")
-            self._header_printed = False
             self._reply_done.set()
 
     async def _prompt(self, prompt_str: str) -> str:
