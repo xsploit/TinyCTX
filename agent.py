@@ -111,6 +111,7 @@ async def _run_background(tail_node_id: str, config: Config) -> None:
 class AgentLoop:
     def __init__(self, tail_node_id: str, config: Config) -> None:
         self.tail_node_id  = tail_node_id  # cursor — the DB node this agent runs from
+        self.lane_node_id  = tail_node_id  # original lane key — never changes
         self.config        = config
         self.context       = Context(token_limit=config.context)
         self.tool_handler  = ToolCallHandler()
@@ -272,6 +273,7 @@ class AgentLoop:
 
         ev = dict(
             tail_node_id=self._tail_node_id,
+            lane_node_id=self.lane_node_id,
             trace_id=trace_id,
             reply_to_message_id=msg_id,
         )

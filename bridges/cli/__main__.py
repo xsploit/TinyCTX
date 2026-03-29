@@ -9,6 +9,7 @@ import re
 import time
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import pyfiglet
 from rich.console import Console, Group
@@ -210,9 +211,6 @@ class CLIBridge:
                 self._reply_done.clear()
                 await self._gateway.push(msg)
                 await self._reply_done.wait()
-                # After each turn the agent may have advanced the cursor;
-                # read the updated cursor back from the lane.
-                self._cursor = _get_lane_cursor(self._gateway, self._cursor)
 
             except (KeyboardInterrupt, EOFError):
                 break
@@ -249,26 +247,6 @@ def _load_cli_cursor(gateway) -> str:
     cursor_file.write_text(node.id, encoding="utf-8")
     return node.id
 
-
-def _get_lane_cursor(gateway, current_node_id: str) -> str:
-    """
-    After a turn completes, read the agent's latest tail_node_id from the lane
-    and persist it to the cursor file so the next run resumes correctly.
-    """
-    lane = gateway._lane_router._lanes.get(current_node_id)
-    if lane is None:
-        return current_node_id
-    new_node_id = lane.loop._tail_node_id
-    if not new_node_id or new_node_id == current_node_id:
-        return current_node_id
-    # Persist updated cursor
-    workspace   = Path(gateway._config.workspace.path).expanduser().resolve()
-    cursor_file = workspace / "cursors" / "cli"
-    try:
-        cursor_file.write_text(new_node_id, encoding="utf-8")
-    except Exception:
-        pass
-    return new_node_id
 
 
 # --- Loader entry point ---

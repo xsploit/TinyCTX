@@ -353,8 +353,11 @@ class Router:
         return await self._lane_router.enqueue_synthetic(node_id)
 
     async def _dispatch_event(self, event: AgentEvent) -> None:
-        node_id = event.tail_node_id
-        handler = self._cursor_handlers.get(node_id)
+        # Use lane_node_id (stable original cursor) for dispatch, not tail_node_id
+        # (which advances as new DB nodes are written during the turn).
+        lane_id = event.lane_node_id
+
+        handler = self._cursor_handlers.get(lane_id)
         if handler is not None:
             try:
                 await handler(event)
@@ -362,9 +365,9 @@ class Router:
                 logger.exception("Cursor handler failed for %s", event.trace_id)
             return
 
-        platform = self._node_platforms.get(node_id)
+        platform = self._node_platforms.get(lane_id)
         if platform is None:
-            logger.error("Cannot determine platform for node %s — dropping %s", node_id, event.trace_id)
+            logger.error("Cannot determine platform for lane %s — dropping %s", lane_id, event.trace_id)
             return
         handler = self._platform_handlers.get(platform)
         if handler is None:

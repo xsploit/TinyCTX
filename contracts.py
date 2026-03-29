@@ -162,7 +162,8 @@ class InboundMessage:
 
 @dataclass(frozen=True, kw_only=True)
 class _AgentEventBase:
-    tail_node_id:        str
+    tail_node_id:        str   # current cursor — advances as new DB nodes are written
+    lane_node_id:        str   # original lane key — stable for the lifetime of the lane
     trace_id:            str
     reply_to_message_id: str
 
