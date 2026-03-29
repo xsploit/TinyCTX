@@ -570,6 +570,16 @@ class _FakeAgent:
         self.config       = cfg
         self.context      = Context(token_limit=cfg.context)
         self.tool_handler = _FakeToolHandler()
+        self._queued_background_branches: list[str] = []
+        self._background_hooks: list = []
+
+    def queue_background_branch(self, tail_node_id: str) -> None:
+        """Capture background branch requests instead of firing real asyncio tasks."""
+        self._queued_background_branches.append(tail_node_id)
+
+    def register_background_hook(self, fn) -> None:
+        """Capture background hooks; memory module's nudge hook wires here."""
+        self._background_hooks.append(fn)
 
 
 def _make_agent(nudge_threshold=0.8, nudge_message=None):
@@ -581,8 +591,44 @@ def _make_agent(nudge_threshold=0.8, nudge_message=None):
     return agent
 
 
+# ---------------------------------------------------------------------------
+# Helpers for DB-backed nudge tests
+# ---------------------------------------------------------------------------
+
+def _make_agent_with_db(tmp_path, nudge_threshold=0.8, nudge_message=None):
+    """Like _make_agent() but wires a real ConversationDB into the context."""
+    from db import ConversationDB
+    cfg   = _FakeAgentConfig(nudge_threshold=nudge_threshold, nudge_message=nudge_message)
+    agent = _FakeAgent(cfg)
+    db    = ConversationDB(tmp_path / "agent.db")
+    root  = db.get_root()
+    session_node = db.add_node(parent_id=root.id, role="system", content="session:nudge-test")
+    agent.context.set_db(db)
+    agent.context.set_tail(session_node.id)
+    from modules.memory.__main__ import register
+    register(agent)
+    return agent, db
+
+
+async def _fire_nudge_hook(agent, tail_node_id="fake-tail"):
+    """Call the consolidation hook registered by memory.register()."""
+    assert agent._background_hooks, "No background hooks registered — is nudge_threshold > 0?"
+    await agent._background_hooks[0](tail_node_id, agent.config)
+
+
 class TestContextNudge:
-    """Tests for the delta-based context nudge injected by modules/memory."""
+    """
+    Tests for the delta-based context nudge injected by modules/memory.
+
+    Phase 3: the nudge is now a *background hook* (registered via
+    register_background_hook), not a HOOK_PRE_ASSEMBLE_ASYNC hook.
+    In the no-DB path it falls back to inline ctx.dialogue injection for
+    backwards compat; in the DB-backed path it queues a background branch.
+
+    Tests invoke _fire_nudge_hook() to simulate what agent.run() does after
+    AgentTextFinal: calling each registered background hook with the current
+    tail_node_id and config.
+    """
 
     async def test_no_nudge_below_threshold(self):
         """Nudge must NOT fire when new token delta is below threshold."""
@@ -594,7 +640,7 @@ class TestContextNudge:
         ctx.state["memory_nudge_tokens_at_last"] = 0
 
         # Delta = 5 000; threshold = 0.8 * 10 000 = 8 000 → no nudge
-        await ctx.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
+        await _fire_nudge_hook(agent)
 
         nudge_turns = [e for e in ctx.dialogue if "Context is getting full" in e.content]
         assert nudge_turns == []
@@ -608,7 +654,7 @@ class TestContextNudge:
         ctx.state["tokens_used"]              = 8_000
         ctx.state["memory_nudge_tokens_at_last"] = 0
 
-        await ctx.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
+        await _fire_nudge_hook(agent)
 
         nudge_turns = [e for e in ctx.dialogue if "Context is getting full" in e.content]
         assert len(nudge_turns) == 1
@@ -621,7 +667,7 @@ class TestContextNudge:
         ctx.state["tokens_used"]              = 9_500
         ctx.state["memory_nudge_tokens_at_last"] = 0
 
-        await ctx.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
+        await _fire_nudge_hook(agent)
 
         nudge_turns = [e for e in ctx.dialogue if "Context is getting full" in e.content]
         assert len(nudge_turns) == 1
@@ -638,11 +684,11 @@ class TestContextNudge:
         ctx.state["memory_nudge_tokens_at_last"] = 0
 
         # First run — nudge fires
-        await ctx.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
+        await _fire_nudge_hook(agent)
         assert len([e for e in ctx.dialogue if "Context is getting full" in e.content]) == 1
 
         # Second run — same token count, delta is now 0
-        await ctx.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
+        await _fire_nudge_hook(agent)
         nudge_turns = [e for e in ctx.dialogue if "Context is getting full" in e.content]
         assert len(nudge_turns) == 1  # still only one
 
@@ -657,13 +703,13 @@ class TestContextNudge:
         # First nudge at 8 000
         ctx.state["tokens_used"]              = 8_000
         ctx.state["memory_nudge_tokens_at_last"] = 0
-        await ctx.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
+        await _fire_nudge_hook(agent)
         assert len([e for e in ctx.dialogue if "Context is getting full" in e.content]) == 1
 
         # Conversation continues; 8 000 more tokens accumulated since the nudge
         # baseline is now 8 000, so delta = 16 000 - 8 000 = 8 000 >= threshold
         ctx.state["tokens_used"] = 16_000
-        await ctx.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
+        await _fire_nudge_hook(agent)
         nudge_turns = [e for e in ctx.dialogue if "Context is getting full" in e.content]
         assert len(nudge_turns) == 2
 
@@ -678,7 +724,7 @@ class TestContextNudge:
         ctx.state["tokens_used"]              = 1
         ctx.state["memory_nudge_tokens_at_last"] = 0
 
-        await ctx.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
+        await _fire_nudge_hook(agent)
 
         today = datetime.date.today().strftime("%d-%m-%Y")
         nudge_turns = [e for e in ctx.dialogue if today in e.content]
@@ -697,24 +743,123 @@ class TestContextNudge:
         ctx.state["tokens_used"]              = 9_999
         ctx.state["memory_nudge_tokens_at_last"] = 0
 
-        await ctx.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
-
+        # No hooks should be registered when disabled
+        assert agent._background_hooks == []
+        # No nudge turns injected
         nudge_turns = [e for e in ctx.dialogue if "Context is getting full" in e.content]
         assert nudge_turns == []
 
     async def test_nudge_injects_user_turn(self):
-        """The nudge is injected as a user-role HistoryEntry."""
+        """The nudge is injected as a user-role HistoryEntry (legacy/no-DB path)."""
         agent = _make_agent(nudge_threshold=0.8)
         ctx   = agent.context
 
         ctx.state["tokens_used"]              = 8_500
         ctx.state["memory_nudge_tokens_at_last"] = 0
 
-        await ctx.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
+        await _fire_nudge_hook(agent)
 
         injected = [e for e in ctx.dialogue if "Context is getting full" in e.content]
         assert len(injected) == 1
         assert injected[0].role == "user"
+
+
+class TestContextNudgeDBBacked:
+    """
+    Phase 3: when a ConversationDB is wired, the nudge spawns a background
+    branch instead of injecting inline. The live conversation is untouched.
+    """
+
+    async def test_nudge_does_not_inject_inline_when_db_wired(self, tmp_path):
+        """Live context must NOT gain a nudge entry when a DB is present."""
+        agent, db = _make_agent_with_db(tmp_path, nudge_threshold=0.8)
+        ctx = agent.context
+
+        ctx.state["tokens_used"]              = 8_000
+        ctx.state["memory_nudge_tokens_at_last"] = 0
+
+        await _fire_nudge_hook(agent, tail_node_id=ctx.tail_node_id)
+
+        nudge_turns = [e for e in ctx.dialogue if "Context is getting full" in e.content]
+        assert nudge_turns == []
+
+    async def test_nudge_queues_background_branch(self, tmp_path):
+        """queue_background_branch() must be called with a valid node_id."""
+        agent, db = _make_agent_with_db(tmp_path, nudge_threshold=0.8)
+        ctx = agent.context
+
+        ctx.state["tokens_used"]              = 8_000
+        ctx.state["memory_nudge_tokens_at_last"] = 0
+
+        await _fire_nudge_hook(agent, tail_node_id=ctx.tail_node_id)
+
+        assert len(agent._queued_background_branches) == 1
+        branch_id = agent._queued_background_branches[0]
+        assert db.get_node(branch_id) is not None
+
+    async def test_branch_node_is_child_of_current_tail(self, tmp_path):
+        """The opening branch node must be a direct child of the live tail."""
+        agent, db = _make_agent_with_db(tmp_path, nudge_threshold=0.8)
+        ctx = agent.context
+        tail_before = ctx.tail_node_id
+
+        ctx.state["tokens_used"]              = 8_000
+        ctx.state["memory_nudge_tokens_at_last"] = 0
+
+        await _fire_nudge_hook(agent, tail_node_id=tail_before)
+
+        branch_id   = agent._queued_background_branches[0]
+        branch_node = db.get_node(branch_id)
+        assert branch_node.parent_id == tail_before
+
+    async def test_branch_node_content_contains_nudge_message(self, tmp_path):
+        """The opening node of the branch must carry the nudge message."""
+        agent, db = _make_agent_with_db(
+            tmp_path,
+            nudge_threshold=0.8,
+            nudge_message="Save to session-{date}.md.",
+        )
+        ctx = agent.context
+
+        ctx.state["tokens_used"]              = 8_000
+        ctx.state["memory_nudge_tokens_at_last"] = 0
+
+        await _fire_nudge_hook(agent, tail_node_id=ctx.tail_node_id)
+
+        branch_id   = agent._queued_background_branches[0]
+        branch_node = db.get_node(branch_id)
+        import datetime
+        today = datetime.date.today().strftime("%d-%m-%Y")
+        assert today in branch_node.content
+        assert "Save to session-" in branch_node.content
+
+    async def test_live_tail_does_not_advance_on_nudge(self, tmp_path):
+        """The caller's cursor must not move — only the branch node is written."""
+        agent, db = _make_agent_with_db(tmp_path, nudge_threshold=0.8)
+        ctx = agent.context
+        tail_before = ctx.tail_node_id
+
+        ctx.state["tokens_used"]              = 8_000
+        ctx.state["memory_nudge_tokens_at_last"] = 0
+
+        await _fire_nudge_hook(agent, tail_node_id=tail_before)
+
+        assert ctx.tail_node_id == tail_before
+
+    async def test_nudge_does_not_repeat_before_new_delta_db(self, tmp_path):
+        """Delta-based repeat-suppression works the same in DB-backed mode."""
+        agent, db = _make_agent_with_db(tmp_path, nudge_threshold=0.8)
+        ctx = agent.context
+
+        ctx.state["tokens_used"]              = 8_000
+        ctx.state["memory_nudge_tokens_at_last"] = 0
+
+        await _fire_nudge_hook(agent, tail_node_id=ctx.tail_node_id)
+        assert len(agent._queued_background_branches) == 1
+
+        # Same token count — delta is now 0; no second branch
+        await _fire_nudge_hook(agent, tail_node_id=ctx.tail_node_id)
+        assert len(agent._queued_background_branches) == 1
 
 
 # ---------------------------------------------------------------------------

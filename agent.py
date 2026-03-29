@@ -27,6 +27,17 @@ Tree refactor (Phase 2):
   All context.add() calls write immediately to the DB; cursor is kept in sync
   on disk after every node write.
 
+Background branches (Phase 3):
+  Modules register post-turn hooks via register_background_hook(fn). After
+  AgentTextFinal is yielded, each hook receives the current tail_node_id and
+  the agent's config. Hooks run as detached asyncio tasks — they must not
+  block the caller. The canonical use is memory consolidation: create an
+  opening node off the current tail via db.add_node(), construct a new
+  AgentLoop pointing at it, and run it to completion.
+
+  _run_background(tail_node_id, config) — module-level helper that fires a
+  standalone AgentLoop in a detached task and discards all events.
+
 Model pool:
   All named chat models from config.models are pre-instantiated.
   Inference walks primary → fallback list per config.llm.fallback_on.
@@ -44,7 +55,7 @@ import json
 import logging
 import uuid
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Callable, Awaitable
 
 from contracts import (
     InboundMessage, AgentEvent,
@@ -80,6 +91,23 @@ def _build_llm(cfg: ModelConfig) -> LLM:
     )
 
 
+async def _run_background(tail_node_id: str, config: Config) -> None:
+    """
+    Run a standalone AgentLoop on tail_node_id as a synthetic turn, discarding
+    all events. Called as a detached asyncio task — never awaited by the caller.
+
+    Usage (from a background hook):
+        opening = db.add_node(parent_id=current_tail, role="user", content="...")
+        asyncio.create_task(_run_background(opening.id, agent.config))
+    """
+    try:
+        loop = AgentLoop(tail_node_id=tail_node_id, config=config)
+        async for _ in loop.run(msg=None):
+            pass  # events discarded
+    except Exception:
+        logger.exception("[background] AgentLoop on tail=%s raised", tail_node_id)
+
+
 class AgentLoop:
     def __init__(self, tail_node_id: str, config: Config) -> None:
         self.tail_node_id  = tail_node_id  # cursor — the DB node this agent runs from
@@ -95,6 +123,12 @@ class AgentLoop:
         self.context.set_db(self._db)
         self.context.set_tail(self._tail_node_id)
         self.context.set_cursor_callback(self._on_context_tail_advance)
+
+        # Background hooks: called after AgentTextFinal with (tail_node_id, config).
+        # Each hook is responsible for spawning its own detached task if needed.
+        self._background_hooks: list[Callable[[str, Config], Awaitable[None]]] = []
+
+        self._pending_background_branches: list[str] = []
 
         self._models: dict[str, LLM] = {
             name: _build_llm(mc)
@@ -135,6 +169,45 @@ class AgentLoop:
         primary = self.config.llm.primary
         logger.warning("get_model('%s') — not found, falling back to primary '%s'", name, primary)
         return self._models[primary]
+
+    # ------------------------------------------------------------------
+    # Background hook registry (Phase 3)
+    # ------------------------------------------------------------------
+
+    def register_background_hook(
+        self, fn: Callable[[str, Config], Awaitable[None]]
+    ) -> None:
+        """
+        Register an async hook to be called after each interactive turn
+        completes (after AgentTextFinal is yielded).
+
+        fn(tail_node_id: str, config: Config) -> Awaitable[None]
+
+        The hook receives the tail node_id at the moment the turn finished
+        and the agent's config. It is responsible for spawning its own
+        detached asyncio.create_task() if it needs to run in the background
+        without blocking. Hooks are called sequentially in registration order;
+        exceptions are caught and logged.
+
+        Typical usage (memory module):
+            def register(agent):
+                async def _memory_hook(tail_node_id, config):
+                    opening = agent._db.add_node(
+                        parent_id=tail_node_id, role="user",
+                        content="Consolidate memory from this conversation.",
+                    )
+                    asyncio.create_task(_run_background(opening.id, config))
+                agent.register_background_hook(_memory_hook)
+        """
+        self._background_hooks.append(fn)
+
+    async def _fire_background_hooks(self, tail_node_id: str) -> None:
+        """Invoke all registered background hooks after a turn completes."""
+        for fn in self._background_hooks:
+            try:
+                await fn(tail_node_id, self.config)
+            except Exception:
+                logger.exception("[background] hook '%s' raised", getattr(fn, "__name__", fn))
 
     # ------------------------------------------------------------------
     # Module loader
@@ -180,9 +253,15 @@ class AgentLoop:
         msg=None  — synthetic turn: skip Stage 1, generate against current
                     context as-is (used by PUT /v1/sessions/{id}/generation).
         msg=<msg> — normal turn: add user message to context, then generate.
+
+        After AgentTextFinal is yielded, any registered background hooks are
+        fired (Phase 3). Synthetic turns do not trigger background hooks —
+        they are themselves background work and should not spawn further
+        background branches.
         """
         self._turn_count += 1
-        logger.debug("[cursor=%s] turn %d (synthetic=%s)", self._tail_node_id, self._turn_count, msg is None)
+        is_synthetic = msg is None
+        logger.debug("[cursor=%s] turn %d (synthetic=%s)", self._tail_node_id, self._turn_count, is_synthetic)
 
         if msg is not None:
             trace_id = msg.trace_id
@@ -346,6 +425,42 @@ class AgentLoop:
             final_text = final_text or "[Tool cycle limit reached.]"
 
         yield AgentTextFinal(text=final_text if not streaming_active else "", **ev)
+
+        # Phase 3: fire any background branches registered this turn.
+        for branch_node_id in self._pending_background_branches:
+            asyncio.ensure_future(self._run_background(branch_node_id))
+        self._pending_background_branches.clear()
+
+        # Phase 3: fire background hooks after the turn completes.
+        # Skipped for synthetic turns — they are already background work.
+        if not is_synthetic and self._background_hooks:
+            await self._fire_background_hooks(self._tail_node_id)
+
+    # ------------------------------------------------------------------
+    # Background branch runner (Phase 3)
+    # ------------------------------------------------------------------
+
+    async def _run_background(self, tail_node_id: str) -> None:
+        """
+        Run a synthetic agent turn on a detached branch. Events are discarded.
+        The branch writes its own nodes into agent.db; the caller's cursor is
+        never touched.
+        """
+        logger.debug("[background] starting branch tail=%s", tail_node_id)
+        try:
+            loop = AgentLoop(tail_node_id=tail_node_id, config=self.config)
+            async for _ in loop.run(msg=None):
+                pass  # discard events
+            logger.debug("[background] branch complete tail=%s", tail_node_id)
+        except Exception:
+            logger.exception("[background] branch failed tail=%s", tail_node_id)
+
+    def queue_background_branch(self, tail_node_id: str) -> None:
+        """
+        Schedule a background branch to be fired after the current turn yields
+        AgentTextFinal. Called by modules (e.g. memory) during a hook.
+        """
+        self._pending_background_branches.append(tail_node_id)
 
     # ------------------------------------------------------------------
     # Tool execution

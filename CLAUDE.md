@@ -57,14 +57,13 @@ main.py
 | `utils/bm25.py` | Pure-stdlib in-memory Okapi BM25. Used by `tools_search` to rank tool names+descriptions against a query. Tokeniser splits on underscores/hyphens so `web_search` matches query `"search"`. |
 | `utils/attachments.py` | Attachment classification, saving, and LLM content-block assembly. Pure utility — no tools, hooks, or prompts. Called by bridges and the gateway. |
 
-**Session identity:**
+**Session identity (tree refactor):**
 
-- DM sessions: `SessionKey(chat_type=DM, conversation_id=<user_id>)` — platform-agnostic.
-- Group sessions: `SessionKey(chat_type=GROUP, conversation_id=<channel_id>, platform=<platform>)` — platform-specific.
+Sessions are represented as tree branches in `agent.db` (SQLite). Each bridge holds a **cursor** — a `node_id` string pointing at the tail of its branch. `InboundMessage.tail_node_id` carries this cursor into the router. There are no `SessionKey` or `sessions/*.json` files.
 
 **Group chat sender attribution:**
 
-`HistoryEntry` carries `author_id: str | None` — set to the sender's `user_id` for group chat user turns, `None` for DM / assistant / tool / system turns. Bridges populate this via `HistoryEntry.user(content, author_id=...)`. Persisted in session JSON and exposed in the gateway `GET /history` response. Bridges own all group-specific logic (buffering, mention detection, `/reset` admin checks) and push pre-formatted attributed text to the router.
+`HistoryEntry` carries `author_id: str | None` — set to the sender's `user_id` for group chat user turns, `None` for DM / assistant / tool / system turns. Bridges populate this via `HistoryEntry.user(content, author_id=...)`. Persisted as `author_id` on the DB node and exposed in the gateway `GET /history` response. Bridges own all group-specific logic (buffering, mention detection, `/reset` admin checks) and push pre-formatted attributed text to the router.
 
 **Agent event stream:**
 
@@ -253,6 +252,30 @@ GET    /v1/health                          status, uptime_s, per-session queue_d
 
 ---
 
+## Background branches (Phase 3)
+
+A background branch is a child node written into `agent.db` off the current tail, with a fresh `AgentLoop` running a synthetic turn on it. Events are discarded. The caller's cursor never moves.
+
+**API (agent.py):**
+
+```python
+# From a hook or module — called during a turn:
+agent.queue_background_branch(node_id)   # schedules after AgentTextFinal
+
+# The node is created manually before queueing:
+branch_node = ctx._db.add_node(parent_id=ctx.tail_node_id, role="user", content="...")
+agent.queue_background_branch(branch_node.id)
+```
+
+All queued branches fire via `asyncio.ensure_future(_run_background(node_id))` after `AgentTextFinal` is yielded. Branches are independent — they do not share cursor state with the caller and cannot affect the live conversation.
+
+**Memory consolidation (memory module):**
+When the context nudge threshold is crossed and a DB is wired, the nudge hook creates an opening node off the current tail and calls `queue_background_branch` instead of injecting a user turn inline. The background `AgentLoop` walks the ancestor chain for context, runs memory write tools, and exits. The live conversation is untouched.
+
+When no DB is wired (tests / legacy path), the nudge falls back to the old inline injection.
+
+---
+
 ## Adding a bridge
 
 1. Create `bridges/<n>/__main__.py` with an async `run(router)` function.
@@ -291,11 +314,10 @@ Modules must not import from `router.py`, `gateway/`, or any bridge.
 - **Vision models** use `vision: true` in `models:`. Non-vision models receive a reference note instead of image blocks.
 - **Tool functions can be sync or async.** `ToolCallHandler.execute_tool_call` handles both.
 - **Context hooks run in priority order** (lower = first). `priority=0` for early hooks (dedup, memory), `priority=10+` for later (trim).
-- **Sessions persist** to `sessions/<session_key>/<N>.json` after every turn. `content` fields may be `str` or `list` — both round-trip correctly.
 - **Token budget telemetry:** agent logs at INFO when context hits 80% of `context:` limit, WARNING at 95%. These are signals to implement/trigger the compaction module.
 - **LLM retries:** `ai.LLM` retries `ClientConnectionError` up to 3× with exponential backoff (1–8s). Other errors (`LLMError`) pass through immediately.
 - **Queue backpressure:** Lane queues are bounded (32 by default, change `LANE_QUEUE_MAX` in `router.py`). Full queues return `False` from `router.push()` — gateway surfaces this as 429.
-- **Graceful shutdown:** SIGTERM/SIGINT drain in-flight turns before exit. `_flush_history()` completes before the process dies.
+- **Graceful shutdown:** SIGTERM/SIGINT drain in-flight turns before exit.
 - **Structured logging:** `structlog` with timestamped console output. All loggers use `logging.getLogger(__name__)` — no changes needed in modules.
 - **Always prefer dynamic discovery over hardcoding** — scan filesystem, infer from config, auto-register at runtime.
 - **Suggest before implementing.** For non-trivial changes, propose 2–3 approaches with tradeoffs before writing code.
@@ -386,7 +408,7 @@ Token-budget trimming in `assemble()` follows the same rules: assistant turns wi
 
 | Module | What it does |
 |--------|-------------|
-| `memory` | Static: injects SOUL.md, AGENTS.md, MEMORY.md as system prompts. Dynamic: hybrid BM25+vector search over `workspace/memory/**/*.md` via async pre-assemble hook + `memory_search` tool. Config key: `memory_search:`. |
+| `memory` | Static: injects SOUL.md, AGENTS.md, MEMORY.md as system prompts. Dynamic: hybrid BM25+vector search over `workspace/memory/**/*.md` via async pre-assemble hook + `memory_search` tool. Context nudge: when token delta exceeds threshold, spawns a background branch for memory consolidation instead of injecting inline. Config key: `memory_search:`. |
 | `filesystem` | Tools: `shell`, `view`, `write_file`, `str_replace` — all always-on. Sandboxed to workspace. Shell execution split into `shell.py` (platform detection, blacklist, subprocess dispatch). On Linux/macOS runs via `bash -c`; on Windows via `powershell -NonInteractive`. Blacklist (`blacklist.txt`, glob patterns, case-insensitive) enforced on both platforms — covers bulk destruction, RCE, privilege escalation, persistence, system path writes, and more. Blocked commands return an error string. Blacklist loaded at `register()` time; restart to reload. |
 | `web` | Tools: `web_search` (DuckDuckGo) and `navigate` are always-on. `http_request`, `click`, `type_text`, `extract_text`, `extract_html`, `screenshot`, `wait_for`, `manage_browser` (Playwright) are deferred. |
 | `cron` | Scheduled agent turns. Jobs in `workspace/CRON.json`. Schedule kinds: `every`, `at`, `cron` (requires `croniter`). Tool: `cron_list`. Each job gets its own isolated session (`dm:cron-<id>`). `reset_after_run: true` wipes session context after each run. |
@@ -417,6 +439,7 @@ The memory module has two layers:
 - `auto_inject: true` — results injected as system prompt every turn
 - `auto_inject: false` — results only via `memory_search` tool
 - Config key: `memory_search:` in `config.yaml` (avoids collision with `workspace:`)
+- **Context nudge (Phase 3):** when threshold is hit and a DB is wired, creates an opening node via `db.add_node()` off the current tail and calls `agent.queue_background_branch()`. The background `AgentLoop` handles consolidation; the live conversation is untouched. Falls back to inline injection when no DB is wired (tests/legacy).
 
 ---
 

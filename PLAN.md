@@ -62,7 +62,9 @@ This log records decisions and planned changes. Nothing is implemented yet.
   Lanes are keyed by cursor `node_id` instead of `SessionKey` — minimal change.
 
 ### Cross-branch primitives (deferred to Phase 3)
-- `spawn_branch`, `send_to_branch`, `wait_for_branch` — not part of Phase 1 or 2.
+- `send_to_branch`, `wait_for_branch` — deferred; require queue refactor.
+- Background branches are spawned by calling `db.add_node()` directly (no
+  wrapper needed — a branch is just a node off an existing parent).
 
 ### GroupPolicy
 - Bridges pass `group_policy` in `InboundMessage` same as today.
@@ -96,7 +98,7 @@ id=<uuid>, parent_id=NULL, role="system", content="", created_at=<now>
 
 ---
 
-## Phase 1 — Tree layer + storage (`db.py`, `context.py`, `contracts.py`)
+## Phase 1 — Tree layer + storage (`db.py`, `context.py`, `contracts.py`) (DONE)
 
 ### New: `db.py`
 
@@ -153,7 +155,7 @@ No other changes in Phase 1.
 
 ---
 
-## Phase 1 — `agent.py` changes
+## Phase 1 — `agent.py` changes (DONE)
 
 ### Deleted entirely
 - `_flush_history()` — gone. DB writes are immediate at `context.add()` time.
@@ -192,7 +194,7 @@ No other changes in Phase 1.
 
 ---
 
-## Phase 2 — Router + Bridge cursor migration
+## Phase 2 — Router + Bridge cursor migration (DONE)
 
 ### `router.py`
 
@@ -275,32 +277,24 @@ Changes:
 
 ---
 
-## Phase 3 — Background branches + memory consolidation
+## Phase 3 — Background branches + memory consolidation (DONE)
 
-### Prerequisites
-- Phase 1 and 2 complete.
-- `spawn_branch` primitive implemented (see below).
+### Design
 
-### New primitive: `spawn_branch`
+A background branch is a child node created off the current tail via
+`db.add_node()` — no wrapper primitive needed. `add_node` is sufficient
+because a branch is just a node; there is no structural distinction in the
+tree. The caller creates the opening node, constructs an `AgentLoop` pointing
+at it, and runs it as a detached asyncio task.
 
-Added to `db.py` / exposed via `Context`:
-
-```python
-def spawn_branch(parent_node_id: str, opening_content: str, role: str = "user") -> str:
-    """
-    Create a child node off parent_node_id. Returns the new node's id.
-    The caller is responsible for pointing an AgentLoop at the returned node_id.
-    """
-```
-
-This is the only new primitive needed. `send_to_branch` and `wait_for_branch`
-are deferred further — they require the queue refactor.
+`send_to_branch` and `wait_for_branch` are deferred — they require the queue
+refactor.
 
 ### Background AgentLoop
 
 A background branch is just an `AgentLoop` with no bridge cursor pointing at
-it. It runs in a detached asyncio task. The runtime spawns it, hands it a
-`tail_node_id`, and lets it run to completion unobserved.
+it. It runs in a detached asyncio task, writes nodes to `agent.db`, and exits
+silently. Events are discarded.
 
 ```python
 async def _run_background(tail_node_id: str, config: Config) -> None:
@@ -308,9 +302,6 @@ async def _run_background(tail_node_id: str, config: Config) -> None:
     async for _ in loop.run(msg=None):  # synthetic turn — no user message
         pass  # events discarded
 ```
-
-No event handler registered. No bridge cursor. The loop runs, writes nodes
-to `agent.db`, and exits.
 
 ### Memory consolidation flow
 
@@ -320,7 +311,7 @@ Location: `agent.py`, after the main `run()` loop, before returning.
 ```
 current tail
      │
-     └── [spawn_branch] "consolidate memory from this conversation"
+     └── [db.add_node] "consolidate memory from this conversation"
               │
               └── background AgentLoop runs:
                     - walks its own ancestor chain for context
@@ -333,17 +324,11 @@ the user's perspective unless they explicitly `/branch switch` to it.
 
 ### Memory module changes (`modules/memory/__main__.py`)
 
-**Phase 1 fix (small, needed now):**
-- `_nudge_hook` currently does `ctx.dialogue.append(HistoryEntry.user(msg))`.
-- Change to `ctx.add(HistoryEntry.user(msg))` so the write goes through to DB
-  and advances the tail. One line change.
-
 **Phase 3 change (background branch):**
 - Remove the inline nudge that injects a summarization message into the
   current conversation.
-- Instead, at nudge threshold, call `spawn_branch` with the summarization
-  instruction as the opening node, then fire `_run_background` as a detached
-  asyncio task.
+- Instead, at nudge threshold, use `db.add_node()` to create an opening node
+  off the current tail, then fire `_run_background` as a detached asyncio task.
 - The current conversation continues uninterrupted. Memory consolidation
   happens in the background branch.
 - The `_nudge_hook` becomes a branch-spawning hook rather than a
@@ -359,7 +344,7 @@ the user's perspective unless they explicitly `/branch switch` to it.
 
 ## Files to touch
 
-### Phase 1
+### Phase 1 (DONE)
 
 | File | Change |
 |------|--------|
@@ -370,7 +355,7 @@ the user's perspective unless they explicitly `/branch switch` to it.
 | `modules/memory/__main__.py` | `ctx.dialogue.append(...)` → `ctx.add(...)` in `_nudge_hook` |
 | `sessions/` (dir) | Delete entirely |
 
-### Phase 2
+### Phase 2 (DONE)
 
 | File | Change |
 |------|--------|
@@ -383,14 +368,12 @@ the user's perspective unless they explicitly `/branch switch` to it.
 | `modules/cron/__main__.py` | Add `cursor_node_id` to `CronJob`; build `InboundMessage(tail_node_id=...)`; per-job cursor init + advance; `reset_after_run` rewinds cursor; remove `SessionKey`/`ChatType` imports |
 | `modules/heartbeat/__main__.py` | Replace `_HEARTBEAT_SESSION` with cursor node_id at `workspace/cursors/heartbeat`; remove `_resolve_session`; build `InboundMessage(tail_node_id=...)`; advance cursor per tick; remove `SessionKey`/`ChatType` imports |
 
-### Phase 3
+### Phase 3 (DONE)
 
 | File | Change |
 |------|--------|
-| `db.py` | Add `spawn_branch()` |
-| `context.py` | Expose `spawn_branch()` via `Context` |
 | `agent.py` | Add `_run_background()` helper; trigger background branch at turn end |
-| `modules/memory/__main__.py` | Replace inline nudge with `spawn_branch` + detached task |
+| `modules/memory/__main__.py` | Replace inline nudge with `db.add_node()` + detached `_run_background` task |
 
 ### Not touched (any phase)
 
@@ -400,17 +383,3 @@ the user's perspective unless they explicitly `/branch switch` to it.
 | `config/` | No changes needed |
 | `utils/` | No session concepts |
 | `modules/web`, `modules/filesystem`, `modules/ctx_tools`, `modules/skills`, `modules/mcp` | Hook contract `async def hook(ctx)` unchanged across all phases |
-
----
-
-## Open Questions (all resolved)
-
-| # | Question | Decision |
-|---|----------|----------|
-| 1 | Global root vs per-bridge roots? | **One global root.** All bridges share it and can walk into each other's branches. |
-| 2 | Migrate existing session JSON? | **Nuke it.** No migration. Durable info is in workspace markdown files. |
-| 3 | GroupPolicy on cursors? | Pass in `InboundMessage` same as today. Router constructs GroupLane wrapper as needed. |
-| 4 | Storage format? | **SQLite (`agent.db`)** in workspace root. Single `nodes` table. |
-| 5 | When do DB writes happen? | **Immediately at `context.add()` time.** No end-of-turn flush. `_flush_history` deleted. |
-| 6 | Agent loop scope of change? | Mostly mechanical: delete session file methods, find-replace `session_key` → `tail_node_id`. Core loop stages unchanged. |
-| 7 | Other modules need changes? | **Yes — cron and heartbeat do.** Both build `SessionKey` and `InboundMessage(session_key=...)` directly. Memory needs one-line fix in Phase 1, nudge refactor in Phase 3. `web`, `filesystem`, `ctx_tools`, `skills`, `mcp` are genuinely untouched. |

@@ -39,7 +39,11 @@ from db import ConversationDB
 
 def _make_config(tmp_path):
     cfg = MagicMock()
-    cfg.models = {"primary": MagicMock(), "fast": MagicMock()}
+    primary_mc = MagicMock()
+    primary_mc.is_embedding = False
+    fast_mc = MagicMock()
+    fast_mc.is_embedding = False
+    cfg.models = {"primary": primary_mc, "fast": fast_mc}
     cfg.llm.primary = "primary"
     cfg.llm.fallback = []
     cfg.llm.fallback_on.any_error = False
@@ -353,6 +357,96 @@ class TestLLMErrors:
 
         chunks = await _collect(agent, _make_msg("hi", node_id=agent.tail_node_id))
         assert _full_text(chunks) == "fallback worked"
+
+
+# ---------------------------------------------------------------------------
+# Background branches (Phase 3)
+# ---------------------------------------------------------------------------
+
+class TestBackgroundBranches:
+    def test_queue_background_branch_accumulates(self, make_agent):
+        """queue_background_branch() appends node_ids without side-effects."""
+        agent = make_agent(_text_stream("ok"))
+        assert agent._pending_background_branches == []
+        agent.queue_background_branch("node-a")
+        agent.queue_background_branch("node-b")
+        assert agent._pending_background_branches == ["node-a", "node-b"]
+
+    @pytest.mark.asyncio
+    async def test_pending_branches_cleared_after_turn(self, make_agent, tmp_path):
+        """After a turn completes, _pending_background_branches is drained."""
+        agent = make_agent(_text_stream("hi"))
+        # Pre-populate with a fake node_id — we don't want _run_background
+        # to actually launch (it would fail on a bad node_id), so patch it.
+        # Use AsyncMock so ensure_future receives an awaitable that won't leak.
+        agent._run_background = AsyncMock()
+
+        # Queue a branch before the turn fires
+        agent._pending_background_branches.append("fake-branch-id")
+
+        with patch("asyncio.ensure_future") as mock_ef:
+            await _collect(agent, _make_msg("hi", node_id=agent.tail_node_id))
+
+        # List must be empty after the turn regardless of whether tasks ran
+        assert agent._pending_background_branches == []
+
+    @pytest.mark.asyncio
+    async def test_run_background_writes_nodes_to_db(self, make_agent, tmp_path):
+        """
+        _run_background() runs a real synthetic AgentLoop turn.
+        The branch node must gain at least an assistant response in the DB.
+        """
+        from db import ConversationDB
+
+        bg_llm = MagicMock()
+        bg_llm.stream = _text_stream("background done")
+
+        # Both the outer agent and the inner background AgentLoop call _build_llm;
+        # keep the patch active for both construction and the _run_background call.
+        with patch("agent.MODULES_DIR", Path("/nonexistent")):
+            with patch("agent._build_llm", return_value=bg_llm):
+                agent = make_agent(_text_stream("main reply"))
+
+                # Create a branch opening node off the current tail
+                db = ConversationDB(tmp_path / "agent.db")
+                branch_node = db.add_node(
+                    parent_id=agent._tail_node_id,
+                    role="user",
+                    content="consolidate memory",
+                )
+
+                await agent._run_background(branch_node.id)
+
+        children = db.get_children(branch_node.id)
+        assert children, "No children written under branch_node — background loop produced no output"
+        bg_ancestors = db.get_ancestors(children[0].id)
+        assistant_nodes = [n for n in bg_ancestors if n.role == "assistant"]
+        assert len(assistant_nodes) >= 1
+        assert "background done" in assistant_nodes[-1].content
+
+    @pytest.mark.asyncio
+    async def test_run_background_does_not_move_main_cursor(self, make_agent, tmp_path):
+        """Running a background branch must leave the main agent cursor untouched."""
+        from db import ConversationDB
+
+        agent = make_agent(_text_stream("main reply"))
+        tail_before = agent._tail_node_id
+
+        db = ConversationDB(tmp_path / "agent.db")
+        branch_node = db.add_node(
+            parent_id=tail_before,
+            role="user",
+            content="do background work",
+        )
+
+        bg_llm = MagicMock()
+        bg_llm.stream = _text_stream("done")
+
+        with patch("agent.MODULES_DIR", Path("/nonexistent")):
+            with patch("agent._build_llm", return_value=bg_llm):
+                await agent._run_background(branch_node.id)
+
+        assert agent._tail_node_id == tail_before
 
 
 # ---------------------------------------------------------------------------

@@ -25,6 +25,15 @@ Wires the memory module into the agent. Does three things:
    or when auto_inject is False. The tool also applies the memory budget
    so its output stays predictably sized.
 
+4. Background consolidation hook  (Phase 3)
+   When the context token fill crosses nudge_threshold * token_limit (delta
+   since the last nudge), a background branch is spawned off the current tail:
+     - An opening node is created via db.add_node() with the nudge_message.
+     - A new AgentLoop is started on that node as a detached asyncio task.
+     - The current conversation continues uninterrupted.
+   The background loop walks its own ancestor chain, calls memory write tools,
+   and exits when done. The user's cursor is never moved.
+
 Config lives under a top-level 'memory_search:' key in config.yaml
 (or whatever extra key you choose — accessed via agent.config.extra).
 All keys are optional; defaults are in modules/memory/__init__.py.
@@ -33,11 +42,12 @@ Convention: register(agent) — no imports from gateway, bridges, or contracts.
 """
 from __future__ import annotations
 
+import asyncio
 import atexit
 import logging
 from pathlib import Path
 
-from context import HOOK_PRE_ASSEMBLE_ASYNC, HistoryEntry
+from context import HOOK_PRE_ASSEMBLE_ASYNC
 
 logger = logging.getLogger(__name__)
 
@@ -265,7 +275,13 @@ def register(agent) -> None:
     )
 
     # ------------------------------------------------------------------
-    # 3b. Context nudge — recurs on delta, not absolute fill
+    # 3b. Background consolidation hook  (Phase 3)
+    #
+    # Replaces the old inline nudge. Instead of injecting a summarization
+    # message into the live conversation, we spawn a background branch off
+    # the current tail when the token delta since the last nudge exceeds the
+    # threshold. The background AgentLoop runs unobserved, calls memory write
+    # tools, and exits. The user's cursor is never moved.
     # ------------------------------------------------------------------
 
     nudge_threshold = float(cfg.get("nudge_threshold", 0.80))
@@ -275,32 +291,55 @@ def register(agent) -> None:
         token_limit = agent.config.context
         nudge_delta = int(nudge_threshold * token_limit)
 
-        async def _nudge_hook(ctx) -> None:
-            tokens_now      = ctx.state.get("tokens_used", 0)
-            tokens_at_nudge = ctx.state.get("memory_nudge_tokens_at_last", 0)
+        # Import _run_background here to avoid a circular import at module
+        # load time (agent imports memory, memory would import agent).
+        from agent import _run_background
 
-            if tokens_now - tokens_at_nudge >= nudge_delta:
-                import datetime
-                date_str = datetime.date.today().strftime("%d-%m-%Y")
-                msg = nudge_message.format(date=date_str)
-                ctx.add(HistoryEntry.user(msg))
-                ctx.state["memory_nudge_tokens_at_last"] = tokens_now
-                logger.info(
-                    "[memory] nudge injected (delta %d/%d tokens since last nudge)",
-                    tokens_now - tokens_at_nudge, nudge_delta,
+        async def _consolidation_hook(tail_node_id: str, config) -> None:
+            tokens_now      = agent.context.state.get("tokens_used", 0)
+            tokens_at_nudge = agent.context.state.get("memory_nudge_tokens_at_last", 0)
+
+            if tokens_now - tokens_at_nudge < nudge_delta:
+                return
+
+            import datetime
+            from context import HistoryEntry
+            date_str = datetime.date.today().strftime("%d-%m-%Y")
+            msg = nudge_message.format(date=date_str)
+
+            # Use agent._db if present (real AgentLoop), otherwise fall back
+            # to the DB wired directly into the context (e.g. _FakeAgent tests).
+            db = getattr(agent, "_db", None) or getattr(agent.context, "_db", None)
+            ctx_tail = agent.context.tail_node_id
+            if db is not None and ctx_tail is not None:
+                # DB-backed path: spawn a background branch off the current tail.
+                # The live conversation is untouched; the background loop writes
+                # its own nodes into the branch.
+                opening = db.add_node(
+                    parent_id=tail_node_id,
+                    role="user",
+                    content=msg,
                 )
+                agent.queue_background_branch(opening.id)
+            else:
+                # No-DB (legacy/test) path: inject the nudge inline so the agent
+                # sees it on the next assemble().
+                agent.context.dialogue.append(HistoryEntry.user(msg))
 
-        agent.context.register_hook(
-            HOOK_PRE_ASSEMBLE_ASYNC,
-            _nudge_hook,
-            priority=100,  # run after search (priority=0)
-        )
+            agent.context.state["memory_nudge_tokens_at_last"] = tokens_now
+            logger.info(
+                "[memory] background consolidation spawned off tail=%s "
+                "(delta %d/%d tokens since last nudge)",
+                tail_node_id, tokens_now - tokens_at_nudge, nudge_delta,
+            )
+
+        agent.register_background_hook(_consolidation_hook)
         logger.info(
-            "[memory] context nudge enabled — threshold %.0f%% delta (%d tokens)",
+            "[memory] background consolidation enabled — threshold %.0f%% delta (%d tokens)",
             nudge_threshold * 100, nudge_delta,
         )
     else:
-        logger.info("[memory] context nudge disabled")
+        logger.info("[memory] background consolidation disabled")
 
     # ------------------------------------------------------------------
     # 4. Auto-inject prompt provider
