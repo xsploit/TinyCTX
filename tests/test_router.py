@@ -4,8 +4,7 @@ tests/test_router.py
 Tests for GroupLane, GroupPolicy, _gp_strip_trigger, and
 Router.set_group_activation.
 
-These tests cover all the group-chat logic that used to live in the Matrix
-bridge (TestMatrixTextExtraction) plus the new routing-level behaviour.
+Routing is keyed by tail_node_id (str cursor) — SessionKey is gone.
 
 Run with:
     python -m pytest tests/test_router.py -v
@@ -14,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -24,7 +24,6 @@ from contracts import (
     GroupPolicy,
     InboundMessage,
     Platform,
-    SessionKey,
     UserIdentity,
 )
 from router import GroupLane, Lane, Router, _gp_strip_trigger, _gp_replace_text
@@ -33,6 +32,10 @@ from router import GroupLane, Lane, Router, _gp_strip_trigger, _gp_replace_text
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _node_id():
+    return str(uuid.uuid4())
+
 
 def _make_config():
     cfg = MagicMock()
@@ -47,14 +50,6 @@ def _make_config():
 
 def _make_user(username="alice", user_id="@alice:matrix.org"):
     return UserIdentity(platform=Platform.MATRIX, user_id=user_id, username=username)
-
-
-def _group_sk(room="!room:matrix.org"):
-    return SessionKey.group(Platform.MATRIX, room)
-
-
-def _dm_sk(uid="@alice:matrix.org"):
-    return SessionKey.dm(uid)
 
 
 def _policy(
@@ -73,10 +68,10 @@ def _policy(
     )
 
 
-def _msg(text, sk=None, policy=None, username="alice", user_id="@alice:matrix.org"):
-    sk = sk or _group_sk()
+def _msg(text, node_id=None, policy=None, username="alice", user_id="@alice:matrix.org"):
+    nid = node_id or _node_id()
     return InboundMessage(
-        session_key=sk,
+        tail_node_id=nid,
         author=_make_user(username=username, user_id=user_id),
         content_type=ContentType.TEXT,
         text=text,
@@ -90,7 +85,7 @@ def _make_lane(policy=None):
     """Create a GroupLane with a mocked inner Lane."""
     inner = MagicMock(spec=Lane)
     inner.enqueue = AsyncMock(return_value=True)
-    inner.session_key = _group_sk()
+    inner.node_id = _node_id()
     inner.queue = MagicMock()
     inner.loop = MagicMock()
     gl = GroupLane(inner, policy or _policy())
@@ -134,7 +129,7 @@ class TestStripTrigger:
 
 
 # ---------------------------------------------------------------------------
-# GroupLane — trigger detection (_is_trigger)
+# GroupLane — trigger detection
 # ---------------------------------------------------------------------------
 
 class TestGroupLaneTriggerDetection:
@@ -204,12 +199,13 @@ class TestGroupLanePush:
     @pytest.mark.asyncio
     async def test_trigger_flushes_buffer(self):
         gl, inner = _make_lane(_policy(activation=ActivationMode.MENTION, prefix="!"))
-        await gl.push(_msg("context one", username="alice"))
-        await gl.push(_msg("context two", username="bob"))
+        nid = _node_id()
+        await gl.push(_msg("context one", node_id=nid, username="alice"))
+        await gl.push(_msg("context two", node_id=nid, username="bob"))
         assert len(gl._buffer) == 2
         inner.enqueue.assert_not_called()
 
-        await gl.push(_msg("!what did they say?", username="carol"))
+        await gl.push(_msg("!what did they say?", node_id=nid, username="carol"))
         inner.enqueue.assert_called_once()
         forwarded = inner.enqueue.call_args[0][0]
         assert "[alice]: context one" in forwarded.text
@@ -250,10 +246,11 @@ class TestGroupLanePush:
     @pytest.mark.asyncio
     async def test_multiple_triggers_each_get_own_buffer(self):
         gl, inner = _make_lane(_policy(activation=ActivationMode.MENTION, prefix="!"))
-        await gl.push(_msg("ctx1"))
-        await gl.push(_msg("!trigger one"))
-        await gl.push(_msg("ctx2"))
-        await gl.push(_msg("!trigger two"))
+        nid = _node_id()
+        await gl.push(_msg("ctx1", node_id=nid))
+        await gl.push(_msg("!trigger one", node_id=nid))
+        await gl.push(_msg("ctx2", node_id=nid))
+        await gl.push(_msg("!trigger two", node_id=nid))
 
         assert inner.enqueue.call_count == 2
         first_text  = inner.enqueue.call_args_list[0][0][0].text
@@ -264,7 +261,7 @@ class TestGroupLanePush:
     @pytest.mark.asyncio
     async def test_prefix_mode_non_prefix_not_forwarded(self):
         gl, inner = _make_lane(_policy(activation=ActivationMode.PREFIX, prefix="!"))
-        await gl.push(_msg("@bot:matrix.org hello"))  # mention — not a prefix trigger
+        await gl.push(_msg("@bot:matrix.org hello"))
         inner.enqueue.assert_not_called()
         assert len(gl._buffer) == 1
 
@@ -295,7 +292,7 @@ class TestGroupLaneReset:
 
 
 # ---------------------------------------------------------------------------
-# GroupLane — set_activation (runtime toggle)
+# GroupLane — set_activation
 # ---------------------------------------------------------------------------
 
 class TestGroupLaneActivationToggle:
@@ -352,7 +349,7 @@ class TestGroupLaneTimeoutFlush:
 
         assert inner.enqueue.call_count == 1
         await asyncio.sleep(0.6)
-        assert inner.enqueue.call_count == 1  # no second call from timeout
+        assert inner.enqueue.call_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +361,7 @@ class TestRouterGroupLaneIntegration:
     def gw(self):
         cfg = _make_config()
 
-        async def _noop_run(msg):
+        async def _noop_run(msg, abort_event=None):
             return
             yield
 
@@ -373,6 +370,7 @@ class TestRouterGroupLaneIntegration:
             instance.run = _noop_run
             instance.gateway = None
             instance.reset = MagicMock()
+            instance._tail_node_id = "stub-node"
             MockLoop.return_value = instance
             router = Router(config=cfg)
             router._mock_loop_instance = instance
@@ -380,22 +378,22 @@ class TestRouterGroupLaneIntegration:
 
     @pytest.mark.asyncio
     async def test_group_message_with_policy_creates_group_lane(self, gw):
-        sk  = _group_sk()
+        nid = _node_id()
         p   = _policy(activation=ActivationMode.MENTION, prefix="!")
-        msg = _msg("!hello", sk=sk, policy=p)
+        msg = _msg("!hello", node_id=nid, policy=p)
         gw.register_platform_handler("matrix", AsyncMock())
         await gw.push(msg)
         await asyncio.sleep(0)
-        lane = gw._session_router._lanes.get(sk)
+        lane = gw._lane_router._lanes.get(nid)
         assert isinstance(lane, GroupLane)
 
     @pytest.mark.asyncio
     async def test_dm_message_creates_plain_lane(self, gw):
-        sk = _dm_sk()
+        nid = _node_id()
         gw.register_platform_handler("matrix", AsyncMock())
-        gw._dm_platforms[sk] = "matrix"
+        gw._node_platforms[nid] = "matrix"
         msg = InboundMessage(
-            session_key=sk,
+            tail_node_id=nid,
             author=_make_user(),
             content_type=ContentType.TEXT,
             text="hello",
@@ -404,15 +402,15 @@ class TestRouterGroupLaneIntegration:
         )
         await gw.push(msg)
         await asyncio.sleep(0)
-        lane = gw._session_router._lanes.get(sk)
+        lane = gw._lane_router._lanes.get(nid)
         assert isinstance(lane, Lane)
 
     @pytest.mark.asyncio
     async def test_group_without_policy_creates_plain_lane(self, gw):
-        sk = _group_sk()
+        nid = _node_id()
         gw.register_platform_handler("matrix", AsyncMock())
         msg = InboundMessage(
-            session_key=sk,
+            tail_node_id=nid,
             author=_make_user(),
             content_type=ContentType.TEXT,
             text="hello",
@@ -422,39 +420,38 @@ class TestRouterGroupLaneIntegration:
         )
         await gw.push(msg)
         await asyncio.sleep(0)
-        lane = gw._session_router._lanes.get(sk)
+        lane = gw._lane_router._lanes.get(nid)
         assert isinstance(lane, Lane)
 
     @pytest.mark.asyncio
     async def test_set_group_activation_updates_lane(self, gw):
-        sk  = _group_sk()
+        nid = _node_id()
         p   = _policy(activation=ActivationMode.MENTION, prefix="!")
-        msg = _msg("!hello", sk=sk, policy=p)
+        msg = _msg("!hello", node_id=nid, policy=p)
         gw.register_platform_handler("matrix", AsyncMock())
         await gw.push(msg)
         await asyncio.sleep(0)
 
-        result = gw.set_group_activation(sk, "always")
+        result = gw.set_group_activation(nid, "always")
         assert result is True
-        lane = gw._session_router._lanes[sk]
+        lane = gw._lane_router._lanes[nid]
         assert lane._policy.activation == ActivationMode.ALWAYS
 
-    def test_set_group_activation_returns_false_for_unknown_session(self, gw):
-        sk = _group_sk("!nonexistent:matrix.org")
-        result = gw.set_group_activation(sk, "always")
+    def test_set_group_activation_returns_false_for_unknown_node(self, gw):
+        result = gw.set_group_activation(_node_id(), "always")
         assert result is False
 
     def test_set_group_activation_invalid_mode_returns_false(self, gw):
-        result = gw.set_group_activation(_group_sk(), "invalid_mode")
+        result = gw.set_group_activation(_node_id(), "invalid_mode")
         assert result is False
 
     @pytest.mark.asyncio
-    async def test_set_group_activation_on_dm_lane_returns_false(self, gw):
-        sk = _dm_sk()
+    async def test_set_group_activation_on_plain_lane_returns_false(self, gw):
+        nid = _node_id()
         gw.register_platform_handler("matrix", AsyncMock())
-        gw._dm_platforms[sk] = "matrix"
+        gw._node_platforms[nid] = "matrix"
         msg = InboundMessage(
-            session_key=sk,
+            tail_node_id=nid,
             author=_make_user(),
             content_type=ContentType.TEXT,
             text="hello",
@@ -463,5 +460,5 @@ class TestRouterGroupLaneIntegration:
         )
         await gw.push(msg)
         await asyncio.sleep(0)
-        result = gw.set_group_activation(sk, "always")
-        assert result is False  # DM lanes are plain Lane, not GroupLane
+        result = gw.set_group_activation(nid, "always")
+        assert result is False  # plain Lane, not GroupLane

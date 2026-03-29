@@ -24,12 +24,13 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from contracts import (
-    SessionKey, UserIdentity, InboundMessage,
+    UserIdentity, InboundMessage,
     AgentTextChunk, AgentTextFinal, AgentError,
     Platform, ContentType, ToolCall, ToolResult,
 )
 from context import HistoryEntry
 from ai import TextDelta, ToolCallAssembled, LLMError
+from db import ConversationDB
 
 
 # ---------------------------------------------------------------------------
@@ -51,10 +52,18 @@ def _make_config(tmp_path):
     return cfg
 
 
-def _make_msg(text="hello", session_key=None):
-    sk = session_key or SessionKey.dm("u1")
+def _make_cursor(tmp_path) -> str:
+    """Create a fresh DB cursor node in tmp_path and return its node_id."""
+    db   = ConversationDB(tmp_path / "agent.db")
+    root = db.get_root()
+    node = db.add_node(parent_id=root.id, role="system", content="session:test")
+    return node.id
+
+
+def _make_msg(text="hello", node_id=None, tmp_path=None):
+    nid = node_id or "test-node-id"
     return InboundMessage(
-        session_key=sk,
+        tail_node_id=nid,
         author=UserIdentity(platform=Platform.CLI, user_id="u1", username="alice"),
         content_type=ContentType.TEXT,
         text=text,
@@ -97,16 +106,13 @@ def make_agent(tmp_path):
     """
     Factory fixture — call make_agent(stream_fn) to get a fresh AgentLoop.
 
-    Each call gets a unique session key so DB state never bleeds between tests.
-    The workspace is tmp_path so agent.db and cursor files land there.
+    Each call creates a unique cursor node in the shared agent.db so DB state
+    never bleeds between tests. The workspace is tmp_path.
     """
-    counter = {"n": 0}
-
     def _factory(stream_fn=None, fallback_stream_fn=None, fallback_names=None):
         from agent import AgentLoop
 
-        counter["n"] += 1
-        unique_key = SessionKey.dm(f"test-user-{counter['n']}")
+        node_id = _make_cursor(tmp_path)
         cfg = _make_config(tmp_path)
 
         if fallback_names:
@@ -121,7 +127,7 @@ def make_agent(tmp_path):
 
         with patch("agent.MODULES_DIR", Path("/nonexistent")):
             with patch("agent._build_llm", return_value=primary_llm):
-                agent = AgentLoop(session_key=unique_key, config=cfg)
+                agent = AgentLoop(tail_node_id=node_id, config=cfg)
 
         agent._models["primary"] = primary_llm
         if fallback_names:
@@ -141,36 +147,35 @@ class TestBasicReply:
     @pytest.mark.asyncio
     async def test_simple_text_reply(self, make_agent):
         agent = make_agent(_text_stream("hello back"))
-        chunks = await _collect(agent, _make_msg("hello"))
+        chunks = await _collect(agent, _make_msg("hello", node_id=agent.tail_node_id))
         assert _full_text(chunks) == "hello back"
 
     @pytest.mark.asyncio
     async def test_reply_is_agent_event(self, make_agent):
         agent = make_agent(_text_stream("hi"))
-        chunks = await _collect(agent, _make_msg())
+        chunks = await _collect(agent, _make_msg(node_id=agent.tail_node_id))
         assert all(isinstance(c, (AgentTextChunk, AgentTextFinal, AgentError)) for c in chunks)
 
     @pytest.mark.asyncio
-    async def test_reply_session_key_matches(self, make_agent):
-        sk = SessionKey.dm("u42")
+    async def test_reply_tail_node_id_matches(self, make_agent):
         agent = make_agent(_text_stream("hi"))
-        agent.session_key = sk
-        chunks = await _collect(agent, _make_msg(session_key=sk))
-        assert chunks[-1].session_key == sk
+        node_id = agent.tail_node_id
+        chunks = await _collect(agent, _make_msg(node_id=node_id))
+        assert chunks[-1].tail_node_id is not None
 
     @pytest.mark.asyncio
     async def test_multi_chunk_text_assembled(self, make_agent):
         agent = make_agent(_text_stream("part1", " ", "part2"))
-        chunks = await _collect(agent, _make_msg())
+        chunks = await _collect(agent, _make_msg(node_id=agent.tail_node_id))
         assert _full_text(chunks) == "part1 part2"
 
     @pytest.mark.asyncio
     async def test_turn_count_increments(self, make_agent):
         agent = make_agent(_text_stream("ok"))
         assert agent._turn_count == 0
-        await _collect(agent, _make_msg("first"))
+        await _collect(agent, _make_msg("first", node_id=agent.tail_node_id))
         assert agent._turn_count == 1
-        await _collect(agent, _make_msg("second"))
+        await _collect(agent, _make_msg("second", node_id=agent.tail_node_id))
         assert agent._turn_count == 2
 
 
@@ -182,14 +187,14 @@ class TestContextAccumulation:
     @pytest.mark.asyncio
     async def test_user_message_added_to_context(self, make_agent):
         agent = make_agent(_text_stream("ok"))
-        await _collect(agent, _make_msg("test input"))
+        await _collect(agent, _make_msg("test input", node_id=agent.tail_node_id))
         roles = [e.role for e in agent.context.dialogue]
         assert "user" in roles
 
     @pytest.mark.asyncio
     async def test_assistant_reply_added_to_context(self, make_agent):
         agent = make_agent(_text_stream("my reply"))
-        await _collect(agent, _make_msg("hi"))
+        await _collect(agent, _make_msg("hi", node_id=agent.tail_node_id))
         assistant_entries = [e for e in agent.context.dialogue if e.role == "assistant"]
         assert len(assistant_entries) == 1
         assert assistant_entries[0].content == "my reply"
@@ -197,8 +202,8 @@ class TestContextAccumulation:
     @pytest.mark.asyncio
     async def test_context_grows_across_turns(self, make_agent):
         agent = make_agent(_text_stream("ok"))
-        await _collect(agent, _make_msg("turn one"))
-        await _collect(agent, _make_msg("turn two"))
+        await _collect(agent, _make_msg("turn one", node_id=agent.tail_node_id))
+        await _collect(agent, _make_msg("turn two", node_id=agent.tail_node_id))
         assert len(agent.context.dialogue) == 4  # 2 user + 2 assistant
 
 
@@ -228,7 +233,7 @@ class TestToolExecution:
             return "tool result"
 
         agent.tool_handler.register_tool(my_tool)
-        await _collect(agent, _make_msg("use the tool"))
+        await _collect(agent, _make_msg("use the tool", node_id=agent.tail_node_id))
         assert tool_called_with == [1]
 
     @pytest.mark.asyncio
@@ -249,7 +254,7 @@ class TestToolExecution:
             return "the answer"
 
         agent.tool_handler.register_tool(my_tool)
-        await _collect(agent, _make_msg("go"))
+        await _collect(agent, _make_msg("go", node_id=agent.tail_node_id))
 
         tool_results = [e for e in agent.context.dialogue if e.role == "tool"]
         assert len(tool_results) == 1
@@ -267,7 +272,7 @@ class TestToolExecution:
                 yield TextDelta(text="done")
 
         agent = make_agent(stream)
-        await _collect(agent, _make_msg("go"))
+        await _collect(agent, _make_msg("go", node_id=agent.tail_node_id))
 
         tool_results = [e for e in agent.context.dialogue if e.role == "tool"]
         assert len(tool_results) == 1
@@ -293,7 +298,7 @@ class TestToolExecution:
             return "keep going"
 
         agent.tool_handler.register_tool(loop_tool)
-        chunks = await _collect(agent, _make_msg("go"))
+        chunks = await _collect(agent, _make_msg("go", node_id=agent.tail_node_id))
         text_chunks = [c for c in chunks if isinstance(c, (AgentTextChunk, AgentTextFinal, AgentError))]
         assert any("cycle limit" in c.text.lower() or "tool" in c.text.lower() for c in text_chunks)
         assert always_tool_count["n"] <= 3
@@ -307,7 +312,7 @@ class TestLLMErrors:
     @pytest.mark.asyncio
     async def test_llm_error_surfaces_in_reply(self, make_agent):
         agent = make_agent(_error_stream("HTTP 500: server error"))
-        chunks = await _collect(agent, _make_msg("hi"))
+        chunks = await _collect(agent, _make_msg("hi", node_id=agent.tail_node_id))
         assert "LLM error" in _full_text(chunks)
 
     @pytest.mark.asyncio
@@ -320,7 +325,7 @@ class TestLLMErrors:
         agent.config.llm.fallback_on.any_error = False
         agent.config.llm.fallback_on.http_codes = [429]
 
-        chunks = await _collect(agent, _make_msg("hi"))
+        chunks = await _collect(agent, _make_msg("hi", node_id=agent.tail_node_id))
         assert _full_text(chunks) == "fallback answer"
 
     @pytest.mark.asyncio
@@ -333,7 +338,7 @@ class TestLLMErrors:
         agent.config.llm.fallback_on.any_error = False
         agent.config.llm.fallback_on.http_codes = [429, 500]
 
-        chunks = await _collect(agent, _make_msg("hi"))
+        chunks = await _collect(agent, _make_msg("hi", node_id=agent.tail_node_id))
         assert "should not see this" not in _full_text(chunks)
         assert "LLM error" in _full_text(chunks)
 
@@ -346,7 +351,7 @@ class TestLLMErrors:
         )
         agent.config.llm.fallback_on.any_error = True
 
-        chunks = await _collect(agent, _make_msg("hi"))
+        chunks = await _collect(agent, _make_msg("hi", node_id=agent.tail_node_id))
         assert _full_text(chunks) == "fallback worked"
 
 
@@ -358,7 +363,7 @@ class TestReset:
     @pytest.mark.asyncio
     async def test_reset_clears_context(self, make_agent):
         agent = make_agent(_text_stream("ok"))
-        await _collect(agent, _make_msg("hi"))
+        await _collect(agent, _make_msg("hi", node_id=agent.tail_node_id))
         assert len(agent.context.dialogue) > 0
 
         agent.reset()
@@ -367,7 +372,7 @@ class TestReset:
     @pytest.mark.asyncio
     async def test_reset_zeroes_turn_count(self, make_agent):
         agent = make_agent(_text_stream("ok"))
-        await _collect(agent, _make_msg("hi"))
+        await _collect(agent, _make_msg("hi", node_id=agent.tail_node_id))
         assert agent._turn_count == 1
 
         agent.reset()
@@ -376,9 +381,8 @@ class TestReset:
     @pytest.mark.asyncio
     async def test_reset_does_not_delete_db_nodes(self, make_agent, tmp_path):
         """reset() is in-memory only — the tree in agent.db must survive."""
-        from db import ConversationDB
         agent = make_agent(_text_stream("ok"))
-        await _collect(agent, _make_msg("hi"))
+        await _collect(agent, _make_msg("hi", node_id=agent.tail_node_id))
         tail_before = agent._tail_node_id
 
         agent.reset()

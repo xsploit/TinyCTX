@@ -87,7 +87,6 @@ from contracts import (
     GroupPolicy,
     InboundMessage,
     Platform,
-    SessionKey,
     UserIdentity,
 )
 
@@ -237,12 +236,14 @@ class MatrixBridge:
         self._store_path = raw_store if os.path.isabs(raw_store) else os.path.join(workspace, raw_store)
         os.makedirs(self._store_path, exist_ok=True)
 
-        # session_key_str → _ReplyAccumulator
+        # node_id → _ReplyAccumulator
         self._accumulators: dict[str, _ReplyAccumulator] = {}
-        # session_key_str → asyncio.Event signalling typing should be active
+        # node_id → asyncio.Event signalling typing should be active
         self._typing_active: dict[str, asyncio.Event] = {}
         # sender+room_id → pending Attachments (media arrives before text in Matrix)
         self._pending_attachments: dict[str, list[Attachment]] = {}
+        # cursor persistence: room_id / dm sender_id → node_id
+        self._cursors: dict[str, str] = {}
 
         self._client: AsyncClient | None = None
         self._own_user_id: str = ""
@@ -282,13 +283,13 @@ class MatrixBridge:
     # ------------------------------------------------------------------
 
     async def handle_event(self, event) -> None:
-        session_key_str = str(event.session_key)
-        acc = self._accumulators.get(session_key_str)
+        node_id = event.tail_node_id
+        acc = self._accumulators.get(node_id)
         if acc is None:
-            logger.debug("Matrix: received event for unknown session %s", session_key_str)
+            logger.debug("Matrix: received event for unknown cursor %s", node_id)
             return
 
-        typing_ev = self._typing_active.get(session_key_str)
+        typing_ev = self._typing_active.get(node_id)
 
         if isinstance(event, AgentThinkingChunk):
             if typing_ev and self._typing_on_thinking:
@@ -302,11 +303,11 @@ class MatrixBridge:
         elif isinstance(event, AgentToolCall):
             if typing_ev and self._typing_on_tools:
                 typing_ev.set()
-            logger.debug("Matrix: tool call %s in session %s", event.tool_name, session_key_str)
+            logger.debug("Matrix: tool call %s for cursor %s", event.tool_name, node_id)
         elif isinstance(event, AgentToolResult):
             logger.debug(
-                "Matrix: tool result %s (%s) in session %s",
-                event.tool_name, "error" if event.is_error else "ok", session_key_str,
+                "Matrix: tool result %s (%s) for cursor %s",
+                event.tool_name, "error" if event.is_error else "ok", node_id,
             )
         elif isinstance(event, AgentError):
             acc.error(event.message)
@@ -343,9 +344,10 @@ class MatrixBridge:
         # DM path
         # ----------------------------------------------------------------
         if is_dm:
-            session_key = SessionKey.dm(event.sender)
-            att_key = f"{event.sender}:{room.room_id}"
+            att_key     = f"{event.sender}:{room.room_id}"
             attachments = tuple(self._pending_attachments.pop(att_key, []))
+            cursor_key  = f"dm:{event.sender}"
+            node_id     = self._get_or_create_cursor(cursor_key)
 
             author = UserIdentity(
                 platform=Platform.MATRIX,
@@ -353,7 +355,7 @@ class MatrixBridge:
                 username=self._display_name(room, event.sender),
             )
             msg = InboundMessage(
-                session_key=session_key,
+                tail_node_id=node_id,
                 author=author,
                 content_type=content_type_for(body, bool(attachments)),
                 text=body,
@@ -361,26 +363,27 @@ class MatrixBridge:
                 timestamp=time.time(),
                 attachments=attachments,
             )
-            session_key_str = str(session_key)
             acc = _ReplyAccumulator(self._max_len)
-            self._accumulators[session_key_str] = acc
+            self._accumulators[node_id] = acc
             asyncio.create_task(
-                self._handle_turn(msg, room.room_id, session_key_str, acc)
+                self._handle_turn(msg, room.room_id, node_id, acc, cursor_key)
             )
             return
 
         # ----------------------------------------------------------------
         # Group room path
         # ----------------------------------------------------------------
-        session_key = SessionKey.group(Platform.MATRIX, room.room_id)
+        cursor_key = f"group:{room.room_id}"
 
         # /reset — admin only (handled before routing)
         if body == self._reset_command:
             if self._is_admin(event.sender):
-                self._router.reset_session(session_key)
+                node_id = self._cursors.get(cursor_key)
+                if node_id:
+                    self._router.reset_lane(node_id)
                 await self._send(room.room_id, "✅ Session reset.")
                 logger.info(
-                    "Matrix: group session %s reset by admin %s",
+                    "Matrix: group room %s reset by admin %s",
                     room.room_id, event.sender,
                 )
             else:
@@ -391,9 +394,10 @@ class MatrixBridge:
         # Trigger detection and stripping are handled by GroupLane via GroupPolicy.
         humanized_body = _humanize_matrix_mentions(body, self._own_user_id)
 
-        display    = self._display_name(room, event.sender)
-        att_key    = f"{event.sender}:{room.room_id}"
+        display     = self._display_name(room, event.sender)
+        att_key     = f"{event.sender}:{room.room_id}"
         attachments = tuple(self._pending_attachments.pop(att_key, []))
+        node_id     = self._get_or_create_cursor(cursor_key)
 
         author = UserIdentity(
             platform=Platform.MATRIX,
@@ -401,7 +405,7 @@ class MatrixBridge:
             username=display,
         )
         msg = InboundMessage(
-            session_key=session_key,
+            tail_node_id=node_id,
             author=author,
             content_type=content_type_for(humanized_body, bool(attachments)),
             text=humanized_body,
@@ -410,11 +414,10 @@ class MatrixBridge:
             attachments=attachments,
             group_policy=self._build_group_policy(),
         )
-        session_key_str = str(session_key)
         acc = _ReplyAccumulator(self._max_len)
-        self._accumulators[session_key_str] = acc
+        self._accumulators[node_id] = acc
         asyncio.create_task(
-            self._handle_turn(msg, room.room_id, session_key_str, acc)
+            self._handle_turn(msg, room.room_id, node_id, acc, cursor_key)
         )
 
     async def _on_media(self, room: MatrixRoom, event) -> None:
@@ -480,16 +483,29 @@ class MatrixBridge:
             except Exception:
                 pass
 
+    def _get_or_create_cursor(self, cursor_key: str) -> str:
+        """Return the node_id for a cursor_key, creating it in the DB if new."""
+        if cursor_key in self._cursors:
+            return self._cursors[cursor_key]
+        from db import ConversationDB
+        workspace   = Path(self._router._config.workspace.path).expanduser().resolve()
+        db          = ConversationDB(workspace / "agent.db")
+        root        = db.get_root()
+        node        = db.add_node(parent_id=root.id, role="system", content=f"session:{cursor_key}")
+        self._cursors[cursor_key] = node.id
+        return node.id
+
     async def _handle_turn(
         self,
         msg: InboundMessage,
         room_id: str,
-        session_key_str: str,
+        node_id: str,
         acc: _ReplyAccumulator,
+        cursor_key: str | None = None,
     ) -> None:
         done_event = asyncio.Event()
         typing_ev = asyncio.Event()
-        self._typing_active[session_key_str] = typing_ev
+        self._typing_active[node_id] = typing_ev
 
         try:
             accepted = await self._router.push(msg)
@@ -512,12 +528,20 @@ class MatrixBridge:
 
             for chunk in chunks:
                 await self._send(room_id, chunk)
+
+            # Advance cursor after a successful turn.
+            if cursor_key:
+                lane = self._router._lane_router._lanes.get(node_id)
+                if lane:
+                    new_id = lane.loop._tail_node_id
+                    if new_id and new_id != node_id:
+                        self._cursors[cursor_key] = new_id
         except Exception:
-            logger.exception("Matrix: error handling turn for session %s", session_key_str)
+            logger.exception("Matrix: error handling turn for cursor %s", node_id)
         finally:
             done_event.set()
-            self._accumulators.pop(session_key_str, None)
-            self._typing_active.pop(session_key_str, None)
+            self._accumulators.pop(node_id, None)
+            self._typing_active.pop(node_id, None)
 
     async def _send(self, room_id: str, text: str) -> None:
         if self._client is None:

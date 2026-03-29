@@ -1,6 +1,12 @@
 """
-router.py — Async session router and lane queues.
+router.py — Async lane router keyed by node_id (cursor).
 No LLM calls, no tools, no memory. Pure routing and async primitives.
+
+Phase 2 tree refactor
+---------------------
+Lanes are keyed by tail_node_id (str) instead of SessionKey.
+InboundMessage.tail_node_id is the sole routing key.
+SessionKey and ChatType are gone.
 
 Group chat routing
 ------------------
@@ -10,12 +16,12 @@ stripping, non-trigger buffering, and optional timeout flush.
 Abort
 -----
 Lane.abort_event is checked by AgentLoop between cycles and mid-stream.
-Router.abort_generation(key) sets it; the drain worker clears it at the
-start of each new turn so it doesn't bleed forward.
+Router.abort_generation(node_id) sets it; the drain worker clears it at
+the start of each new turn so it doesn't bleed forward.
 
 Synthetic turns
 ---------------
-Router.push_synthetic(key) enqueues None to the lane. The drain worker
+Router.push_synthetic(node_id) enqueues None to the lane. The drain worker
 calls loop.run(None) which skips Stage 1 (no user intake).
 """
 
@@ -28,7 +34,7 @@ from pathlib import Path
 from typing import Callable, Awaitable
 
 from contracts import (
-    InboundMessage, AgentEvent, SessionKey, ChatType,
+    InboundMessage, AgentEvent,
     GroupPolicy, ActivationMode,
 )
 from agent import AgentLoop
@@ -43,11 +49,10 @@ LANE_QUEUE_MAX = 32
 
 @dataclass
 class Lane:
-    session_key:      SessionKey
-    config:           Config
-    event_handler:    EventHandler
-    router:           "Router"
-    version_override: int | None = None
+    node_id:       str
+    config:        Config
+    event_handler: EventHandler
+    router:        "Router"
 
     loop:        AgentLoop     = field(init=False)
     queue:       asyncio.Queue = field(init=False)
@@ -58,16 +63,15 @@ class Lane:
         self.queue       = asyncio.Queue(maxsize=LANE_QUEUE_MAX)
         self.abort_event = asyncio.Event()
         self.loop        = AgentLoop(
-            session_key=self.session_key,
+            tail_node_id=self.node_id,
             config=self.config,
-            version_override=self.version_override,
         )
         self.loop.gateway = self.router
 
     def start(self) -> None:
         if self._worker is None or self._worker.done():
             self._worker = asyncio.create_task(
-                self._drain(), name=f"lane:{self.session_key}"
+                self._drain(), name=f"lane:{self.node_id}"
             )
 
     async def enqueue(self, msg: InboundMessage | None) -> bool:
@@ -78,13 +82,13 @@ class Lane:
         except asyncio.QueueFull:
             logger.warning(
                 "Lane %s queue full (%d/%d) — dropping",
-                self.session_key, self.queue.qsize(), LANE_QUEUE_MAX,
+                self.node_id, self.queue.qsize(), LANE_QUEUE_MAX,
             )
             return False
 
     def abort(self) -> None:
         self.abort_event.set()
-        logger.info("Lane %s: abort signalled", self.session_key)
+        logger.info("Lane %s: abort signalled", self.node_id)
 
     async def _drain(self) -> None:
         while True:
@@ -95,9 +99,9 @@ class Lane:
                     try:
                         await self.event_handler(event)
                     except Exception:
-                        logger.exception("Event handler raised for %s", self.session_key)
+                        logger.exception("Event handler raised for %s", self.node_id)
             except Exception:
-                logger.exception("AgentLoop raised for %s — lane continues", self.session_key)
+                logger.exception("AgentLoop raised for %s — lane continues", self.node_id)
             finally:
                 self.queue.task_done()
 
@@ -129,7 +133,7 @@ def _gp_strip_trigger(text: str, policy: GroupPolicy) -> str:
 
 def _gp_replace_text(msg: InboundMessage, new_text: str) -> InboundMessage:
     return InboundMessage(
-        session_key=msg.session_key,
+        tail_node_id=msg.tail_node_id,
         author=msg.author,
         content_type=msg.content_type,
         text=new_text,
@@ -147,7 +151,7 @@ def _gp_replace_text(msg: InboundMessage, new_text: str) -> InboundMessage:
 # ---------------------------------------------------------------------------
 
 class GroupLane:
-    """Wraps Lane for group sessions, applying GroupPolicy."""
+    """Wraps Lane for group conversations, applying GroupPolicy."""
 
     def __init__(self, lane: Lane, policy: GroupPolicy) -> None:
         self._lane   = lane
@@ -192,7 +196,7 @@ class GroupLane:
     @property
     def abort_event(self):  return self._lane.abort_event
     @property
-    def session_key(self):  return self._lane.session_key
+    def node_id(self):      return self._lane.node_id
 
     def set_activation(self, mode: ActivationMode) -> None:
         p = self._policy
@@ -228,7 +232,7 @@ class GroupLane:
     def _reset_timeout(self) -> None:
         self._cancel_timeout()
         self._timeout_task = asyncio.create_task(
-            self._timeout_flush(), name=f"group-timeout:{self._lane.session_key}"
+            self._timeout_flush(), name=f"group-timeout:{self._lane.node_id}"
         )
 
     def _cancel_timeout(self) -> None:
@@ -252,56 +256,52 @@ class GroupLane:
 # _SessionRouter
 # ---------------------------------------------------------------------------
 
-class _SessionRouter:
+class _LaneRouter:
     def __init__(self, config: Config, event_handler: EventHandler, router: "Router") -> None:
         self._config        = config
         self._event_handler = event_handler
         self._router        = router
-        self._lanes: dict[SessionKey, "Lane | GroupLane"] = {}
-        self._version_overrides: dict[SessionKey, int] = {}
+        self._lanes: dict[str, "Lane | GroupLane"] = {}  # node_id → lane
 
     async def route(self, msg: InboundMessage) -> bool:
-        lane = self._get_or_create(msg.session_key, msg)
+        lane = self._get_or_create(msg.tail_node_id, msg)
         if isinstance(lane, GroupLane):
             return await lane.push(msg)
         return await lane.enqueue(msg)
 
-    async def enqueue_synthetic(self, key: SessionKey) -> bool:
+    async def enqueue_synthetic(self, node_id: str) -> bool:
         """Enqueue a synthetic turn (None msg) for an existing or new lane."""
-        if key not in self._lanes:
+        if node_id not in self._lanes:
             lane = Lane(
-                session_key=key,
+                node_id=node_id,
                 config=self._config,
                 event_handler=self._event_handler,
                 router=self._router,
-                version_override=self._version_overrides.pop(key, None),
             )
             lane.start()
-            self._lanes[key] = lane
-            logger.info("Opened lane %s (synthetic)", key)
-        lane = self._lanes[key]
+            self._lanes[node_id] = lane
+            logger.info("Opened lane %s (synthetic)", node_id)
+        lane = self._lanes[node_id]
         inner = lane._lane if isinstance(lane, GroupLane) else lane
         return await inner.enqueue(None)
 
-    def _get_or_create(self, key: SessionKey, msg: InboundMessage) -> "Lane | GroupLane":
-        if key not in self._lanes:
-            version_override = self._version_overrides.pop(key, None)
+    def _get_or_create(self, node_id: str, msg: InboundMessage) -> "Lane | GroupLane":
+        if node_id not in self._lanes:
             inner = Lane(
-                session_key=key,
+                node_id=node_id,
                 config=self._config,
                 event_handler=self._event_handler,
                 router=self._router,
-                version_override=version_override,
             )
             inner.start()
-            if key.chat_type == ChatType.GROUP and msg.group_policy is not None:
+            if msg.group_policy is not None:
                 lane: "Lane | GroupLane" = GroupLane(inner, msg.group_policy)
-                logger.info("Opened GroupLane %s (activation=%s)", key, msg.group_policy.activation)
+                logger.info("Opened GroupLane %s (activation=%s)", node_id, msg.group_policy.activation)
             else:
                 lane = inner
-                logger.info("Opened lane %s", key)
-            self._lanes[key] = lane
-        return self._lanes[key]
+                logger.info("Opened lane %s", node_id)
+            self._lanes[node_id] = lane
+        return self._lanes[node_id]
 
     async def close_all(self) -> None:
         for lane in self._lanes.values():
@@ -309,7 +309,7 @@ class _SessionRouter:
         self._lanes.clear()
 
     @property
-    def active_sessions(self) -> list[SessionKey]:
+    def active_lanes(self) -> list[str]:
         return list(self._lanes.keys())
 
 
@@ -321,9 +321,9 @@ class Router:
     def __init__(self, config: Config) -> None:
         self._config             = config
         self._platform_handlers: dict[str, EventHandler] = {}
-        self._session_handlers:  dict[SessionKey, EventHandler] = {}
-        self._dm_platforms:      dict[SessionKey, str] = {}
-        self._session_router     = _SessionRouter(
+        self._cursor_handlers:   dict[str, EventHandler] = {}  # node_id → handler
+        self._node_platforms:    dict[str, str]           = {}  # node_id → platform value
+        self._lane_router        = _LaneRouter(
             config=config,
             event_handler=self._dispatch_event,
             router=self,
@@ -336,34 +336,35 @@ class Router:
     def register_reply_handler(self, platform: str, handler: EventHandler) -> None:
         self.register_platform_handler(platform, handler)
 
-    def register_session_handler(self, key: SessionKey, handler: EventHandler) -> None:
-        self._session_handlers[key] = handler
+    def register_cursor_handler(self, node_id: str, handler: EventHandler) -> None:
+        """Register a per-cursor event handler (replaces register_session_handler)."""
+        self._cursor_handlers[node_id] = handler
 
-    def unregister_session_handler(self, key: SessionKey) -> None:
-        self._session_handlers.pop(key, None)
+    def unregister_cursor_handler(self, node_id: str) -> None:
+        self._cursor_handlers.pop(node_id, None)
 
     async def push(self, msg: InboundMessage) -> bool:
-        if msg.session_key.chat_type.value == "dm":
-            self._dm_platforms[msg.session_key] = msg.author.platform.value
-        return await self._session_router.route(msg)
+        # Record which platform this cursor belongs to for event dispatch.
+        self._node_platforms[msg.tail_node_id] = msg.author.platform.value
+        return await self._lane_router.route(msg)
 
-    async def push_synthetic(self, key: SessionKey) -> bool:
+    async def push_synthetic(self, node_id: str) -> bool:
         """Queue a generation with no new user message (run(None))."""
-        return await self._session_router.enqueue_synthetic(key)
+        return await self._lane_router.enqueue_synthetic(node_id)
 
     async def _dispatch_event(self, event: AgentEvent) -> None:
-        sk      = event.session_key
-        handler = self._session_handlers.get(sk)
+        node_id = event.tail_node_id
+        handler = self._cursor_handlers.get(node_id)
         if handler is not None:
             try:
                 await handler(event)
             except Exception:
-                logger.exception("Session handler failed for %s", event.trace_id)
+                logger.exception("Cursor handler failed for %s", event.trace_id)
             return
 
-        platform = sk.platform.value if sk.platform else self._dm_platforms.get(sk)
+        platform = self._node_platforms.get(node_id)
         if platform is None:
-            logger.error("Cannot determine platform for %s — dropping %s", sk, event.trace_id)
+            logger.error("Cannot determine platform for node %s — dropping %s", node_id, event.trace_id)
             return
         handler = self._platform_handlers.get(platform)
         if handler is None:
@@ -374,43 +375,35 @@ class Router:
         except Exception:
             logger.exception("Platform handler failed for %s", event.trace_id)
 
-    def reset_session(self, key: SessionKey) -> None:
-        lane = self._session_router._lanes.get(key)
+    def reset_lane(self, node_id: str) -> None:
+        lane = self._lane_router._lanes.get(node_id)
         if lane:
             lane.reset()
 
-    def abort_generation(self, key: SessionKey) -> bool:
-        lane = self._session_router._lanes.get(key)
+    def abort_generation(self, node_id: str) -> bool:
+        lane = self._lane_router._lanes.get(node_id)
         if lane is None:
             return False
         lane.abort()
         return True
 
-    def set_group_activation(self, key: SessionKey, mode: "str | ActivationMode") -> bool:
+    def set_group_activation(self, node_id: str, mode: "str | ActivationMode") -> bool:
         if isinstance(mode, str):
             try:
                 mode = ActivationMode(mode)
             except ValueError:
                 logger.error("set_group_activation: unknown mode %r", mode)
                 return False
-        lane = self._session_router._lanes.get(key)
+        lane = self._lane_router._lanes.get(node_id)
         if isinstance(lane, GroupLane):
             lane.set_activation(mode)
             return True
         return False
 
-    def next_session(self, key: SessionKey) -> None:
-        """
-        Phase 1 stub: next_session is superseded by branch cursor advancement
-        in the tree refactor. For now this is a no-op — the old session JSON
-        versioning mechanism is removed and Phase 2 will implement proper
-        branch forking via ConversationDB.spawn_branch().
-        """
-        logger.info("next_session(%s) — no-op in Phase 1 tree refactor", key)
-
     async def shutdown(self) -> None:
-        await self._session_router.close_all()
+        await self._lane_router.close_all()
 
     @property
-    def active_sessions(self) -> list[SessionKey]:
-        return self._session_router.active_sessions
+    def active_lanes(self) -> list[str]:
+        """node_ids of all currently-open lanes."""
+        return self._lane_router.active_lanes

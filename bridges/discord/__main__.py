@@ -64,7 +64,6 @@ from contracts import (
     content_type_for,
     InboundMessage,
     Platform,
-    SessionKey,
     UserIdentity,
 )
 
@@ -97,10 +96,6 @@ DEFAULTS = {
 
 # ---------------------------------------------------------------------------
 # Mention humanization
-#
-# Converts Discord wire-format mentions (<@id> and <@!id>) to @username so
-# the LLM sees readable text rather than raw snowflake IDs.
-# Adapted from discord-mcp/discord_utils.py MentionProcessor.humanize_mentions.
 # ---------------------------------------------------------------------------
 
 async def _humanize_mentions(text: str, client: discord.Client) -> str:
@@ -126,9 +121,6 @@ async def _humanize_mentions(text: str, client: discord.Client) -> str:
 
 # ---------------------------------------------------------------------------
 # GroupBuffer
-#
-# Accumulates non-triggering messages in a group channel and flushes them
-# as a single attributed InboundMessage when a trigger arrives (or on timeout).
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -142,7 +134,7 @@ class GroupBuffer:
     """Per-channel message buffer."""
 
     def __init__(self, timeout_s: float) -> None:
-        self._timeout_s = timeout_s          # 0 = disabled
+        self._timeout_s = timeout_s
         self._lines: list[_BufferedLine] = []
         self._flush_task: asyncio.Task | None = None
         self._flush_callback = None
@@ -161,7 +153,6 @@ class GroupBuffer:
         trigger_display_name: str | None = None,
         trigger_text: str | None = None,
     ) -> list[_BufferedLine]:
-        """Return accumulated lines + optional trigger line, then clear."""
         self._cancel_timer()
         lines = list(self._lines)
         if trigger_text and trigger_user_id and trigger_display_name:
@@ -193,7 +184,6 @@ class GroupBuffer:
 
 
 def _format_buffer(lines: list[_BufferedLine]) -> str:
-    """Format buffered lines as attributed multi-line text for the LLM."""
     return "\n".join(f"[{line.display_name}]: {line.text}" for line in lines)
 
 
@@ -261,12 +251,10 @@ class DiscordBridge:
         raw_admin: list = self._opts["admin_users"]
         self._admin_users: set[int] = {int(u) for u in raw_admin}
 
-        # session_key_str → _ReplyAccumulator for the active turn
         self._accumulators: dict[str, _ReplyAccumulator] = {}
-        # session_key_str → asyncio.Event signalling typing should be active
         self._typing_active: dict[str, asyncio.Event] = {}
-        # channel_id → GroupBuffer
         self._group_buffers: dict[str, GroupBuffer] = {}
+        self._cursors: dict[str, str] = {}
 
         intents = discord.Intents.default()
         intents.message_content = True
@@ -294,7 +282,6 @@ class DiscordBridge:
         return self._group_buffers[channel_id]
 
     def _strip_trigger(self, text: str) -> str:
-        """Strip bot @mention and command prefix from message text."""
         if self._client.user:
             text = text.replace(f"<@{self._client.user.id}>", "")
             text = text.replace(f"<@!{self._client.user.id}>", "")
@@ -323,13 +310,13 @@ class DiscordBridge:
     # ------------------------------------------------------------------
 
     async def handle_event(self, event) -> None:
-        session_key_str = str(event.session_key)
-        acc = self._accumulators.get(session_key_str)
+        node_id = event.tail_node_id
+        acc = self._accumulators.get(node_id)
         if acc is None:
-            logger.debug("Discord: received event for unknown session %s", session_key_str)
+            logger.debug("Discord: received event for unknown cursor %s", node_id)
             return
 
-        typing_ev = self._typing_active.get(session_key_str)
+        typing_ev = self._typing_active.get(node_id)
 
         if isinstance(event, AgentThinkingChunk):
             if typing_ev and self._typing_on_thinking:
@@ -343,11 +330,11 @@ class DiscordBridge:
         elif isinstance(event, AgentToolCall):
             if typing_ev and self._typing_on_tools:
                 typing_ev.set()
-            logger.debug("Discord: tool call %s in session %s", event.tool_name, session_key_str)
+            logger.debug("Discord: tool call %s for cursor %s", event.tool_name, node_id)
         elif isinstance(event, AgentToolResult):
             logger.debug(
-                "Discord: tool result %s (%s) in session %s",
-                event.tool_name, "error" if event.is_error else "ok", session_key_str,
+                "Discord: tool result %s (%s) for cursor %s",
+                event.tool_name, "error" if event.is_error else "ok", node_id,
             )
         elif isinstance(event, AgentError):
             acc.error(event.message)
@@ -374,11 +361,9 @@ class DiscordBridge:
             )
 
     async def _on_message(self, message: discord.Message) -> None:
-        # Ignore own messages.
         if self._client.user and message.author.id == self._client.user.id:
             return
 
-        # Access control.
         if not self._is_allowed(message.author.id):
             logger.debug(
                 "Discord: ignoring message from unauthorized user %s (%s)",
@@ -388,25 +373,23 @@ class DiscordBridge:
 
         is_dm = isinstance(message.channel, discord.DMChannel)
 
-        # ----------------------------------------------------------------
-        # DM path — unchanged from original behaviour
-        # ----------------------------------------------------------------
         if is_dm:
             if not self._dm_enabled:
                 return
-            session_key = SessionKey.dm(str(message.author.id))
             text = message.content.strip()
             attachments = await self._fetch_attachments(message)
             if not text and not attachments:
                 return
 
-            author = UserIdentity(
+            cursor_key  = f"dm:{message.author.id}"
+            node_id     = self._get_or_create_cursor(cursor_key)
+            author      = UserIdentity(
                 platform=Platform.DISCORD,
                 user_id=str(message.author.id),
                 username=message.author.display_name,
             )
             msg = InboundMessage(
-                session_key=session_key,
+                tail_node_id=node_id,
                 author=author,
                 content_type=content_type_for(text, bool(attachments)),
                 text=text,
@@ -414,40 +397,36 @@ class DiscordBridge:
                 timestamp=time.time(),
                 attachments=attachments,
             )
-            session_key_str = str(session_key)
             acc = _ReplyAccumulator(message.channel, self._max_len)
-            self._accumulators[session_key_str] = acc
+            self._accumulators[node_id] = acc
             asyncio.create_task(
-                self._handle_turn(msg, message.channel, session_key_str, acc)
+                self._handle_turn(msg, message.channel, node_id, acc, cursor_key)
             )
             return
 
-        # ----------------------------------------------------------------
-        # Group channel path
-        # ----------------------------------------------------------------
         if self._guild_ids and message.guild and message.guild.id not in self._guild_ids:
             return
 
-        session_key = SessionKey.group(Platform.DISCORD, str(message.channel.id))
-        channel_id = str(message.channel.id)
-        buf = self._get_or_create_buffer(channel_id)
-        raw_text = message.content.strip()
+        channel_id  = str(message.channel.id)
+        cursor_key  = f"group:{channel_id}"
+        buf         = self._get_or_create_buffer(channel_id)
+        raw_text    = message.content.strip()
 
-        # /reset — admin only
         if raw_text == self._reset_command:
             if self._is_admin(message.author.id):
                 buf.clear()
-                self._router.reset_session(session_key)
+                node_id = self._cursors.get(cursor_key)
+                if node_id:
+                    self._router.reset_lane(node_id)
                 await message.channel.send("✅ Session reset.")
                 logger.info(
-                    "Discord: group session %s reset by admin %s",
+                    "Discord: group channel %s reset by admin %s",
                     channel_id, message.author.id,
                 )
             else:
                 await message.channel.send("⛔ Only admins can reset the session.")
             return
 
-        # Determine whether this message is a trigger (mention or prefix).
         mentioned = (
             self._client.user is not None
             and self._client.user in message.mentions
@@ -456,15 +435,14 @@ class DiscordBridge:
         is_trigger = mentioned or prefixed
 
         if self._prefix_required and not is_trigger:
-            # Non-trigger: buffer it for context.
             humanized = await _humanize_mentions(raw_text, self._client)
 
             async def _timeout_flush_cb(
                 _buf=buf, _channel_id=channel_id,
-                _session_key=session_key, _channel=message.channel,
+                _cursor_key=cursor_key, _channel=message.channel,
             ):
                 await self._flush_group_buffer(
-                    _buf, _channel_id, _session_key, _channel,
+                    _buf, _channel_id, _cursor_key, _channel,
                     trigger_user_id=None, trigger_display_name=None, trigger_text=None,
                 )
 
@@ -476,13 +454,12 @@ class DiscordBridge:
             )
             return
 
-        # Trigger: strip bot mention/prefix, humanize remaining mentions, flush.
         stripped = self._strip_trigger(raw_text)
         humanized_trigger = await _humanize_mentions(stripped, self._client)
         attachments = await self._fetch_attachments(message)
 
         await self._flush_group_buffer(
-            buf, channel_id, session_key, message.channel,
+            buf, channel_id, cursor_key, message.channel,
             trigger_user_id=str(message.author.id),
             trigger_display_name=message.author.display_name,
             trigger_text=humanized_trigger,
@@ -491,14 +468,26 @@ class DiscordBridge:
         )
 
     # ------------------------------------------------------------------
-    # Group flush — assembles buffer into one InboundMessage and pushes it
+    # Group flush
     # ------------------------------------------------------------------
+
+    def _get_or_create_cursor(self, cursor_key: str) -> str:
+        if cursor_key in self._cursors:
+            return self._cursors[cursor_key]
+        from db import ConversationDB
+        from pathlib import Path
+        workspace   = Path(self._router._config.workspace.path).expanduser().resolve()
+        db          = ConversationDB(workspace / "agent.db")
+        root        = db.get_root()
+        node        = db.add_node(parent_id=root.id, role="system", content=f"session:{cursor_key}")
+        self._cursors[cursor_key] = node.id
+        return node.id
 
     async def _flush_group_buffer(
         self,
         buf: GroupBuffer,
         channel_id: str,
-        session_key: SessionKey,
+        cursor_key: str,
         channel: discord.abc.Messageable,
         trigger_user_id: str | None,
         trigger_display_name: str | None,
@@ -515,8 +504,8 @@ class DiscordBridge:
             return
 
         combined_text = _format_buffer(lines)
+        node_id = self._get_or_create_cursor(cursor_key)
 
-        # Author: trigger sender if present, else first buffered sender.
         if trigger_user_id:
             author_uid = trigger_user_id
             author_name = trigger_display_name or trigger_user_id
@@ -533,7 +522,7 @@ class DiscordBridge:
             username=author_name,
         )
         msg = InboundMessage(
-            session_key=session_key,
+            tail_node_id=node_id,
             author=author,
             content_type=content_type_for(combined_text, bool(attachments)),
             text=combined_text,
@@ -542,11 +531,10 @@ class DiscordBridge:
             attachments=attachments,
         )
 
-        session_key_str = str(session_key)
         acc = _ReplyAccumulator(channel, self._max_len)
-        self._accumulators[session_key_str] = acc
+        self._accumulators[node_id] = acc
         asyncio.create_task(
-            self._handle_turn(msg, channel, session_key_str, acc)
+            self._handle_turn(msg, channel, node_id, acc, cursor_key)
         )
 
     # ------------------------------------------------------------------
@@ -576,12 +564,13 @@ class DiscordBridge:
         self,
         msg: InboundMessage,
         channel: discord.abc.Messageable,
-        session_key_str: str,
+        node_id: str,
         acc: _ReplyAccumulator,
+        cursor_key: str | None = None,
     ) -> None:
         done_event = asyncio.Event()
         typing_ev = asyncio.Event()
-        self._typing_active[session_key_str] = typing_ev
+        self._typing_active[node_id] = typing_ev
 
         try:
             accepted = await self._router.push(msg)
@@ -601,12 +590,19 @@ class DiscordBridge:
                     keepalive.cancel()
             else:
                 await acc.wait_and_send()
+
+            if cursor_key:
+                lane = self._router._lane_router._lanes.get(node_id)
+                if lane:
+                    new_id = lane.loop._tail_node_id
+                    if new_id and new_id != node_id:
+                        self._cursors[cursor_key] = new_id
         except Exception:
-            logger.exception("Discord: error handling turn for session %s", session_key_str)
+            logger.exception("Discord: error handling turn for cursor %s", node_id)
         finally:
             done_event.set()
-            self._accumulators.pop(session_key_str, None)
-            self._typing_active.pop(session_key_str, None)
+            self._accumulators.pop(node_id, None)
+            self._typing_active.pop(node_id, None)
 
     # ------------------------------------------------------------------
     # Entry point

@@ -1,6 +1,13 @@
 """
 contracts.py — Pure data contracts. No logic, no I/O, no imports outside stdlib.
 Every other layer imports from here. Never the reverse.
+
+Phase 2 tree refactor
+---------------------
+SessionKey and ChatType are removed. Lanes are now keyed by node_id (str).
+InboundMessage.tail_node_id is required (promoted from optional).
+_AgentEventBase carries tail_node_id (str) instead of session_key.
+Platform is kept — bridges still have platform identity for event dispatch.
 """
 
 from __future__ import annotations
@@ -77,60 +84,19 @@ class AttachmentKind(str, Enum):
     BINARY   = "binary"    # everything else — reference only, saved to uploads/
 
 
-class ChatType(str, Enum):
-    DM      = "dm"       # 1-on-1 — session shared across platforms
-    GROUP   = "group"    # group/public chat — session is platform-specific
-
-
 # ---------------------------------------------------------------------------
-# Session identity
-#
-# DM sessions:    SessionKey(chat_type=DM,    conversation_id=<owner_user_id>)
-#   platform is None — DMs are platform-agnostic by design.
-#   The same human on Discord and Matrix shares one session.
-#
-# Group sessions: SessionKey(chat_type=GROUP, conversation_id=<channel/room_id>,
-#                            platform=<platform>)
-#   Group chats are platform-specific — a Discord server and a Matrix room
-#   are different contexts.
+# User identity
 # ---------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class SessionKey:
-    """Immutable key that uniquely identifies one conversation lane."""
-    chat_type:       ChatType
-    conversation_id: str        # DM: owner user_id  |  Group: channel/room id
-    platform:        Platform | None = None  # None for DMs, required for groups
-
-    def __post_init__(self) -> None:
-        if self.chat_type == ChatType.GROUP and self.platform is None:
-            raise ValueError("GROUP sessions must specify a platform.")
-
-    def __str__(self) -> str:
-        if self.chat_type == ChatType.DM:
-            return f"dm:{self.conversation_id}"
-        return f"group:{self.platform.value}:{self.conversation_id}"
-
-    @staticmethod
-    def dm(owner_user_id: str) -> SessionKey:
-        """1-on-1 session key — platform agnostic."""
-        return SessionKey(chat_type=ChatType.DM, conversation_id=owner_user_id)
-
-    @staticmethod
-    def group(platform: Platform, channel_id: str) -> SessionKey:
-        """Group/public session key — platform specific."""
-        return SessionKey(chat_type=ChatType.GROUP, conversation_id=channel_id, platform=platform)
-
 
 @dataclass(frozen=True)
 class UserIdentity:
     """
     Who sent the message.
-    For DM session routing, user_id is the stable cross-platform owner id.
-    Bridges are responsible for mapping their platform user id to this.
+    user_id is the stable per-platform identifier.
+    Bridges are responsible for supplying a consistent user_id.
     """
     platform: Platform
-    user_id:  str       # Stable id used as DM session key
+    user_id:  str
     username: str       # Human-readable display name
 
 
@@ -162,49 +128,43 @@ class Attachment:
 @dataclass(frozen=True)
 class InboundMessage:
     """
-    Canonical message produced by bridges. Nothing platform-specific leaks here.
+    Canonical message produced by bridges.
 
-    For group sessions, bridges should set group_policy so the router's
-    GroupLane can enforce trigger detection, stripping, and buffering.
-    Bridges pass raw (unstripped) text; GroupLane handles everything.
-
-    tail_node_id: tree-refactor field. When set, the router routes this
-    message to the lane keyed by this node_id rather than session_key.
-    Bridges set this once the tree refactor is complete (Phase 2). Until
-    then, session_key is the primary routing key.
+    tail_node_id  — the cursor node_id for this conversation branch.
+                    The router opens or reuses the Lane keyed by this id.
+    author        — who sent the message (platform + user_id + display name)
+    group_policy  — present for group/channel messages; None for DMs
     """
-    session_key:   SessionKey
-    author:        UserIdentity
-    content_type:  ContentType
-    text:          str
-    message_id:    str
-    timestamp:     float
-    reply_to_id:   str | None    = None
-    attachments:   tuple["Attachment", ...] = field(default_factory=tuple)
-    trace_id:      str           = field(default_factory=lambda: str(uuid.uuid4()))
-    group_policy:  "GroupPolicy | None" = None  # set by bridge for group messages
-    tail_node_id:  str | None    = None          # tree refactor: cursor node_id
+    tail_node_id: str
+    author:       UserIdentity
+    content_type: ContentType
+    text:         str
+    message_id:   str
+    timestamp:    float
+    reply_to_id:  str | None    = None
+    attachments:  tuple["Attachment", ...] = field(default_factory=tuple)
+    trace_id:     str           = field(default_factory=lambda: str(uuid.uuid4()))
+    group_policy: "GroupPolicy | None" = None  # set by bridge for group messages
 
 
 # ---------------------------------------------------------------------------
 # Agent event stream
 #
-# AgentLoop.run() yields a stream of AgentEvent objects. The gateway routes
-# each event to the correct bridge via per-session or per-platform handlers.
+# AgentLoop.run() yields a stream of AgentEvent objects. The router dispatches
+# each event to the correct bridge via per-cursor or per-platform handlers.
 # Bridges receive the full event stream and decide what to render.
 #
-# All events share four common fields:
-#   session_key          — which lane produced the event
+# All events share:
+#   tail_node_id         — cursor node_id that identifies the lane
 #   trace_id             — ties all events for one user message together
 #   reply_to_message_id  — the inbound message_id that triggered this turn
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True, kw_only=True)
 class _AgentEventBase:
-    session_key:         SessionKey
+    tail_node_id:        str
     trace_id:            str
     reply_to_message_id: str
-    tail_node_id:        str | None = None  # tree refactor: tail node after this turn
 
 
 @dataclass(frozen=True)

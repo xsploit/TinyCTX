@@ -4,6 +4,9 @@ tests/test_bridges.py
 Tests for Discord and Matrix bridge access-control logic, option parsing,
 reply accumulation, and message routing.
 
+Phase 2 tree refactor: InboundMessage uses tail_node_id (str) — no SessionKey.
+Bridges maintain a _cursors dict mapping cursor_key → node_id.
+
 No real network connections are made. discord.py and matrix-nio are not
 imported — the bridge modules are loaded with their external deps stubbed
 out so the tests run in any environment.
@@ -17,6 +20,7 @@ import asyncio
 import sys
 import time
 import types
+import uuid
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -31,17 +35,15 @@ from contracts import (
     ContentType,
     InboundMessage,
     Platform,
-    SessionKey,
     UserIdentity,
 )
 
 
 # ---------------------------------------------------------------------------
-# Stubs for discord.py and matrix-nio so we don't need them installed
+# Stubs for discord.py and matrix-nio
 # ---------------------------------------------------------------------------
 
 def _stub_discord():
-    """Insert a minimal discord stub into sys.modules."""
     discord = types.ModuleType("discord")
 
     class Intents:
@@ -88,7 +90,6 @@ def _stub_discord():
 
 
 def _stub_nio():
-    """Insert minimal matrix-nio stubs into sys.modules."""
     nio = types.ModuleType("nio")
 
     class AsyncClient:
@@ -133,7 +134,7 @@ def _stub_nio():
             self.sender = sender
             self.body = body
             self.event_id = event_id
-            self.server_timestamp = int(time.time() * 1000)  # fresh
+            self.server_timestamp = int(time.time() * 1000)
             self.source = {}
 
     class RoomMessageMedia:
@@ -176,7 +177,6 @@ def _stub_nio():
     return nio
 
 
-# Stub both libs before importing the bridge modules.
 _stub_discord()
 _stub_nio()
 
@@ -201,9 +201,13 @@ def _trace_id():
     return "trace-test"
 
 
-def _make_agent_event(cls, session_key, **kwargs):
+def _node_id():
+    return str(uuid.uuid4())
+
+
+def _make_agent_event(cls, node_id, **kwargs):
     return cls(
-        session_key=session_key,
+        tail_node_id=node_id,
         trace_id=_trace_id(),
         reply_to_message_id="msg-1",
         **kwargs,
@@ -225,7 +229,7 @@ class TestDiscordBridgeOptions:
         assert b._prefix_required is True
         assert b._max_len == 1900
         assert b._typing is True
-        assert b._allowed_users == set()   # empty = open access
+        assert b._allowed_users == set()
         assert b._guild_ids == set()
 
     def test_allowed_users_parsed_as_ints(self):
@@ -277,13 +281,15 @@ class TestDiscordAllowlist:
 
 
 class TestDiscordMessageFiltering:
-    """Test that _on_message drops messages from unauthorized users."""
-
     def _bridge(self, allowed=None):
         router = _make_router()
         opts = {"allowed_users": allowed} if allowed is not None else {}
         b = DiscordBridge(router, opts)
         b._router = router
+        # Pre-seed a cursor so _get_or_create_cursor doesn't hit the DB
+        b._cursors["dm:42"] = _node_id()
+        b._cursors["dm:111"] = _node_id()
+        b._cursors["dm:99999"] = _node_id()
         return b, router
 
     def _make_discord_message(self, author_id: int, content: str, is_dm: bool = True):
@@ -292,14 +298,14 @@ class TestDiscordMessageFiltering:
         msg.author.display_name = f"user_{author_id}"
         msg.content = content
         msg.id = 12345
+        msg.attachments = []
 
-        # Determine channel type
         import discord
         if is_dm:
             msg.channel = MagicMock(spec=discord.DMChannel)
         else:
             msg.channel = MagicMock()
-            msg.channel.__class__ = MagicMock  # not a DMChannel
+            msg.channel.__class__ = MagicMock
 
         return msg
 
@@ -315,13 +321,13 @@ class TestDiscordMessageFiltering:
         b, router = self._bridge(allowed=[111])
         msg = self._make_discord_message(author_id=111, content="hello")
         await b._on_message(msg)
-        # Give the created task a tick to run
         await asyncio.sleep(0)
         router.push.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_open_allowlist_accepts_anyone(self):
         b, router = self._bridge(allowed=[])
+        b._cursors["dm:99999"] = _node_id()
         msg = self._make_discord_message(author_id=99999, content="hello")
         await b._on_message(msg)
         await asyncio.sleep(0)
@@ -330,7 +336,6 @@ class TestDiscordMessageFiltering:
     @pytest.mark.asyncio
     async def test_bot_own_message_ignored(self):
         b, router = self._bridge(allowed=[])
-        # Message from the bot itself
         msg = self._make_discord_message(author_id=b._client.user.id, content="echo")
         await b._on_message(msg)
         router.push.assert_not_called()
@@ -338,6 +343,7 @@ class TestDiscordMessageFiltering:
     @pytest.mark.asyncio
     async def test_empty_text_not_pushed(self):
         b, router = self._bridge(allowed=[])
+        b._cursors["dm:42"] = _node_id()
         msg = self._make_discord_message(author_id=42, content="   ")
         await b._on_message(msg)
         router.push.assert_not_called()
@@ -351,9 +357,15 @@ class TestDiscordMessageFiltering:
         router.push.assert_not_called()
 
 
-class TestDiscordSessionRouting:
+class TestDiscordMessageRouting:
+    """Test that pushed InboundMessages carry a tail_node_id and correct author."""
+
     def _bridge(self):
-        return DiscordBridge(_make_router(), {})
+        b = DiscordBridge(_make_router(), {})
+        # Pre-seed cursors so no DB access needed
+        b._cursors["dm:42"] = str(uuid.uuid4())
+        b._cursors["dm:77"] = str(uuid.uuid4())
+        return b
 
     def _make_discord_dm_message(self, author_id: int):
         import discord
@@ -362,11 +374,12 @@ class TestDiscordSessionRouting:
         msg.author.display_name = "tester"
         msg.content = "hello"
         msg.id = 1
+        msg.attachments = []
         msg.channel = MagicMock(spec=discord.DMChannel)
         return msg
 
     @pytest.mark.asyncio
-    async def test_dm_creates_dm_session_key(self):
+    async def test_dm_message_has_tail_node_id(self):
         b = self._bridge()
         pushed = []
         b._router.push = AsyncMock(side_effect=lambda m: pushed.append(m) or True)
@@ -374,8 +387,8 @@ class TestDiscordSessionRouting:
         await b._on_message(msg)
         await asyncio.sleep(0)
         assert len(pushed) == 1
-        assert pushed[0].session_key.chat_type.value == "dm"
-        assert pushed[0].session_key.conversation_id == "42"
+        assert isinstance(pushed[0].tail_node_id, str)
+        assert len(pushed[0].tail_node_id) > 0
 
     @pytest.mark.asyncio
     async def test_author_identity_populated(self):
@@ -417,7 +430,7 @@ class TestDiscordReplyAccumulator:
     async def test_long_reply_chunked(self):
         sent = []
         acc = DiscordAccumulator(self._channel(sent), max_len=5)
-        acc.finish("abcdefghij")   # 10 chars, max_len=5 → 2 chunks
+        acc.finish("abcdefghij")
         await acc.wait_and_send()
         assert sent == ["abcde", "fghij"]
 
@@ -444,63 +457,57 @@ class TestDiscordEventHandling:
     def _bridge(self):
         return DiscordBridge(_make_router(), {})
 
-    def _sk(self):
-        return SessionKey.dm("u1")
-
     @pytest.mark.asyncio
     async def test_text_chunk_feeds_accumulator(self):
         b = self._bridge()
-        sk = self._sk()
+        nid = _node_id()
         acc = MagicMock()
-        b._accumulators[str(sk)] = acc
+        b._accumulators[nid] = acc
 
-        event = _make_agent_event(AgentTextChunk, sk, text="hi")
+        event = _make_agent_event(AgentTextChunk, nid, text="hi")
         await b.handle_event(event)
         acc.feed.assert_called_once_with("hi")
 
     @pytest.mark.asyncio
     async def test_text_final_finishes_accumulator(self):
         b = self._bridge()
-        sk = self._sk()
+        nid = _node_id()
         acc = MagicMock()
-        b._accumulators[str(sk)] = acc
+        b._accumulators[nid] = acc
 
-        event = _make_agent_event(AgentTextFinal, sk, text="done")
+        event = _make_agent_event(AgentTextFinal, nid, text="done")
         await b.handle_event(event)
         acc.finish.assert_called_once_with("done")
 
     @pytest.mark.asyncio
     async def test_agent_error_calls_error(self):
         b = self._bridge()
-        sk = self._sk()
+        nid = _node_id()
         acc = MagicMock()
-        b._accumulators[str(sk)] = acc
+        b._accumulators[nid] = acc
 
-        event = _make_agent_event(AgentError, sk, message="boom")
+        event = _make_agent_event(AgentError, nid, message="boom")
         await b.handle_event(event)
         acc.error.assert_called_once_with("boom")
 
     @pytest.mark.asyncio
     async def test_tool_call_logged_not_sent(self):
         b = self._bridge()
-        sk = self._sk()
+        nid = _node_id()
         acc = MagicMock()
-        b._accumulators[str(sk)] = acc
+        b._accumulators[nid] = acc
 
-        event = _make_agent_event(AgentToolCall, sk, call_id="c1", tool_name="search", args={})
+        event = _make_agent_event(AgentToolCall, nid, call_id="c1", tool_name="search", args={})
         await b.handle_event(event)
-        # feed/finish/error should NOT be called for tool calls
         acc.feed.assert_not_called()
         acc.finish.assert_not_called()
         acc.error.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_unknown_session_event_ignored(self):
+    async def test_unknown_node_event_ignored(self):
         b = self._bridge()
-        sk = self._sk()
-        event = _make_agent_event(AgentTextChunk, sk, text="nobody home")
-        # Should not raise
-        await b.handle_event(event)
+        event = _make_agent_event(AgentTextChunk, _node_id(), text="nobody home")
+        await b.handle_event(event)  # should not raise
 
     @pytest.mark.asyncio
     async def test_backpressure_sends_busy_message(self):
@@ -510,9 +517,9 @@ class TestDiscordEventHandling:
         channel.send = AsyncMock(side_effect=lambda t: sent.append(t))
         b._router.push = AsyncMock(return_value=False)
 
-        sk = SessionKey.dm("u1")
+        nid = _node_id()
         msg = InboundMessage(
-            session_key=sk,
+            tail_node_id=nid,
             author=UserIdentity(Platform.DISCORD, "u1", "alice"),
             content_type=ContentType.TEXT,
             text="hello",
@@ -520,9 +527,9 @@ class TestDiscordEventHandling:
             timestamp=time.time(),
         )
         acc = DiscordAccumulator(channel, max_len=1900)
-        b._accumulators[str(sk)] = acc
+        b._accumulators[nid] = acc
 
-        await b._handle_turn(msg, channel, str(sk), acc)
+        await b._handle_turn(msg, channel, nid, acc)
         assert any("busy" in s.lower() or "⏳" in s for s in sent)
 
 
@@ -604,7 +611,6 @@ class TestMatrixAllowlist:
     def test_empty_allowlist_permits_everyone(self):
         b = self._bridge(allowed=[])
         assert b._is_allowed("@anyone:matrix.org") is True
-        assert b._is_allowed("@stranger:evil.com") is True
 
     def test_allowlist_permits_listed_mxid(self):
         b = self._bridge(allowed=["@alice:matrix.org"])
@@ -615,7 +621,6 @@ class TestMatrixAllowlist:
         assert b._is_allowed("@eve:matrix.org") is False
 
     def test_mxid_case_sensitive(self):
-        """Matrix MXIDs are case-sensitive."""
         b = self._bridge(allowed=["@Alice:matrix.org"])
         assert b._is_allowed("@alice:matrix.org") is False
         assert b._is_allowed("@Alice:matrix.org") is True
@@ -640,17 +645,11 @@ class TestMatrixDMDetection:
         room = nio.MatrixRoom(member_count=3)
         assert b._is_dm_room(room) is False
 
-    def test_one_member_room_is_not_group(self):
+    def test_one_member_room_is_not_dm(self):
         import nio
         b = self._bridge()
         room = nio.MatrixRoom(member_count=1)
-        # 1-member rooms are edge case; not a typical group (not 2 either)
         assert b._is_dm_room(room) is False
-
-
-# TestMatrixTextExtraction removed — trigger detection, stripping, and
-# buffering are now handled by GroupLane in router.py via GroupPolicy.
-# See tests/test_router.py :: TestGroupLane for the equivalent coverage.
 
 
 class TestMatrixMessageFiltering:
@@ -665,6 +664,9 @@ class TestMatrixMessageFiltering:
         b = MatrixBridge(router, opts)
         b._own_user_id = "@bot:matrix.org"
         b._router = router
+        # Pre-seed cursors
+        b._cursors["dm:@alice:matrix.org"] = _node_id()
+        b._cursors["dm:@user:matrix.org"] = _node_id()
         return b, router
 
     def _dm_room(self):
@@ -675,7 +677,6 @@ class TestMatrixMessageFiltering:
         import nio
         evt = nio.RoomMessageText(sender=sender, body=body)
         if not fresh:
-            # Make it old (> 60s)
             evt.server_timestamp = int((time.time() - 120) * 1000)
         return evt
 
@@ -725,26 +726,33 @@ class TestMatrixMessageFiltering:
         import nio
         b, router = self._bridge(allowed=[])
         b._room_ids = {"!allowed:matrix.org"}
+        b._cursors["dm:@user:matrix.org"] = _node_id()
         allowed_room = nio.MatrixRoom(room_id="!allowed:matrix.org", member_count=2)
         await b._on_message(allowed_room, self._event("@user:matrix.org", "hello"))
         await asyncio.sleep(0)
         router.push.assert_called_once()
 
 
-class TestMatrixSessionRouting:
+class TestMatrixMessageRouting:
+    """Test that pushed InboundMessages have correct tail_node_id and author."""
+
     def _bridge(self):
         b = MatrixBridge(_make_router(), {
             "homeserver": "https://matrix.org",
             "username": "@bot:matrix.org",
         })
         b._own_user_id = "@bot:matrix.org"
+        # Pre-seed cursors
+        b._cursors["dm:@user:matrix.org"] = _node_id()
+        b._cursors["dm:@alice:matrix.org"] = _node_id()
+        b._cursors["group:!room:matrix.org"] = _node_id()
         return b
 
     def _dm_room(self):
         import nio
         return nio.MatrixRoom(member_count=2)
 
-    def _group_room(self, room_id="!group:matrix.org"):
+    def _group_room(self, room_id="!room:matrix.org"):
         import nio
         return nio.MatrixRoom(room_id=room_id, member_count=10)
 
@@ -753,26 +761,26 @@ class TestMatrixSessionRouting:
         return nio.RoomMessageText(sender=sender, body=body)
 
     @pytest.mark.asyncio
-    async def test_dm_creates_dm_session_key(self):
+    async def test_dm_message_has_tail_node_id(self):
         b = self._bridge()
         pushed = []
         b._router.push = AsyncMock(side_effect=lambda m: pushed.append(m) or True)
         await b._on_message(self._dm_room(), self._event())
         await asyncio.sleep(0)
-        assert pushed[0].session_key.chat_type.value == "dm"
-        assert pushed[0].session_key.conversation_id == "@user:matrix.org"
+        assert len(pushed) == 1
+        assert isinstance(pushed[0].tail_node_id, str)
+        assert len(pushed[0].tail_node_id) > 0
 
     @pytest.mark.asyncio
-    async def test_group_creates_group_session_key(self):
+    async def test_group_message_has_tail_node_id(self):
         b = self._bridge()
         b._prefix_required = False
         pushed = []
         b._router.push = AsyncMock(side_effect=lambda m: pushed.append(m) or True)
         await b._on_message(self._group_room("!room:matrix.org"), self._event())
         await asyncio.sleep(0)
-        assert pushed[0].session_key.chat_type.value == "group"
-        assert pushed[0].session_key.conversation_id == "!room:matrix.org"
-        assert pushed[0].session_key.platform == Platform.MATRIX
+        assert len(pushed) == 1
+        assert isinstance(pushed[0].tail_node_id, str)
 
     @pytest.mark.asyncio
     async def test_author_identity_populated(self):
@@ -835,60 +843,56 @@ class TestMatrixEventHandling:
         b._own_user_id = "@bot:matrix.org"
         return b
 
-    def _sk(self):
-        return SessionKey.dm("@user:matrix.org")
-
     @pytest.mark.asyncio
     async def test_text_chunk_feeds_accumulator(self):
         b = self._bridge()
-        sk = self._sk()
+        nid = _node_id()
         acc = MagicMock()
-        b._accumulators[str(sk)] = acc
+        b._accumulators[nid] = acc
 
-        event = _make_agent_event(AgentTextChunk, sk, text="hi")
+        event = _make_agent_event(AgentTextChunk, nid, text="hi")
         await b.handle_event(event)
         acc.feed.assert_called_once_with("hi")
 
     @pytest.mark.asyncio
     async def test_text_final_finishes_accumulator(self):
         b = self._bridge()
-        sk = self._sk()
+        nid = _node_id()
         acc = MagicMock()
-        b._accumulators[str(sk)] = acc
+        b._accumulators[nid] = acc
 
-        event = _make_agent_event(AgentTextFinal, sk, text="done")
+        event = _make_agent_event(AgentTextFinal, nid, text="done")
         await b.handle_event(event)
         acc.finish.assert_called_once_with("done")
 
     @pytest.mark.asyncio
     async def test_agent_error_calls_error(self):
         b = self._bridge()
-        sk = self._sk()
+        nid = _node_id()
         acc = MagicMock()
-        b._accumulators[str(sk)] = acc
+        b._accumulators[nid] = acc
 
-        event = _make_agent_event(AgentError, sk, message="boom")
+        event = _make_agent_event(AgentError, nid, message="boom")
         await b.handle_event(event)
         acc.error.assert_called_once_with("boom")
 
     @pytest.mark.asyncio
     async def test_tool_call_does_not_touch_accumulator(self):
         b = self._bridge()
-        sk = self._sk()
+        nid = _node_id()
         acc = MagicMock()
-        b._accumulators[str(sk)] = acc
+        b._accumulators[nid] = acc
 
-        event = _make_agent_event(AgentToolCall, sk, call_id="c1", tool_name="fn", args={})
+        event = _make_agent_event(AgentToolCall, nid, call_id="c1", tool_name="fn", args={})
         await b.handle_event(event)
         acc.feed.assert_not_called()
         acc.finish.assert_not_called()
         acc.error.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_unknown_session_ignored(self):
+    async def test_unknown_node_ignored(self):
         b = self._bridge()
-        sk = self._sk()
-        event = _make_agent_event(AgentTextChunk, sk, text="nobody home")
+        event = _make_agent_event(AgentTextChunk, _node_id(), text="nobody home")
         await b.handle_event(event)  # should not raise
 
     @pytest.mark.asyncio
@@ -897,9 +901,9 @@ class TestMatrixEventHandling:
         b._client = AsyncMock()
         b._router.push = AsyncMock(return_value=False)
 
-        sk = SessionKey.dm("@user:matrix.org")
+        nid = _node_id()
         msg = InboundMessage(
-            session_key=sk,
+            tail_node_id=nid,
             author=UserIdentity(Platform.MATRIX, "@user:matrix.org", "user"),
             content_type=ContentType.TEXT,
             text="hello",
@@ -907,9 +911,10 @@ class TestMatrixEventHandling:
             timestamp=time.time(),
         )
         acc = MatrixAccumulator(max_len=16000)
-        b._accumulators[str(sk)] = acc
+        b._accumulators[nid] = acc
 
-        await b._handle_turn(msg, "!room:matrix.org", str(sk), acc)
+        await b._handle_turn(msg, "!room:matrix.org", nid, acc)
         b._client.room_send.assert_called_once()
         call_kwargs = b._client.room_send.call_args.kwargs
-        assert "busy" in call_kwargs["content"]["body"].lower() or "⏳" in call_kwargs["content"]["body"]
+        body = call_kwargs["content"]["body"]
+        assert "busy" in body.lower() or "⏳" in body

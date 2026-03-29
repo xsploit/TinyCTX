@@ -57,19 +57,13 @@ from typing import Any
 
 from contracts import (
     InboundMessage, ContentType,
-    SessionKey, UserIdentity, Platform, ChatType,
+    UserIdentity, Platform,
 )
 
 logger = logging.getLogger(__name__)
 
 _CRON_USER_ID = "cron-system"
-
-# Platform.CRON is a dedicated enum value in contracts.py so that
-# gateway._dispatch_reply resolves the platform from author.platform.value
-# (via _dm_platforms populated by push()) without any overwrite risk.
-# Previously Platform.CLI was (ab)used here, causing push() to store "cli"
-# in _dm_platforms and route replies to the wrong handler.
-_CRON_PLATFORM = Platform.CRON.value  # "cron"
+_CRON_PLATFORM = Platform.CRON.value  # "cron" — used for platform handler slot
 
 _CRON_AUTHOR = UserIdentity(
     platform=Platform.CRON,
@@ -107,6 +101,7 @@ class CronJob:
     schedule:         CronSchedule
     message:          str
     state:            CronState  = field(default_factory=CronState)
+    cursor_node_id:   str | None = None    # DB node_id for this job's branch cursor
     delete_after_run: bool       = False
     reset_after_run:  bool       = False   # wipe session context after each run
     created_at_ms:    int        = 0
@@ -462,33 +457,45 @@ class _CronRunner:
         self._save()
         self._arm()
 
+    def _get_or_create_job_cursor(self, job: CronJob, gateway) -> str:
+        """
+        Return the node_id for this job's branch cursor.
+        Creates a new child of the global root on first call and stores it
+        in job.cursor_node_id so subsequent runs resume where the last left off.
+        """
+        if job.cursor_node_id:
+            return job.cursor_node_id
+        from db import ConversationDB
+        workspace = Path(self._agent.config.workspace.path).expanduser().resolve()
+        db   = ConversationDB(workspace / "agent.db")
+        root = db.get_root()
+        node = db.add_node(parent_id=root.id, role="system", content=f"session:cron:{job.id}")
+        job.cursor_node_id = node.id
+        logger.info("[cron] created cursor node %s for job '%s'", node.id, job.name)
+        return node.id
+
     async def _run_job(self, job: CronJob) -> None:
         logger.info("[cron] running job '%s' (%s)", job.name, job.id)
         start_ms = _now_ms()
 
-        # Each job gets its own persistent session key so its AgentLoop
-        # context is isolated from the user's session and from other jobs.
-        job_session = SessionKey.dm(f"cron-{job.id}")
-
         try:
-            # _CRON_AUTHOR uses Platform.CRON so gateway.push() stores
-            # "cron" in _dm_platforms[job_session] — replies are then
-            # dispatched to the "cron" handler, never the "cli" handler.
-            msg = InboundMessage(
-                session_key=job_session,
-                author=_CRON_AUTHOR,
-                content_type=ContentType.TEXT,
-                text=job.message,
-                message_id=f"cron-{job.id}-{int(time.time_ns())}",
-                timestamp=time.time(),
-            )
-
             gateway = getattr(self._agent, "gateway", None)
             if gateway is None:
                 logger.error("[cron] agent.gateway not set — cannot run job '%s'", job.name)
                 job.state.last_status = "error"
                 job.state.last_error  = "agent.gateway not available"
                 return
+
+            node_id = self._get_or_create_job_cursor(job, gateway)
+
+            msg = InboundMessage(
+                tail_node_id=node_id,
+                author=_CRON_AUTHOR,
+                content_type=ContentType.TEXT,
+                text=job.message,
+                message_id=f"cron-{job.id}-{int(time.time_ns())}",
+                timestamp=time.time(),
+            )
 
             parts: list[str] = []
             reply_event = asyncio.Event()
@@ -505,17 +512,19 @@ class _CronRunner:
                     parts.append(event.message)
                     reply_event.set()
 
-            # Install per-job collector into the dedicated cron handler slot.
-            # _job_lock (held by the caller) guarantees only one job is active
-            # at a time, so this slot is never shared between concurrent jobs.
-            gateway._platform_handlers[_CRON_PLATFORM] = _collect
+            # Use per-cursor handler so concurrent jobs don't share a slot.
+            gateway.register_cursor_handler(node_id, _collect)
 
             try:
                 await gateway.push(msg)
                 await asyncio.wait_for(reply_event.wait(), timeout=120)
             finally:
-                # Restore the no-op sentinel so the slot is never empty.
-                gateway._platform_handlers[_CRON_PLATFORM] = _noop_reply_handler
+                gateway.unregister_cursor_handler(node_id)
+
+            # Advance cursor to the latest tail after the turn.
+            lane = gateway._lane_router._lanes.get(node_id)
+            if lane and lane.loop._tail_node_id != node_id:
+                job.cursor_node_id = lane.loop._tail_node_id
 
             reply_text = "".join(parts).strip()
             if reply_text:
@@ -537,12 +546,12 @@ class _CronRunner:
         job.state.last_run_at_ms = start_ms
         job.updated_at_ms        = _now_ms()
 
-        # reset_after_run: wipe session context so the next run starts fresh.
+        # reset_after_run: clear in-memory context (tree stays intact).
         if job.reset_after_run:
             gateway = getattr(self._agent, "gateway", None)
-            if gateway is not None:
-                gateway.reset_session(job_session)
-                logger.debug("[cron] reset session for job '%s'", job.name)
+            if gateway is not None and job.cursor_node_id:
+                gateway.reset_lane(job.cursor_node_id)
+                logger.debug("[cron] reset lane for job '%s'", job.name)
 
         # One-shot cleanup
         if job.schedule.kind == "at":
@@ -596,10 +605,5 @@ def register(agent) -> None:
         return _build_cron_list(store_path)
 
     agent.tool_handler.register_tool(cron_list)
-
-    # Pre-register the no-op sentinel so the gateway never logs
-    # "no handler found" between job runs.
-    if agent.gateway is not None:
-        agent.gateway.register_reply_handler(_CRON_PLATFORM, _noop_reply_handler)
 
     logger.info("[cron] registered — store: %s", store_path)

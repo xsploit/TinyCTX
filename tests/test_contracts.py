@@ -1,69 +1,76 @@
 """
 tests/test_contracts.py
 
-Tests for pure data types in contracts.py — SessionKey, UserIdentity,
-InboundMessage, OutboundReply, ToolCall, ToolResult.
+Tests for pure data types in contracts.py.
+SessionKey and ChatType have been removed (Phase 2 tree refactor).
+InboundMessage now uses tail_node_id (str) as its routing key.
 
 Run with:
     pytest tests/
 """
 import pytest
 from contracts import (
-    SessionKey, UserIdentity, InboundMessage,
+    UserIdentity, InboundMessage,
     AgentTextFinal, AgentError,
     ToolCall, ToolResult,
-    Platform, ContentType, ChatType,
+    Platform, ContentType,
+    content_type_for,
 )
+import time
+import uuid
 
 
 # ---------------------------------------------------------------------------
-# SessionKey
+# Helpers
 # ---------------------------------------------------------------------------
 
-class TestSessionKey:
-    def test_dm_session_key(self):
-        key = SessionKey.dm("user123")
-        assert key.chat_type == ChatType.DM
-        assert key.conversation_id == "user123"
-        assert key.platform is None
+def _node_id():
+    return str(uuid.uuid4())
 
-    def test_group_session_key(self):
-        key = SessionKey.group(Platform.DISCORD, "channel456")
-        assert key.chat_type == ChatType.GROUP
-        assert key.conversation_id == "channel456"
-        assert key.platform == Platform.DISCORD
 
-    def test_group_without_platform_raises(self):
-        with pytest.raises(ValueError, match="platform"):
-            SessionKey(chat_type=ChatType.GROUP, conversation_id="ch1", platform=None)
+def _make_msg(node_id=None, text="hello"):
+    return InboundMessage(
+        tail_node_id=node_id or _node_id(),
+        author=UserIdentity(Platform.CLI, "u1", "alice"),
+        content_type=ContentType.TEXT,
+        text=text,
+        message_id="msg-1",
+        timestamp=time.time(),
+    )
 
-    def test_dm_str(self):
-        key = SessionKey.dm("user123")
-        assert str(key) == "dm:user123"
 
-    def test_group_str(self):
-        key = SessionKey.group(Platform.DISCORD, "ch1")
-        assert str(key) == "group:discord:ch1"
+# ---------------------------------------------------------------------------
+# InboundMessage
+# ---------------------------------------------------------------------------
 
-    def test_dm_keys_are_hashable(self):
-        key = SessionKey.dm("u1")
-        d = {key: "value"}
-        assert d[key] == "value"
-
-    def test_dm_keys_are_equal_with_same_id(self):
-        a = SessionKey.dm("u1")
-        b = SessionKey.dm("u1")
-        assert a == b
-
-    def test_group_keys_differ_by_platform(self):
-        discord = SessionKey.group(Platform.DISCORD, "ch1")
-        matrix  = SessionKey.group(Platform.MATRIX,  "ch1")
-        assert discord != matrix
+class TestInboundMessage:
+    def test_tail_node_id_stored(self):
+        nid = _node_id()
+        msg = _make_msg(node_id=nid)
+        assert msg.tail_node_id == nid
 
     def test_frozen_immutability(self):
-        key = SessionKey.dm("u1")
+        msg = _make_msg()
         with pytest.raises((AttributeError, TypeError)):
-            key.conversation_id = "changed"  # type: ignore
+            msg.text = "changed"  # type: ignore
+
+    def test_trace_id_auto_generated(self):
+        a = _make_msg()
+        b = _make_msg()
+        assert a.trace_id != b.trace_id
+
+    def test_attachments_default_empty_tuple(self):
+        msg = _make_msg()
+        assert msg.attachments == ()
+
+    def test_content_type_text(self):
+        assert content_type_for("hello", False) == ContentType.TEXT
+
+    def test_content_type_mixed(self):
+        assert content_type_for("hello", True) == ContentType.MIXED
+
+    def test_content_type_attachment_only(self):
+        assert content_type_for("", True) == ContentType.ATTACHMENT_ONLY
 
 
 # ---------------------------------------------------------------------------
@@ -117,3 +124,30 @@ class TestPlatform:
         assert Platform("cli") == Platform.CLI
         assert Platform("cron") == Platform.CRON
         assert Platform("api") == Platform.API
+
+
+# ---------------------------------------------------------------------------
+# AgentEvent base fields
+# ---------------------------------------------------------------------------
+
+class TestAgentEventBase:
+    def test_agent_text_final_fields(self):
+        nid = _node_id()
+        ev = AgentTextFinal(
+            tail_node_id=nid,
+            trace_id="t1",
+            reply_to_message_id="m1",
+            text="hello",
+        )
+        assert ev.tail_node_id == nid
+        assert ev.text == "hello"
+
+    def test_agent_error_fields(self):
+        nid = _node_id()
+        ev = AgentError(
+            tail_node_id=nid,
+            trace_id="t1",
+            reply_to_message_id="m1",
+            message="boom",
+        )
+        assert ev.message == "boom"

@@ -21,13 +21,11 @@ Abort:
   inference cycle and inside the LLM stream. If set, yields AgentError and
   exits cleanly.
 
-Tree refactor (Phase 1):
-  AgentLoop now opens agent.db (via ConversationDB) and wires it into Context.
-  _tail_node_id tracks the current branch cursor. On first start for a
-  session, a child of the global root is created as the session's home node.
-  All context.add() calls write immediately to the DB; no end-of-turn flush.
-  _flush_history, _restore_history, _load_latest_version, and next_session
-  are deleted. reset() clears in-memory state only — it does not touch the DB.
+Tree refactor (Phase 2):
+  AgentLoop is initialised with tail_node_id (str cursor) instead of
+  session_key. The cursor points at the DB branch this agent is running on.
+  All context.add() calls write immediately to the DB; cursor is kept in sync
+  on disk after every node write.
 
 Model pool:
   All named chat models from config.models are pre-instantiated.
@@ -51,7 +49,7 @@ from typing import AsyncIterator
 from contracts import (
     InboundMessage, AgentEvent,
     AgentThinkingChunk, AgentTextChunk, AgentTextFinal, AgentToolCall, AgentToolResult, AgentError,
-    ToolCall, ToolResult, SessionKey,
+    ToolCall, ToolResult,
 )
 from context import Context, HistoryEntry, HOOK_PRE_ASSEMBLE_ASYNC
 from config import Config, ModelConfig
@@ -83,16 +81,17 @@ def _build_llm(cfg: ModelConfig) -> LLM:
 
 
 class AgentLoop:
-    def __init__(self, session_key: SessionKey, config: Config, version_override: int | None = None) -> None:
-        self.session_key   = session_key
+    def __init__(self, tail_node_id: str, config: Config) -> None:
+        self.tail_node_id  = tail_node_id  # cursor — the DB node this agent runs from
         self.config        = config
         self.context       = Context(token_limit=config.context)
         self.tool_handler  = ToolCallHandler()
         self._turn_count   = 0
         self.gateway       = None  # set by Lane after construction
 
-        # Tree refactor: open DB and restore cursor
-        self._db, self._tail_node_id = self._init_db()
+        # Open the shared agent.db and wire the cursor in.
+        self._db           = self._open_db()
+        self._tail_node_id = tail_node_id
         self.context.set_db(self._db)
         self.context.set_tail(self._tail_node_id)
         self.context.set_cursor_callback(self._on_context_tail_advance)
@@ -107,75 +106,24 @@ class AgentLoop:
         self._load_modules()
 
     # ------------------------------------------------------------------
-    # DB initialisation
+    # DB
     # ------------------------------------------------------------------
 
-    def _init_db(self) -> tuple[ConversationDB, str]:
-        """
-        Open (or create) agent.db in the workspace. Return (db, tail_node_id).
-
-        The tail_node_id is persisted in a small cursor file alongside the DB
-        so the session resumes where it left off on restart. The cursor file
-        is named after the session_key to allow multiple sessions to share one
-        DB (as they will once Phase 2 bridges are migrated).
-
-        On first start for this session_key, a child of the global root is
-        created as the session's initial node and becomes the cursor.
-        """
+    def _open_db(self) -> ConversationDB:
+        """Open (or create) agent.db in the workspace directory."""
         workspace = Path(self.config.workspace.path).expanduser().resolve()
         workspace.mkdir(parents=True, exist_ok=True)
-        db_path = workspace / "agent.db"
-
-        db = ConversationDB(db_path)
-
-        # Cursor file: workspace/cursors/<safe_key>
-        cursors_dir = workspace / "cursors"
-        cursors_dir.mkdir(parents=True, exist_ok=True)
-        safe_key    = str(self.session_key).replace(":", "_")
-        cursor_file = cursors_dir / safe_key
-
-        if cursor_file.exists():
-            node_id = cursor_file.read_text(encoding="utf-8").strip()
-            # Verify the node still exists in the DB
-            if db.get_node(node_id) is not None:
-                logger.info("[%s] resumed from cursor %s", self.session_key, node_id)
-                return db, node_id
-            else:
-                logger.warning(
-                    "[%s] cursor %s not found in DB — creating fresh node",
-                    self.session_key, node_id,
-                )
-
-        # Fresh start: attach to global root
-        root   = db.get_root()
-        node   = db.add_node(parent_id=root.id, role="system", content=f"session:{self.session_key}")
-        cursor_file.write_text(node.id, encoding="utf-8")
-        logger.info("[%s] created session node %s", self.session_key, node.id)
-        return db, node.id
-
-    def _save_cursor(self) -> None:
-        """Persist the current tail_node_id to the cursor file."""
-        if self._tail_node_id is None:
-            return
-        workspace   = Path(self.config.workspace.path).expanduser().resolve()
-        cursors_dir = workspace / "cursors"
-        cursors_dir.mkdir(parents=True, exist_ok=True)
-        safe_key    = str(self.session_key).replace(":", "_")
-        cursor_file = cursors_dir / safe_key
-        try:
-            cursor_file.write_text(self._tail_node_id, encoding="utf-8")
-        except Exception as exc:
-            logger.warning("[%s] failed to save cursor: %s", self.session_key, exc)
+        return ConversationDB(workspace / "agent.db")
 
     def _on_context_tail_advance(self) -> None:
         """
         Called by Context.add() each time the tail node advances.
-        Keeps _tail_node_id and the on-disk cursor file in sync immediately,
-        so a second AgentLoop for the same session always resumes from the
-        latest node even if run() never completed.
+        Keeps _tail_node_id in sync with the context so callers reading
+        agent._tail_node_id always see the latest cursor.
         """
         self._tail_node_id = self.context.tail_node_id
-        self._save_cursor()
+        # Propagate the updated cursor back to the public attribute.
+        self.tail_node_id  = self._tail_node_id
 
     # ------------------------------------------------------------------
     # Public model accessor (for modules)
@@ -234,7 +182,7 @@ class AgentLoop:
         msg=<msg> — normal turn: add user message to context, then generate.
         """
         self._turn_count += 1
-        logger.debug("[%s] turn %d (synthetic=%s)", self.session_key, self._turn_count, msg is None)
+        logger.debug("[cursor=%s] turn %d (synthetic=%s)", self._tail_node_id, self._turn_count, msg is None)
 
         if msg is not None:
             trace_id = msg.trace_id
@@ -244,7 +192,7 @@ class AgentLoop:
             msg_id   = "synthetic"
 
         ev = dict(
-            session_key=self.session_key,
+            tail_node_id=self._tail_node_id,
             trace_id=trace_id,
             reply_to_message_id=msg_id,
         )
@@ -272,7 +220,7 @@ class AgentLoop:
 
             # Abort check between cycles
             if abort_event and abort_event.is_set():
-                logger.info("[%s] aborted before cycle %d", self.session_key, cycle)
+                logger.info("[%s] aborted before cycle %d", self._tail_node_id, cycle)
                 yield AgentError(message="[generation aborted]", **ev)
                 return
 
@@ -287,13 +235,13 @@ class AgentLoop:
             token_pct   = tokens_used / token_limit if token_limit else 0
             if token_pct >= 0.95:
                 logger.warning(
-                    "[%s] context at %.0f%% of token budget (%d/%d) — consider compaction",
-                    self.session_key, token_pct * 100, tokens_used, token_limit,
+                    "[cursor=%s] context at %.0f%% of token budget (%d/%d) — consider compaction",
+                    self._tail_node_id, token_pct * 100, tokens_used, token_limit,
                 )
             elif token_pct >= 0.80:
                 logger.info(
-                    "[%s] context at %.0f%% of token budget (%d/%d)",
-                    self.session_key, token_pct * 100, tokens_used, token_limit,
+                    "[cursor=%s] context at %.0f%% of token budget (%d/%d)",
+                    self._tail_node_id, token_pct * 100, tokens_used, token_limit,
                 )
 
             # Stage 3: Inference — walk primary → fallback chain
@@ -315,7 +263,7 @@ class AgentLoop:
 
                 async for llm_event in llm.stream(messages, tools=tools):
                     if abort_event and abort_event.is_set():
-                        logger.info("[%s] aborted mid-stream", self.session_key)
+                        logger.info("[%s] aborted mid-stream", self._tail_node_id)
                         yield AgentError(message="[generation aborted]", **ev)
                         return
 
@@ -347,8 +295,8 @@ class AgentLoop:
                 if not error:
                     if model_name != self.config.llm.primary:
                         logger.info(
-                            "[%s] inference succeeded on fallback model '%s'",
-                            self.session_key, model_name,
+                            "[cursor=%s] inference succeeded on fallback model '%s'",
+                            self._tail_node_id, model_name,
                         )
                     break
 
@@ -358,16 +306,15 @@ class AgentLoop:
                 )
                 if should_fallback and model_name != model_chain[-1]:
                     logger.warning(
-                        "[%s] model '%s' failed (%s) — trying next fallback",
-                        self.session_key, model_name, error,
+                        "[cursor=%s] model '%s' failed (%s) — trying next fallback",
+                        self._tail_node_id, model_name, error,
                     )
                     continue
                 break
 
             if error:
-                logger.error("[%s] LLM error (all models exhausted): %s", self.session_key, error)
+                logger.error("[cursor=%s] LLM error (all models exhausted): %s", self._tail_node_id, error)
                 yield AgentError(message=f"[LLM error: {error}]", **ev)
-                self._save_cursor()
                 return
 
             response_text = "".join(text_chunks)
@@ -381,7 +328,7 @@ class AgentLoop:
                 break
 
             # Stages 4 & 5: Tool execution + result backfill
-            logger.debug("[%s] cycle %d — %d tool call(s)", self.session_key, cycle, len(tool_calls))
+            logger.debug("[%s] cycle %d — %d tool call(s)", self._tail_node_id, cycle, len(tool_calls))
             for tc in tool_calls:
                 yield AgentToolCall(call_id=tc.call_id, tool_name=tc.tool_name, args=tc.args, **ev)
                 result = await self._execute_tool(tc)
@@ -395,12 +342,8 @@ class AgentLoop:
                 )
 
         else:
-            logger.warning("[%s] hit max_tool_cycles (%d)", self.session_key, max_cycles)
+            logger.warning("[cursor=%s] hit max_tool_cycles (%d)", self._tail_node_id, max_cycles)
             final_text = final_text or "[Tool cycle limit reached.]"
-
-        # Sync cursor so the DB tail_node_id is persisted for next restart
-        self._tail_node_id = self.context.tail_node_id
-        self._save_cursor()
 
         yield AgentTextFinal(text=final_text if not streaming_active else "", **ev)
 
@@ -430,10 +373,7 @@ class AgentLoop:
         Clear in-memory context. Does NOT touch agent.db — the tree is
         permanent. The cursor stays at the current tail; the agent will
         continue to see prior history when it next assembles context.
-
-        To start a genuinely fresh branch, advance the cursor to a new
-        child node (that is Phase 2 bridge work).
         """
         self.context.clear()
         self._turn_count = 0
-        logger.info("[%s] reset (in-memory only — tree intact)", self.session_key)
+        logger.info("[cursor=%s] reset (in-memory only — tree intact)", self._tail_node_id)

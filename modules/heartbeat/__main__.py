@@ -31,7 +31,7 @@ from datetime import datetime, time as dtime
 
 from contracts import (
     InboundMessage, ContentType,
-    SessionKey, UserIdentity, Platform, ChatType,
+    UserIdentity, Platform,
 )
 
 logger = logging.getLogger(__name__)
@@ -43,34 +43,8 @@ _HEARTBEAT_AUTHOR  = UserIdentity(
     user_id=_HEARTBEAT_USER_ID,
     username="heartbeat",
 )
-_HEARTBEAT_SESSION = SessionKey(
-    chat_type=ChatType.DM,
-    conversation_id=_HEARTBEAT_USER_ID,
-)
 _TOKEN = "HEARTBEAT_OK"
 
-
-
-def _resolve_session(session_cfg: str, main_key: "SessionKey") -> "SessionKey":
-    """
-    Resolve a session config value to a SessionKey.
-      "main"              → the agent's own session key (default)
-      "dm:<id>"           → SessionKey.dm(id)
-      "group:<plat>:<id>" → SessionKey.group(Platform.<plat>, id)
-    Any unrecognised string falls back to main.
-    """
-    if not session_cfg or session_cfg == "main":
-        return main_key
-    parts = session_cfg.split(":", 2)
-    try:
-        if parts[0] == "dm" and len(parts) == 2:
-            return SessionKey.dm(parts[1])
-        if parts[0] == "group" and len(parts) == 3:
-            return SessionKey.group(Platform(parts[1]), parts[2])
-    except Exception:
-        pass
-    logger.warning("[heartbeat] unrecognised session config '%s' — using main session", session_cfg)
-    return main_key
 
 
 def register(agent) -> None:
@@ -90,29 +64,23 @@ def register(agent) -> None:
     ack_max             = int(cfg.get("ack_max_chars", 300))
     max_continuations   = int(cfg.get("max_continuations", 5))
     active_hours        = cfg.get("active_hours", None)
-
-    # Resolve session key. "main" (default) uses the agent's own session.
-    # Any other string is parsed as "dm:<id>" or "group:<platform>:<id>".
-    session_cfg = cfg.get("session", "main")
-    session_key = _resolve_session(session_cfg, agent.session_key)
-
-    interval_secs = every_minutes * 60
+    interval_secs       = every_minutes * 60
 
     task = asyncio.get_event_loop().create_task(
         _heartbeat_loop(
             agent, interval_secs,
             prompt, continuation_prompt,
             ack_max, max_continuations,
-            active_hours, session_key,
+            active_hours,
         ),
-        name=f"heartbeat:{agent.session_key}",
+        name=f"heartbeat:{agent.tail_node_id}",
     )
 
     _patch_reset(agent, task)
 
     logger.info(
-        "[heartbeat] started — every %dm, session=%s, active_hours=%s",
-        every_minutes, session_key, active_hours,
+        "[heartbeat] started — every %dm, cursor=%s, active_hours=%s",
+        every_minutes, agent.tail_node_id, active_hours,
     )
 
 
@@ -128,7 +96,6 @@ async def _heartbeat_loop(
     ack_max: int,
     max_continuations: int,
     active_hours: dict | None,
-    session_key: "SessionKey",
 ) -> None:
     # Wait one full interval before the first tick so startup isn't noisy.
     await asyncio.sleep(interval_secs)
@@ -138,7 +105,7 @@ async def _heartbeat_loop(
             if _in_active_window(active_hours):
                 await _tick(
                     agent, prompt, continuation_prompt,
-                    ack_max, max_continuations, session_key,
+                    ack_max, max_continuations,
                 )
             else:
                 logger.debug("[heartbeat] outside active hours — skipping tick")
@@ -160,7 +127,6 @@ async def _tick(
     continuation_prompt: str,
     ack_max: int,
     max_continuations: int,
-    session_key: "SessionKey",
 ) -> None:
     """
     Run the initial heartbeat turn. If the agent doesn't reply HEARTBEAT_OK,
@@ -169,7 +135,7 @@ async def _tick(
     logger.debug("[heartbeat] tick start")
 
     # Initial turn
-    reply = await _run_turn(agent, prompt, session_key)
+    reply = await _run_turn(agent, prompt)
     is_ok, alert = _parse_reply(reply, ack_max)
 
     if is_ok:
@@ -181,7 +147,7 @@ async def _tick(
 
     for turn in range(1, max_continuations + 1):
         logger.debug("[heartbeat] continuation turn %d/%d", turn, max_continuations)
-        reply = await _run_turn(agent, continuation_prompt, session_key)
+        reply = await _run_turn(agent, continuation_prompt)
         is_ok, alert = _parse_reply(reply, ack_max)
 
         if is_ok:
@@ -196,12 +162,14 @@ async def _tick(
     )
 
 
-async def _run_turn(agent, text: str, session_key: "SessionKey") -> str:
-    """Inject a synthetic message and collect the full reply."""
+async def _run_turn(agent, text: str) -> str:
+    """Inject a synthetic message directly into the agent and collect the full reply."""
     from contracts import AgentTextChunk, AgentTextFinal, AgentError
 
+    # The heartbeat runs on the same agent instance, so we use its current
+    # tail_node_id as the cursor — no separate session needed.
     msg = InboundMessage(
-        session_key=session_key,
+        tail_node_id=agent.tail_node_id,
         author=_HEARTBEAT_AUTHOR,
         content_type=ContentType.TEXT,
         text=text,

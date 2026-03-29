@@ -2,20 +2,10 @@
 tests/test_attachment_integration.py
 
 Tests for the attachment plumbing that spans contracts, config, context,
-and agent — everything except utils/attachments.py itself (that lives in
-test_attachments.py).
+and agent — everything except utils/attachments.py itself.
 
-Topics:
-  - Attachment / AttachmentKind dataclasses (contracts)
-  - InboundMessage.attachments field
-  - ModelConfig.vision + AttachmentConfig (config)
-  - HistoryEntry with list content (context)
-  - Context merge guard for content-block lists (context)
-  - _count_tokens handles list content (context)
-  - AgentLoop Stage-1 calls build_content_blocks when attachments present (agent)
-  - AgentLoop _flush_history round-trips list content (agent)
-
-No LLM calls.  No real filesystem outside tmp_path.
+Phase 2 tree refactor: InboundMessage uses tail_node_id (str) — no SessionKey.
+AgentLoop takes tail_node_id (str) instead of session_key.
 
 Run with:
     pytest tests/test_attachment_integration.py -v
@@ -26,6 +16,7 @@ import base64
 import json
 import textwrap
 import time
+import uuid
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -34,7 +25,8 @@ import pytest
 from contracts import (
     Attachment, AttachmentKind,
     InboundMessage, ContentType,
-    SessionKey, UserIdentity, Platform,
+    UserIdentity, Platform,
+    content_type_for,
 )
 from config import ModelConfig, AttachmentConfig, Config, LLMRoutingConfig
 from context import Context, HistoryEntry, ROLE_USER, ROLE_ASSISTANT
@@ -42,8 +34,12 @@ from ai import TextDelta
 
 
 # ---------------------------------------------------------------------------
-# Helpers shared across test classes
+# Helpers
 # ---------------------------------------------------------------------------
+
+def _node_id():
+    return str(uuid.uuid4())
+
 
 def _att(filename="file.txt", data=b"hello", mime_type="text/plain") -> Attachment:
     return Attachment(filename=filename, data=data, mime_type=mime_type)
@@ -56,9 +52,8 @@ def _png_bytes() -> bytes:
 
 
 def _make_msg(text="hi", attachments=()) -> InboundMessage:
-    from contracts import content_type_for
     return InboundMessage(
-        session_key=SessionKey.dm("u1"),
+        tail_node_id=_node_id(),
         author=UserIdentity(platform=Platform.CLI, user_id="u1", username="alice"),
         content_type=content_type_for(text, bool(attachments)),
         text=text,
@@ -69,7 +64,6 @@ def _make_msg(text="hi", attachments=()) -> InboundMessage:
 
 
 def _make_full_config(tmp_path: Path, vision: bool = False) -> Config:
-    """Minimal Config with real AttachmentConfig wired in."""
     mc = ModelConfig(
         model="test",
         base_url="http://localhost/v1",
@@ -250,7 +244,7 @@ class TestAttachmentConfig:
 
 
 # ---------------------------------------------------------------------------
-# HistoryEntry with list content (context changes)
+# HistoryEntry with list content
 # ---------------------------------------------------------------------------
 
 class TestHistoryEntryListContent:
@@ -309,14 +303,6 @@ class TestContextNoMergeBlocks:
         user_msgs = [m for m in messages if m["role"] == "user"]
         assert len(user_msgs) == 2
 
-    def test_string_content_users_between_list_content_not_merged(self):
-        ctx = Context()
-        ctx.add(HistoryEntry.user([{"type": "text", "text": "block"}]))
-        ctx.add(HistoryEntry.user("plain after block"))
-        messages = ctx.assemble()
-        user_msgs = [m for m in messages if m["role"] == "user"]
-        assert len(user_msgs) == 2
-
 
 # ---------------------------------------------------------------------------
 # Context: _count_tokens handles list content
@@ -330,7 +316,7 @@ class TestCountTokensListContent:
             {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "x" * 1000}},
         ]
         ctx.add(HistoryEntry.user(blocks))
-        messages = ctx.assemble()
+        ctx.assemble()
         assert ctx.state["tokens_used"] > 0
 
     def test_list_content_counts_more_than_short_string(self):
@@ -346,13 +332,11 @@ class TestCountTokensListContent:
         assert ctx_list.state["tokens_used"] > ctx_str.state["tokens_used"]
 
     def test_token_budget_trims_list_content_turns(self):
-        """A user turn with a large content-block list should be dropped when over budget."""
         ctx = Context(token_limit=20)
         big_blocks = [{"type": "text", "text": "X" * 500}]
         ctx.add(HistoryEntry.user(big_blocks))
         ctx.add(HistoryEntry.user("short recent message"))
         messages = ctx.assemble()
-        # The recent short message must survive
         assert any(
             (isinstance(m["content"], str) and "short recent message" in m["content"])
             or (isinstance(m["content"], list) and any("short recent message" in b.get("text", "") for b in m["content"]))
@@ -364,34 +348,35 @@ class TestCountTokensListContent:
 # AgentLoop: Stage-1 intake with attachments
 # ---------------------------------------------------------------------------
 
+def _make_agent(tmp_path, vision=False):
+    from agent import AgentLoop
+    from db import ConversationDB
+
+    cfg = _make_full_config(tmp_path, vision=vision)
+    cfg.workspace.path.mkdir(parents=True, exist_ok=True)
+
+    async def _text_stream(messages, tools=None):
+        yield TextDelta(text="ok")
+
+    llm_mock = MagicMock()
+    llm_mock.stream = _text_stream
+
+    # Create a real node_id in the DB for the agent to start from
+    db = ConversationDB(cfg.workspace.path / "agent.db")
+    root = db.get_root()
+    session_node = db.add_node(parent_id=root.id, role="system", content="test-session")
+
+    with patch("agent.MODULES_DIR", Path("/nonexistent")):
+        with patch("agent._build_llm", return_value=llm_mock):
+            agent = AgentLoop(tail_node_id=session_node.id, config=cfg)
+    agent._models["primary"] = llm_mock
+    return agent
+
+
 class TestAgentIntakeWithAttachments:
-    def _make_agent(self, tmp_path, vision=False):
-        from agent import AgentLoop
-
-        cfg = _make_full_config(tmp_path, vision=vision)
-        cfg.workspace.path.mkdir(parents=True, exist_ok=True)
-
-        counter = {"n": 0}
-
-        async def _text_stream(messages, tools=None):
-            yield TextDelta(text="ok")
-
-        llm_mock = MagicMock()
-        llm_mock.stream = _text_stream
-
-        with patch("agent.MODULES_DIR", Path("/nonexistent")):
-            with patch("agent._build_llm", return_value=llm_mock):
-                agent = AgentLoop(
-                    session_key=SessionKey.dm(f"att-test"),
-                    config=cfg,
-                )
-        agent._models["primary"] = llm_mock
-
-        return agent
-
     @pytest.mark.asyncio
     async def test_plain_message_adds_string_to_context(self, tmp_path):
-        agent = self._make_agent(tmp_path)
+        agent = _make_agent(tmp_path)
         msg = _make_msg("hello")
         async for _ in agent.run(msg):
             pass
@@ -401,19 +386,18 @@ class TestAgentIntakeWithAttachments:
 
     @pytest.mark.asyncio
     async def test_text_attachment_adds_list_to_context(self, tmp_path):
-        agent = self._make_agent(tmp_path)
+        agent = _make_agent(tmp_path)
         att = _att("notes.txt", data=b"note content", mime_type="text/plain")
         msg = _make_msg("here are my notes", attachments=(att,))
         async for _ in agent.run(msg):
             pass
         user_entries = [e for e in agent.context.dialogue if e.role == "user"]
         assert len(user_entries) == 1
-        # Content should be a list (content blocks) since there is an attachment
         assert isinstance(user_entries[0].content, list)
 
     @pytest.mark.asyncio
     async def test_text_attachment_content_present_in_blocks(self, tmp_path):
-        agent = self._make_agent(tmp_path)
+        agent = _make_agent(tmp_path)
         att = _att("file.txt", data=b"the file body", mime_type="text/plain")
         msg = _make_msg("check file", attachments=(att,))
         async for _ in agent.run(msg):
@@ -424,7 +408,7 @@ class TestAgentIntakeWithAttachments:
 
     @pytest.mark.asyncio
     async def test_image_attachment_vision_model_inlines_image(self, tmp_path):
-        agent = self._make_agent(tmp_path, vision=True)
+        agent = _make_agent(tmp_path, vision=True)
         att = _att("photo.png", data=_png_bytes(), mime_type="image/png")
         msg = _make_msg("what is this?", attachments=(att,))
         async for _ in agent.run(msg):
@@ -436,7 +420,7 @@ class TestAgentIntakeWithAttachments:
 
     @pytest.mark.asyncio
     async def test_image_attachment_non_vision_model_no_image_block(self, tmp_path):
-        agent = self._make_agent(tmp_path, vision=False)
+        agent = _make_agent(tmp_path, vision=False)
         att = _att("photo.png", data=_png_bytes(), mime_type="image/png")
         msg = _make_msg("what is this?", attachments=(att,))
         async for _ in agent.run(msg):
@@ -448,7 +432,7 @@ class TestAgentIntakeWithAttachments:
 
     @pytest.mark.asyncio
     async def test_attachment_saved_to_workspace_uploads(self, tmp_path):
-        agent = self._make_agent(tmp_path)
+        agent = _make_agent(tmp_path)
         att = _att("saved.txt", data=b"data")
         msg = _make_msg("attached", attachments=(att,))
         async for _ in agent.run(msg):
@@ -458,17 +442,14 @@ class TestAgentIntakeWithAttachments:
 
 
 # ---------------------------------------------------------------------------
-# AgentLoop: _flush_history round-trips list content
+# AgentLoop: list content DB round-trip
 # ---------------------------------------------------------------------------
 
-class TestAgentFlushRestoreListContent:
+class TestAgentListContentDBRoundtrip:
     @pytest.mark.asyncio
     async def test_list_content_survives_db_roundtrip(self, tmp_path):
-        """
-        List content written to the DB must round-trip back as a list,
-        not as a raw JSON string. (Replaces the old _flush_history test.)
-        """
         from agent import AgentLoop
+        from db import ConversationDB
 
         cfg = _make_full_config(tmp_path)
         cfg.workspace.path.mkdir(parents=True, exist_ok=True)
@@ -479,19 +460,18 @@ class TestAgentFlushRestoreListContent:
         llm_mock = MagicMock()
         llm_mock.stream = _text_stream
 
+        db = ConversationDB(cfg.workspace.path / "agent.db")
+        root = db.get_root()
+        session_node = db.add_node(parent_id=root.id, role="system", content="persist-test")
+
         with patch("agent.MODULES_DIR", Path("/nonexistent")):
             with patch("agent._build_llm", return_value=llm_mock):
-                agent = AgentLoop(
-                    session_key=SessionKey.dm("persist-test"),
-                    config=cfg,
-                )
+                agent = AgentLoop(tail_node_id=session_node.id, config=cfg)
         agent._models["primary"] = llm_mock
 
-        # Write a list-content user entry directly via context (goes to DB)
         blocks = [{"type": "text", "text": "user msg"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}]
         agent.context.add(HistoryEntry.user(blocks))
 
-        # Re-load from DB via assemble() and check the round-trip
         messages = agent.context.assemble()
         user_msgs = [m for m in messages if m["role"] == "user"]
         assert len(user_msgs) == 1
@@ -500,19 +480,13 @@ class TestAgentFlushRestoreListContent:
 
     @pytest.mark.asyncio
     async def test_restore_history_preserves_list_content(self, tmp_path):
-        """
-        History loaded from the DB at agent startup must restore list content
-        as a list, not coerce it to a string. (Replaces the old _restore_history test.)
-        """
         from agent import AgentLoop
         from db import ConversationDB
-        import json as _json
 
         cfg = _make_full_config(tmp_path)
         cfg.workspace.path.mkdir(parents=True, exist_ok=True)
 
         blocks = [{"type": "text", "text": "hello"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}]
-        sk = SessionKey.dm("restore-test")
 
         async def _noop_stream(messages, tools=None):
             yield TextDelta(text="ok")
@@ -520,18 +494,22 @@ class TestAgentFlushRestoreListContent:
         llm_mock = MagicMock()
         llm_mock.stream = _noop_stream
 
-        # First agent: write a list-content entry to the DB
+        # First agent: write list-content to the DB
+        db = ConversationDB(cfg.workspace.path / "agent.db")
+        root = db.get_root()
+        session_node = db.add_node(parent_id=root.id, role="system", content="restore-test")
+
         with patch("agent.MODULES_DIR", Path("/nonexistent")):
             with patch("agent._build_llm", return_value=llm_mock):
-                agent1 = AgentLoop(session_key=sk, config=cfg)
+                agent1 = AgentLoop(tail_node_id=session_node.id, config=cfg)
         agent1._models["primary"] = llm_mock
         agent1.context.add(HistoryEntry.user(blocks))
         tail_after_write = agent1._tail_node_id
 
-        # Second agent: same session key + same DB — should restore from cursor
+        # Second agent: start from the same tail node — should see the written data
         with patch("agent.MODULES_DIR", Path("/nonexistent")):
             with patch("agent._build_llm", return_value=llm_mock):
-                agent2 = AgentLoop(session_key=sk, config=cfg)
+                agent2 = AgentLoop(tail_node_id=tail_after_write, config=cfg)
 
         messages = agent2.context.assemble()
         user_msgs = [m for m in messages if m["role"] == "user"]

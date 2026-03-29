@@ -19,7 +19,7 @@ from rich.live import Live
 
 from contracts import (
     Platform, ContentType,
-    SessionKey, UserIdentity, InboundMessage,
+    UserIdentity, InboundMessage,
     AgentThinkingChunk, AgentTextChunk, AgentTextFinal, AgentToolCall, AgentToolResult, AgentError,
 )
 
@@ -76,6 +76,7 @@ class CLIBridge:
 
         self._current_content = ""
         self._live: Live | None = None
+        self._cursor: str | None = None  # node_id for this CLI session
 
     def _get_live_render(self, content: str, is_thinking: bool = False) -> Group:
         """Helper to create a renderable group for the Live display."""
@@ -168,12 +169,13 @@ class CLIBridge:
 
     async def run(self) -> None:
         self._gateway.register_platform_handler(Platform.CLI.value, self.handle_event)
+        self._cursor = _load_cli_cursor(self._gateway)
 
         banner_text = Text()
         banner_text.append(pyfiglet.figlet_format(self._theme.t("name"), font="slant"), style=self._theme.c("banner"))
         banner_text.append(f"  {self._theme.t('tagline')}", style=self._theme.c("tagline"))
         self._console.print(Panel(banner_text, border_style=self._theme.c("border"), padding=(0, 2)))
-        self._console.print(f"[{self._theme.c('border')}]  type a message · /reset · /next · exit[/{self._theme.c('border')}]\n")
+        self._console.print(f"[{self._theme.c('border')}]  type a message · /reset · exit[/{self._theme.c('border')}]\n")
 
         c = self._theme.c
         t = self._theme.t
@@ -193,21 +195,24 @@ class CLIBridge:
 
                 if text.startswith("/"):
                     if text.lower() == "/reset":
-                        self._gateway.reset_session(CLI_SESSION)
+                        self._gateway.reset_lane(self._cursor)
                         self._console.print(f"[{c('reset')}]  ↺  context cleared[/{c('reset')}]")
-                    elif text.lower() == "/next":
-                        self._gateway.next_session(CLI_SESSION)
-                        self._console.print(f"[{c('reset')}]  ↷  new session[/{c('reset')}]")
                     continue
 
                 msg = InboundMessage(
-                    session_key=CLI_SESSION, author=CLI_USER,
-                    content_type=ContentType.TEXT, text=text,
-                    message_id=str(time.time_ns()), timestamp=time.time(),
+                    tail_node_id=self._cursor,
+                    author=CLI_USER,
+                    content_type=ContentType.TEXT,
+                    text=text,
+                    message_id=str(time.time_ns()),
+                    timestamp=time.time(),
                 )
                 self._reply_done.clear()
                 await self._gateway.push(msg)
                 await self._reply_done.wait()
+                # After each turn the agent may have advanced the cursor;
+                # read the updated cursor back from the lane.
+                self._cursor = _get_lane_cursor(self._gateway, self._cursor)
 
             except (KeyboardInterrupt, EOFError):
                 break
@@ -215,10 +220,55 @@ class CLIBridge:
         self._console.print(f"[{c('reset')}]{t('bye_message')}[/{c('reset')}]")
 
 
-# Boilerplate Constants
+# CLI user identity
 CLI_USER_ID = "cli-owner"
 CLI_USER = UserIdentity(platform=Platform.CLI, user_id=CLI_USER_ID, username="you")
-CLI_SESSION = SessionKey.dm(CLI_USER_ID)
+
+
+def _load_cli_cursor(gateway) -> str:
+    """
+    Load (or create) the persistent CLI cursor from workspace/cursors/cli.
+    On first run, attaches to the DB global root and persists the new node_id.
+    """
+    from db import ConversationDB
+    workspace   = Path(gateway._config.workspace.path).expanduser().resolve()
+    workspace.mkdir(parents=True, exist_ok=True)
+    cursors_dir = workspace / "cursors"
+    cursors_dir.mkdir(parents=True, exist_ok=True)
+    cursor_file = cursors_dir / "cli"
+    db_path     = workspace / "agent.db"
+    db          = ConversationDB(db_path)
+
+    if cursor_file.exists():
+        node_id = cursor_file.read_text(encoding="utf-8").strip()
+        if db.get_node(node_id) is not None:
+            return node_id
+
+    root    = db.get_root()
+    node    = db.add_node(parent_id=root.id, role="system", content="session:cli")
+    cursor_file.write_text(node.id, encoding="utf-8")
+    return node.id
+
+
+def _get_lane_cursor(gateway, current_node_id: str) -> str:
+    """
+    After a turn completes, read the agent's latest tail_node_id from the lane
+    and persist it to the cursor file so the next run resumes correctly.
+    """
+    lane = gateway._lane_router._lanes.get(current_node_id)
+    if lane is None:
+        return current_node_id
+    new_node_id = lane.loop._tail_node_id
+    if not new_node_id or new_node_id == current_node_id:
+        return current_node_id
+    # Persist updated cursor
+    workspace   = Path(gateway._config.workspace.path).expanduser().resolve()
+    cursor_file = workspace / "cursors" / "cli"
+    try:
+        cursor_file.write_text(new_node_id, encoding="utf-8")
+    except Exception:
+        pass
+    return new_node_id
 
 
 # --- Loader entry point ---
