@@ -1,5 +1,7 @@
 # secrets / local config
 config.yaml
+config.yaml.bak
+
 
 # python
 __pycache__/
