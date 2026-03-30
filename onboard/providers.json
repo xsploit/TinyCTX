@@ -1,7 +1,11 @@
 {
   "Ollama": "http://localhost:11434/v1",
   "LMStudio": "http://localhost:1234/v1",
+  "vLLM": "http://localhost:8000/v1",
+  "llama-cpp": "http://localhost:8000/v1",
   "OpenAI": "https://api.openai.com/v1",
+  "Gemini": "https://generativelanguage.googleapis.com/v1beta/openai/",
+  "Anthropic": "https://api.anthropic.com/v1/",
   "XAI": "https://api.x.ai/v1",
   "Groq": "https://api.groq.com/openai/v1",
   "Mistral": "https://api.mistral.ai/v1",
@@ -19,5 +23,7 @@
   "Hyperbolic": "https://api.hyperbolic.xyz/v1",
   "LLMAPI": "https://api.llmapi.ai/v1",
   "302ai": "https://api.302.ai/v1",
-  "AIHubMix": "https://api.aihubmix.com/v1"
+  "AIHubMix": "https://api.aihubmix.com/v1",
+  "HuggingFace": "https://api-inference.huggingface.co/v1",
+  "SiliconFlow": "https://api.siliconflow.cn/v1"
 }
