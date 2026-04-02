@@ -202,25 +202,21 @@ def step_bridges(mode: Mode) -> dict[str, Any]:
 
 def _setup_discord_bridge(bridges: dict, mode: Mode) -> None:
     import os
-    if mode == "quickstart":
-        export_cmd = "set" if sys.platform == "win32" else "export"
-        c.print()
-        c.print(Panel(
-            "  1. Go to [bold]discord.com/developers/applications[/]\n"
-            "  2. Click [bold]New Application[/], give it a name\n"
-            "  3. Go to [bold]Bot[/] → click [bold]Add Bot[/]\n"
-            "  4. Under [bold]Privileged Gateway Intents[/], turn on:\n"
-            "       • Message Content Intent\n"
-            "       • Server Members Intent\n"
-            "  5. Click [bold]Reset Token[/] and copy it\n"
-            f"  6. Run:  [bold]{export_cmd} DISCORD_BOT_TOKEN=your-token[/]",
-            title="[bold cyan]Discord Bot Setup[/]",
-            border_style="cyan",
-        ))
-    else:
-        c.print("\n[bold]Discord[/] — set [bold]DISCORD_BOT_TOKEN[/] in your environment.")
-        c.print("  Bot setup: https://discord.com/developers/applications")
-        c.print("  Required intents: Message Content, Server Members")
+    from .helpers import set_env
+    c.print()
+    c.print(Panel(
+        "  1. Go to [bold]discord.com/developers/applications[/]\n"
+        "  2. Click [bold]New Application[/], give it a name\n"
+        "  3. Go to [bold]Bot[/] → click [bold]Add Bot[/]\n"
+        "  4. Under [bold]Privileged Gateway Intents[/], turn on:\n"
+        "       • Message Content Intent\n"
+        "       • Server Members Intent\n"
+        "  5. Click [bold]Reset Token[/] and copy it",
+        title="[bold cyan]Discord Bot Setup[/]",
+        border_style="cyan",
+    ))
+    if mode != "quickstart":
+        c.print("  Docs: https://discord.com/developers/applications")
 
     bridges["discord"] = {
         "enabled": True,
@@ -230,26 +226,37 @@ def _setup_discord_bridge(bridges: dict, mode: Mode) -> None:
             "max_reply_length": 1900, "typing_indicator": True,
         },
     }
-    if os.environ.get("DISCORD_BOT_TOKEN"):
-        success("DISCORD_BOT_TOKEN found.")
+
+    if not os.environ.get("DISCORD_BOT_TOKEN"):
+        c.print()
+        entered = questionary.password(
+            "Paste your Discord bot token (or leave blank to set it later)",
+            style=QSTYLE,
+        ).ask()
+        if entered and entered.strip():
+            token = entered.strip()
+            os.environ["DISCORD_BOT_TOKEN"] = token
+            try:
+                set_env("DISCORD_BOT_TOKEN", token)
+                success("DISCORD_BOT_TOKEN saved to your shell profile and set for this session.")
+            except Exception as e:
+                warn(f"Could not persist DISCORD_BOT_TOKEN permanently ({e}) — set it manually before restarting.")
+        else:
+            warn("DISCORD_BOT_TOKEN not set yet — set it before starting.")
     else:
-        warn("DISCORD_BOT_TOKEN not set yet — set it before starting.")
+        success("DISCORD_BOT_TOKEN found.")
 
 
 def _setup_matrix_bridge(bridges: dict, mode: Mode) -> None:
     import os
-    if mode == "quickstart":
-        export_cmd = "set" if sys.platform == "win32" else "export"
-        c.print()
-        c.print(Panel(
-            "  1. Create a Matrix account at [bold]matrix.org[/] (or your own server)\n"
-            "  2. Your MXID looks like: [bold]@yourname:matrix.org[/]\n"
-            f"  3. Run:  [bold]{export_cmd} MATRIX_PASSWORD=your-password[/]",
-            title="[bold cyan]Matrix Bot Setup[/]",
-            border_style="cyan",
-        ))
-    else:
-        c.print("\n[bold]Matrix[/] — set [bold]MATRIX_PASSWORD[/] in your environment.\n")
+    from .helpers import set_env
+    c.print()
+    c.print(Panel(
+        "  1. Create a Matrix account at [bold]matrix.org[/] (or your own server)\n"
+        "  2. Your MXID looks like: [bold]@yourname:matrix.org[/]",
+        title="[bold cyan]Matrix Bot Setup[/]",
+        border_style="cyan",
+    ))
 
     homeserver = questionary.text("Homeserver URL", default="https://matrix.org", style=QSTYLE).ask() or "https://matrix.org"
     username   = questionary.text("Bot MXID (@bot:server.tld)", default="@yourbot:matrix.org", style=QSTYLE).ask() or "@yourbot:matrix.org"
@@ -262,10 +269,25 @@ def _setup_matrix_bridge(bridges: dict, mode: Mode) -> None:
             "command_prefix": "!", "max_reply_length": 16000, "sync_timeout_ms": 30000,
         },
     }
-    if os.environ.get("MATRIX_PASSWORD"):
-        success("MATRIX_PASSWORD found.")
+
+    if not os.environ.get("MATRIX_PASSWORD"):
+        c.print()
+        entered = questionary.password(
+            "Paste your Matrix bot password (or leave blank to set it later)",
+            style=QSTYLE,
+        ).ask()
+        if entered and entered.strip():
+            pw = entered.strip()
+            os.environ["MATRIX_PASSWORD"] = pw
+            try:
+                set_env("MATRIX_PASSWORD", pw)
+                success("MATRIX_PASSWORD saved to your shell profile and set for this session.")
+            except Exception as e:
+                warn(f"Could not persist MATRIX_PASSWORD permanently ({e}) — set it manually before restarting.")
+        else:
+            warn("MATRIX_PASSWORD not set yet — set it before starting.")
     else:
-        warn("MATRIX_PASSWORD not set yet — set it before starting.")
+        success("MATRIX_PASSWORD found.")
 
 
 def step_max_tool_cycles(mode: Mode) -> int:
@@ -330,14 +352,40 @@ def step_bootstrap_md(workspace: str) -> None:
             warn(f"Could not copy {fname}: {e}")
 
 
-def step_health_check(gateway: dict[str, Any]) -> None:
-    section("Health Check")
-    host, port = gateway["host"], gateway["port"]
-    c.print(f"  Pinging http://{host}:{port}/v1/health …", end=" ")
-    if health_ping(host, port):
-        success("Gateway is up!")
-    else:
-        warn("No response — start the agent with [bold]python -m main[/] and verify.")
+def step_launch(gateway: dict[str, Any]) -> None:
+    import subprocess
+    section("Launch")
+    c.print("TinyCTX is configured. Would you like to start it now?\n")
+    if not questionary.confirm("Start TinyCTX in a new terminal window?", default=True, style=QSTYLE).ask():
+        c.print("  Run [bold]python -m main[/] when you're ready.")
+        return
+
+    import sys
+    python = sys.executable
+    cwd    = str(REPO_ROOT)
+    try:
+        if sys.platform == "win32":
+            subprocess.Popen(
+                ["cmd", "/c", "start", "cmd", "/k", python, "-m", "main"],
+                cwd=cwd, close_fds=True,
+            )
+        elif sys.platform == "darwin":
+            script = f'tell application "Terminal" to do script "cd {cwd} && {python} -m main"'
+            subprocess.Popen(["osascript", "-e", script])
+        else:
+            for term in ("x-terminal-emulator", "gnome-terminal", "xterm"):
+                try:
+                    subprocess.Popen([term, "--", python, "-m", "main"], cwd=cwd)
+                    break
+                except FileNotFoundError:
+                    continue
+            else:
+                warn("Could not find a terminal emulator — run [bold]python -m main[/] manually.")
+                return
+        host, port = gateway["host"], gateway["port"]
+        success(f"Agent launched! Gateway will be at http://{host}:{port}")
+    except Exception as e:
+        warn(f"Could not open terminal ({e}) — run [bold]python -m main[/] manually.")
 
 
 def step_summary(mode: Mode, gateway: dict[str, Any]) -> None:
@@ -432,7 +480,7 @@ def main() -> None:
     write_config(data)
     success(f"Config written to [bold]{CONFIG_PATH}[/]")
 
-    step_health_check(gateway)
+    step_launch(gateway)
     step_summary(mode, gateway)
 
 

@@ -18,6 +18,7 @@ from .helpers import (
     Mode,
     api_key_env_for,
     c,
+    set_env,
     success,
     warn,
 )
@@ -55,7 +56,21 @@ def configure_provider_quickstart(beginner_providers: dict[str, dict], label: st
             border_style="cyan",
         ))
         if not os.environ.get(api_key_env):
-            warn(f"{api_key_env} is not set yet — that's okay, you can set it after this wizard.")
+            c.print()
+            entered = questionary.password(
+                f"Paste your {provider_name} API key (or leave blank to set it later)",
+                style=QSTYLE,
+            ).ask()
+            if entered and entered.strip():
+                key_value = entered.strip()
+                os.environ[api_key_env] = key_value
+                try:
+                    set_env(api_key_env, key_value)
+                    success(f"{api_key_env} saved to your shell profile and set for this session.")
+                except Exception as e:
+                    warn(f"Could not persist {api_key_env} permanently ({e}) — set it manually before restarting.")
+            else:
+                warn(f"{api_key_env} not set — you'll need it before starting the agent.")
         else:
             success(f"{api_key_env} is already set.")
 
@@ -96,6 +111,20 @@ def configure_provider(providers: dict[str, str], label: str, mode: Mode) -> tup
         base_url    = providers[provider_name]
         api_key_env = "N/A" if provider_name in LOCAL_PROVIDERS else api_key_env_for(provider_name)
         if api_key_env != "N/A" and not os.environ.get(api_key_env):
-            warn(f"{api_key_env} is not set — set it before starting the agent.")
+            c.print()
+            entered = questionary.password(
+                f"Paste your {provider_name} API key (or leave blank to set it later)",
+                style=QSTYLE,
+            ).ask()
+            if entered and entered.strip():
+                key_value = entered.strip()
+                os.environ[api_key_env] = key_value
+                try:
+                    set_env(api_key_env, key_value)
+                    success(f"{api_key_env} saved to your shell profile and set for this session.")
+                except Exception as e:
+                    warn(f"Could not persist {api_key_env} permanently ({e}) — set it manually before restarting.")
+            else:
+                warn(f"{api_key_env} not set — set it before starting the agent.")
 
     return base_url, api_key_env, provider_name
