@@ -537,11 +537,6 @@ class _CronRunner:
             finally:
                 gateway.unregister_cursor_handler(node_id)
 
-            # Advance cursor to the latest tail after the turn.
-            lane = gateway._lane_router._lanes.get(node_id)
-            if lane and lane.loop._tail_node_id != node_id:
-                job.cursor_node_id = lane.loop._tail_node_id
-
             reply_text = "".join(parts).strip()
             if reply_text:
                 print(f"\n[CRON: {job.name}]\n{reply_text}\n")

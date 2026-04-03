@@ -265,7 +265,7 @@ async def _run_turn(
         gateway._heartbeat_agent = agent
 
     msg = InboundMessage(
-        tail_node_id=tail_node_id,
+        tail_node_id=lane_node_id,
         author=_HEARTBEAT_AUTHOR,
         content_type=ContentType.TEXT,
         text=text,
@@ -297,13 +297,6 @@ async def _run_turn(
         logger.error("[heartbeat] turn timed out after 120s")
     finally:
         gateway.unregister_cursor_handler(lane_node_id)
-
-    # Advance tail to the lane's current DB tail so the next turn appends
-    # to the correct leaf rather than re-using the old node.
-    lane = gateway._lane_router._lanes.get(lane_node_id)
-    if lane and lane.loop._tail_node_id != tail_node_id:
-        tail_node_id = lane.loop._tail_node_id
-        setattr(agent, "_heartbeat_cursor_node_id", tail_node_id)
 
     return "".join(parts).strip(), tail_node_id
 
