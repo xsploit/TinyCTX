@@ -21,7 +21,7 @@ from rich.panel import Panel
 from .helpers import (
     BANNER, BUNDLED_DIR, BUNDLED_MD, CONFIG_PATH,
     DEFAULT_GATEWAY_HOST, DEFAULT_GATEWAY_PORT, DEFAULT_WORKSPACE,
-    Mode, QSTYLE,
+    GoBack, Mode, QSTYLE,
     assemble_config, c, health_ping, load_beginner_providers,
     load_existing_config, load_providers, pick_model, pick_model_beginner,
     section, success, warn, write_config,
@@ -69,12 +69,15 @@ def step_select_mode() -> Mode:
             "🟢  Quick Start  — I'm new, just get me going",
             "🟡  Standard     — I know what I'm doing",
             "🔴  Advanced     — Show me everything",
+            "← Back",
         ],
         style=QSTYLE,
     ).ask()
 
     if choice is None:
         sys.exit(0)
+    if "Back" in choice:
+        raise GoBack
 
     if "Quick Start" in choice:
         c.print("\n[bold green]Quick Start[/] selected — we'll keep things simple!\n")
@@ -124,7 +127,10 @@ def step_embedding(providers: dict, mode: Mode) -> dict[str, Any] | None:
     section("Step 2 — Embedding Model (optional)")
     c.print("Enables hybrid BM25+vector memory search. Skip for BM25-only mode.\n")
 
-    if not questionary.confirm("Configure an embedding model?", default=True, style=QSTYLE).ask():
+    raw = input("  Configure an embedding model? (y/n/back, default n): ").strip().lower()
+    if raw in ("back", "b"):
+        raise GoBack
+    if raw not in ("y", "yes"):
         warn("BM25-only memory search will be used.")
         return None
 
@@ -142,15 +148,17 @@ def step_workspace(mode: Mode) -> str:
         section("Step 2 — Where to Save Your Data")
         c.print(f"TinyCTX will store your sessions and memory here.\n")
         c.print(f"  Default: [bold]{DEFAULT_WORKSPACE}[/]  (recommended)\n")
-        use_default = questionary.confirm("Use the default location?", default=True, style=QSTYLE).ask()
-        workspace = DEFAULT_WORKSPACE if use_default else (
-            questionary.text("Enter a folder path", default=DEFAULT_WORKSPACE, style=QSTYLE).ask()
-            or DEFAULT_WORKSPACE
-        )
+        raw = input(f"  Workspace path (Enter for default, 'back' to go back): ").strip()
+        if raw.lower() in ("back", "b"):
+            raise GoBack
+        workspace = raw if raw else DEFAULT_WORKSPACE
     else:
         section("Step 3 — Workspace")
         c.print("Stores sessions, memory index, SOUL.md, AGENTS.md, etc.\n")
-        workspace = questionary.text("Workspace path", default=DEFAULT_WORKSPACE, style=QSTYLE).ask() or DEFAULT_WORKSPACE
+        raw = input(f"  Workspace path (default: {DEFAULT_WORKSPACE}, 'back' to go back): ").strip()
+        if raw.lower() in ("back", "b"):
+            raise GoBack
+        workspace = raw if raw else DEFAULT_WORKSPACE
 
     Path(workspace).expanduser().mkdir(parents=True, exist_ok=True)
     success(f"Workspace: [bold]{Path(workspace).expanduser()}[/]")
@@ -161,17 +169,33 @@ def step_gateway(mode: Mode) -> dict[str, Any]:
     if mode == "quickstart":
         section("Step 3 — Access Key")
         c.print("TinyCTX uses a secret key so only you can connect to it.\n")
-        raw     = questionary.text("Set a key (or press Enter to auto-generate one)", default="", style=QSTYLE).ask()
-        api_key = raw.strip() if raw and raw.strip() else secrets.token_hex(16)
+        raw = input("  Gateway API key (Enter to auto-generate, 'back' to go back): ").strip()
+        if raw.lower() in ("back", "b"):
+            raise GoBack
+        api_key = raw if raw else secrets.token_hex(16)
         success(f"Key: [bold]{api_key}[/]  (save this somewhere!)")
         return {"enabled": True, "host": DEFAULT_GATEWAY_HOST, "port": DEFAULT_GATEWAY_PORT, "api_key": api_key}
 
     section("Step 4 — Gateway (HTTP/SSE API)")
     c.print("Exposes TinyCTX to SillyTavern, curl, and other external clients.\n")
-    host    = questionary.text("Bind host", default=DEFAULT_GATEWAY_HOST, style=QSTYLE).ask() or DEFAULT_GATEWAY_HOST
-    port    = int(questionary.text("Port", default=str(DEFAULT_GATEWAY_PORT), style=QSTYLE).ask() or DEFAULT_GATEWAY_PORT)
-    raw     = questionary.text("API key (blank = auto-generate)", default="", style=QSTYLE).ask()
-    api_key = raw.strip() if raw and raw.strip() else secrets.token_hex(16)
+    raw_host = input(f"  Bind host (default: {DEFAULT_GATEWAY_HOST}, 'back' to go back): ").strip()
+    if raw_host.lower() in ("back", "b"):
+        raise GoBack
+    host = raw_host if raw_host else DEFAULT_GATEWAY_HOST
+    while True:
+        raw_port = input(f"  Port (default: {DEFAULT_GATEWAY_PORT}): ").strip()
+        if not raw_port:
+            port = DEFAULT_GATEWAY_PORT
+            break
+        try:
+            port = int(raw_port)
+            if 1 <= port <= 65535:
+                break
+            warn(f"Port must be between 1 and 65535.")
+        except ValueError:
+            warn(f"'{raw_port}' is not a valid port number.")
+    raw_key = input("  API key (Enter to auto-generate): ").strip()
+    api_key = raw_key if raw_key else secrets.token_hex(16)
     success(f"Gateway: http://{host}:{port}  key=[bold]{api_key}[/]")
     return {"enabled": True, "host": host, "port": port, "api_key": api_key}
 
@@ -184,25 +208,36 @@ def step_bridges(mode: Mode) -> dict[str, Any]:
         section("Step 5 — Bridges")
         c.print("CLI is always enabled. Select additional bridges:\n")
 
-    choices = questionary.checkbox(
-        "Additional bridges to enable (space to select, enter to confirm)",
-        choices=["Discord", "Matrix"],
-        style=QSTYLE,
-    ).ask() or []
+    available = ["Discord", "Matrix"]
+    c.print("  Available: " + ", ".join(f"[bold]{b}[/]" for b in available))
+    c.print("  Type the names you want, comma-separated (or leave blank for none, 'back' to go back).")
+    raw = input("  Bridges: ").strip()
+    if raw.lower() in ("back", "b"):
+        raise GoBack
+    chosen = {x.strip().title() for x in raw.split(",") if x.strip()} if raw else set()
+    chosen = {b for b in chosen if b in available}
 
     bridges: dict[str, Any] = {"cli": {"enabled": True}}
 
-    if "Discord" in choices:
+    if "Discord" in chosen:
         _setup_discord_bridge(bridges, mode)
-    if "Matrix" in choices:
+    if "Matrix" in chosen:
         _setup_matrix_bridge(bridges, mode)
 
     return bridges
 
 
 def _setup_discord_bridge(bridges: dict, mode: Mode) -> None:
+    import getpass
     import os
     from .helpers import set_env
+
+    def _prompt_secret(prompt: str) -> str:
+        try:
+            v = getpass.getpass(prompt + ": ")
+            return v.strip() if v else ""
+        except (KeyboardInterrupt, EOFError):
+            return ""
     c.print()
     c.print(Panel(
         "  1. Go to [bold]discord.com/developers/applications[/]\n"
@@ -229,15 +264,11 @@ def _setup_discord_bridge(bridges: dict, mode: Mode) -> None:
 
     if not os.environ.get("DISCORD_BOT_TOKEN"):
         c.print()
-        entered = questionary.password(
-            "Paste your Discord bot token (or leave blank to set it later)",
-            style=QSTYLE,
-        ).ask()
-        if entered and entered.strip():
-            token = entered.strip()
-            os.environ["DISCORD_BOT_TOKEN"] = token
+        entered = _prompt_secret("Paste your Discord bot token (or leave blank to set it later)")
+        if entered:
+            os.environ["DISCORD_BOT_TOKEN"] = entered
             try:
-                set_env("DISCORD_BOT_TOKEN", token)
+                set_env("DISCORD_BOT_TOKEN", entered)
                 success("DISCORD_BOT_TOKEN saved to your shell profile and set for this session.")
             except Exception as e:
                 warn(f"Could not persist DISCORD_BOT_TOKEN permanently ({e}) — set it manually before restarting.")
@@ -248,8 +279,16 @@ def _setup_discord_bridge(bridges: dict, mode: Mode) -> None:
 
 
 def _setup_matrix_bridge(bridges: dict, mode: Mode) -> None:
+    import getpass
     import os
     from .helpers import set_env
+
+    def _prompt_secret(prompt: str) -> str:
+        try:
+            v = getpass.getpass(prompt + ": ")
+            return v.strip() if v else ""
+        except (KeyboardInterrupt, EOFError):
+            return ""
     c.print()
     c.print(Panel(
         "  1. Create a Matrix account at [bold]matrix.org[/] (or your own server)\n"
@@ -272,15 +311,11 @@ def _setup_matrix_bridge(bridges: dict, mode: Mode) -> None:
 
     if not os.environ.get("MATRIX_PASSWORD"):
         c.print()
-        entered = questionary.password(
-            "Paste your Matrix bot password (or leave blank to set it later)",
-            style=QSTYLE,
-        ).ask()
-        if entered and entered.strip():
-            pw = entered.strip()
-            os.environ["MATRIX_PASSWORD"] = pw
+        entered = _prompt_secret("Paste your Matrix bot password (or leave blank to set it later)")
+        if entered:
+            os.environ["MATRIX_PASSWORD"] = entered
             try:
-                set_env("MATRIX_PASSWORD", pw)
+                set_env("MATRIX_PASSWORD", entered)
                 success("MATRIX_PASSWORD saved to your shell profile and set for this session.")
             except Exception as e:
                 warn(f"Could not persist MATRIX_PASSWORD permanently ({e}) — set it manually before restarting.")

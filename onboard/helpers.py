@@ -62,6 +62,12 @@ QSTYLE = Style([
 c = Console()
 
 
+# ── navigation ───────────────────────────────────────────────────────────────
+
+class GoBack(Exception):
+    """Raised by any wizard step to return to the previous step."""
+
+
 # ── UI primitives ─────────────────────────────────────────────────────────────
 
 def section(title: str) -> None:
@@ -159,8 +165,20 @@ def api_key_env_for(provider_name: str) -> str:
     return provider_name.upper().replace(" ", "_").replace("-", "_") + "_API_KEY"
 
 
+def is_valid_url(url: str) -> bool:
+    """Return True if url has a recognised scheme and a non-empty netloc."""
+    try:
+        from urllib.parse import urlparse
+        p = urlparse(url)
+        return p.scheme in ("http", "https") and bool(p.netloc)
+    except Exception:
+        return False
+
+
 def fetch_models(base_url: str, api_key_env: str, timeout: float = 6.0) -> list[str]:
     """Query GET /v1/models. Returns sorted model ID list, or [] on failure."""
+    if not is_valid_url(base_url):
+        return []
     url = base_url.rstrip("/")
     if not url.endswith("/v1"):
         url += "/v1"

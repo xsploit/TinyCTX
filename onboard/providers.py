@@ -6,6 +6,7 @@ Each function returns (base_url, api_key_env, provider_name).
 
 from __future__ import annotations
 
+import getpass
 import os
 import sys
 
@@ -18,10 +19,20 @@ from .helpers import (
     Mode,
     api_key_env_for,
     c,
+    is_valid_url,
     set_env,
     success,
     warn,
 )
+
+
+def _prompt_secret(prompt: str) -> str:
+    """Prompt for a secret value without echo. Returns stripped string or '' if blank."""
+    try:
+        value = getpass.getpass(prompt + ": ")
+        return value.strip() if value else ""
+    except (KeyboardInterrupt, EOFError):
+        return ""
 
 
 def configure_provider_quickstart(beginner_providers: dict[str, dict], label: str) -> tuple[str, str, str]:
@@ -57,15 +68,11 @@ def configure_provider_quickstart(beginner_providers: dict[str, dict], label: st
         ))
         if not os.environ.get(api_key_env):
             c.print()
-            entered = questionary.password(
-                f"Paste your {provider_name} API key (or leave blank to set it later)",
-                style=QSTYLE,
-            ).ask()
-            if entered and entered.strip():
-                key_value = entered.strip()
-                os.environ[api_key_env] = key_value
+            entered = _prompt_secret(f"Paste your {provider_name} API key (or leave blank to set it later)")
+            if entered:
+                os.environ[api_key_env] = entered
                 try:
-                    set_env(api_key_env, key_value)
+                    set_env(api_key_env, entered)
                     success(f"{api_key_env} saved to your shell profile and set for this session.")
                 except Exception as e:
                     warn(f"Could not persist {api_key_env} permanently ({e}) — set it manually before restarting.")
@@ -96,13 +103,17 @@ def configure_provider(providers: dict[str, str], label: str, mode: Mode) -> tup
         sys.exit(0)
 
     if provider_name == "Custom":
-        base_url = questionary.text(
-            "Base URL (e.g. http://localhost:8000/v1)",
-            style=QSTYLE,
-        ).ask() or ""
-        use_key = questionary.confirm(
-            "Does this endpoint require an API key?", default=False, style=QSTYLE
-        ).ask()
+        while True:
+            raw_url = questionary.text(
+                "Base URL (e.g. http://localhost:8000/v1)",
+                style=QSTYLE,
+            ).ask() or ""
+            if is_valid_url(raw_url):
+                base_url = raw_url.rstrip("/")
+                break
+            warn(f"'{raw_url}' doesn't look like a valid URL — must start with http:// or https://")
+        raw_key = input("  Requires an API key? (y/n, default n): ").strip().lower()
+        use_key = raw_key in ("y", "yes")
         api_key_env = (
             questionary.text("Env var name for API key", default="CUSTOM_API_KEY", style=QSTYLE).ask()
             or "CUSTOM_API_KEY"
@@ -112,15 +123,11 @@ def configure_provider(providers: dict[str, str], label: str, mode: Mode) -> tup
         api_key_env = "N/A" if provider_name in LOCAL_PROVIDERS else api_key_env_for(provider_name)
         if api_key_env != "N/A" and not os.environ.get(api_key_env):
             c.print()
-            entered = questionary.password(
-                f"Paste your {provider_name} API key (or leave blank to set it later)",
-                style=QSTYLE,
-            ).ask()
-            if entered and entered.strip():
-                key_value = entered.strip()
-                os.environ[api_key_env] = key_value
+            entered = _prompt_secret(f"Paste your {provider_name} API key (or leave blank to set it later)")
+            if entered:
+                os.environ[api_key_env] = entered
                 try:
-                    set_env(api_key_env, key_value)
+                    set_env(api_key_env, entered)
                     success(f"{api_key_env} saved to your shell profile and set for this session.")
                 except Exception as e:
                     warn(f"Could not persist {api_key_env} permanently ({e}) — set it manually before restarting.")
