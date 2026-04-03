@@ -160,7 +160,7 @@ class Context:
       Without a DB wired, old in-memory behaviour is preserved.
     """
 
-    def __init__(self, token_limit: int = 16384) -> None:
+    def __init__(self, token_limit: int = 16384, image_tokens_per_block: int = 280) -> None:
         self.dialogue: list[HistoryEntry] = []
 
         # pid -> (PromptSlot, provider callable)
@@ -174,6 +174,15 @@ class Context:
         self.state: dict[str, Any] = {}
 
         self.token_limit = token_limit
+
+        # Flat token cost charged per image_url content block when estimating
+        # context usage.  image_url blocks carry raw base64 data which would
+        # produce wildly inflated byte counts if measured as text.  Instead we
+        # charge a flat cost matching the model's actual vision-encoder overhead.
+        # Sourced from ModelConfig.tokens_per_image in config.yaml.  None means
+        # the model has no vision support; _count_tokens treats it as 0 (no
+        # image_url blocks will appear in the message list for such models).
+        self._image_tokens_per_block: int | None = image_tokens_per_block
 
         # Tree refactor: optional DB backing
         self._db = None            # ConversationDB | None
@@ -198,6 +207,15 @@ class Context:
         and advance it.
         """
         self._tail_node_id = node_id
+
+    def set_image_tokens(self, tokens_per_image: int | None) -> None:
+        """
+        Update the per-image token cost used by _count_tokens().
+        Call this when the active model changes (e.g. fallback kicks in) so
+        the budget estimator reflects the new model's vision-encoder overhead.
+        None means the model has no vision support (image_url blocks cost 0).
+        """
+        self._image_tokens_per_block = tokens_per_image
 
     def set_cursor_callback(self, fn) -> None:
         """
@@ -458,11 +476,26 @@ class Context:
     # ------------------------------------------------------------------
 
     def _count_tokens(self, messages: list[dict], tools: list[dict] | None = None) -> int:
-        tool_chars = len(json.dumps(tools)) if tools else 0
+        tool_chars  = len(json.dumps(tools)) if tools else 0
+        img_cost    = self._image_tokens_per_block or 0  # 0 for non-vision models
+        image_chars = img_cost * 4  # ×4 because the sum is divided by 4
+
         def _content_len(c) -> int:
             if isinstance(c, list):
-                return sum(len(json.dumps(b)) for b in c)
+                total = 0
+                for b in c:
+                    # image_url blocks carry raw base64 — counting those bytes as
+                    # characters wildly inflates the estimate and causes the
+                    # budget-trimmer to evict all prior conversation history.
+                    # Charge a flat per-image cost matching the model's actual
+                    # vision-encoder overhead (image_tokens_per_block in config.yaml).
+                    if isinstance(b, dict) and b.get("type") == "image_url":
+                        total += image_chars
+                    else:
+                        total += len(json.dumps(b))
+                return total
             return len(str(c or ""))
+
         return (sum(
             _content_len(m.get("content", "")) +
             len(json.dumps(m.get("tool_calls", [])))
@@ -490,10 +523,15 @@ class Context:
         # Load from DB if wired; otherwise use in-memory dialogue.
         if self._db is not None and self._tail_node_id is not None:
             source = self._load_from_db()
+            logger.debug(
+                "[assemble] loaded %d entries from DB (tail=%s)",
+                len(source), self._tail_node_id,
+            )
             # Keep self.dialogue in sync so hooks that iterate it see current state.
             self.dialogue = source
         else:
             source = self.dialogue
+            logger.debug("[assemble] using in-memory dialogue (%d entries)", len(source))
 
         n = len(source)
 

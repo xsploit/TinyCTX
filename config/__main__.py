@@ -27,12 +27,13 @@ class ModelConfig:
     temperature:      float      = 0.7
     budget_tokens:    int | None = None   # Anthropic extended thinking: budget_tokens > 0
     reasoning_effort: str | None = None   # OpenAI-compat: "low" | "medium" | "high"
-    cache_prompts:    bool        = False  # Anthropic prompt caching on last system message
-    vision:           bool        = False  # True = model accepts image_url content blocks
+    cache_prompts:      bool        = False  # Anthropic prompt caching on last system message
+    tokens_per_image:   int | None  = None   # Flat token cost per image_url block (None = vision disabled)
 
     @property
     def supports_vision(self) -> bool:
-        return self.vision
+        """True when the model accepts image_url content blocks."""
+        return self.tokens_per_image is not None
 
     @property
     def api_key(self) -> str:
@@ -212,7 +213,13 @@ def _parse_model(raw: dict) -> ModelConfig:
     kind = raw.get("kind", "chat").lower()
     if kind not in ("chat", "embedding"):
         raise ValueError(f"Model kind must be 'chat' or 'embedding', got '{kind}'")
-    vision = bool(raw.get("vision", False))
+    tokens_per_image_raw = raw.get("tokens_per_image")
+    if tokens_per_image_raw is not None:
+        tokens_per_image = int(tokens_per_image_raw)
+        if tokens_per_image <= 0:
+            raise ValueError(f"tokens_per_image must be > 0, got {tokens_per_image}")
+    else:
+        tokens_per_image = None
     reasoning_effort = raw.get("reasoning_effort")
     if reasoning_effort is not None and reasoning_effort not in ("low", "medium", "high"):
         raise ValueError(
@@ -235,7 +242,7 @@ def _parse_model(raw: dict) -> ModelConfig:
         budget_tokens=budget_tokens,
         reasoning_effort=reasoning_effort,
         cache_prompts=bool(raw.get("cache_prompts", False)),
-        vision=vision,
+        tokens_per_image=tokens_per_image,
     )
 
 

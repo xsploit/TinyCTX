@@ -113,7 +113,11 @@ class AgentLoop:
         self.tail_node_id  = tail_node_id  # cursor — the DB node this agent runs from
         self.lane_node_id  = tail_node_id  # original lane key — never changes
         self.config        = config
-        self.context       = Context(token_limit=config.context)
+        primary_mc         = config.models.get(config.llm.primary)
+        self.context       = Context(
+            token_limit=config.context,
+            image_tokens_per_block=primary_mc.tokens_per_image if primary_mc else 280,
+        )
         self.tool_handler  = ToolCallHandler()
         self._turn_count   = 0
         self.gateway       = None  # set by Lane after construction
@@ -379,6 +383,9 @@ class AgentLoop:
                             "[cursor=%s] inference succeeded on fallback model '%s'",
                             self._tail_node_id, model_name,
                         )
+                        # Sync image token cost to the model that actually ran.
+                        mc = self.config.models.get(model_name)
+                        self.context.set_image_tokens(mc.tokens_per_image if mc else None)
                     break
 
                 fo = self.config.llm.fallback_on
@@ -501,7 +508,7 @@ class AgentLoop:
             b64data = payload[sep + 1:]
 
             primary_cfg = self.config.get_model_config(self.config.llm.primary)
-            if primary_cfg.vision:
+            if primary_cfg.supports_vision:
                 return ToolResult(
                     call_id=call.call_id,
                     tool_name=call.tool_name,
