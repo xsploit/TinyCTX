@@ -57,20 +57,24 @@ _TOKEN = "HEARTBEAT_OK"
 # Cursor bootstrap
 # ---------------------------------------------------------------------------
 
-def _get_or_create_cursor(agent, branch_from: str) -> str:
+def _get_or_create_cursor(agent, branch_from: str) -> tuple[str, str]:
     """
-    Return the node_id for the heartbeat branch cursor.
+    Return (lane_node_id, tail_node_id) for the heartbeat branch.
 
-    branch_from == "root":    child of the global DB root (fully isolated)
-    branch_from == "session": child of the agent's current tail at startup
-                               (inherits history up to this point, then diverges)
+    lane_node_id — the stable original branch root; never changes; used as
+                   the lane dict key and cursor-handler registration key,
+                   because router._dispatch_event always dispatches using
+                   event.lane_node_id (the immutable lane origin).
+    tail_node_id — the advancing DB tail; passed in InboundMessage so turns
+                   append to the correct leaf node.
 
-    The node is created once; the node_id is stored on the agent instance so
-    subsequent calls just return the cached value.
+    The lane node is created once; both ids are stored on the agent instance
+    so subsequent calls just return the cached values.
     """
-    attr = "_heartbeat_cursor_node_id"
-    if getattr(agent, attr, None):
-        return getattr(agent, attr)
+    attr_lane = "_heartbeat_lane_node_id"
+    attr_tail = "_heartbeat_cursor_node_id"
+    if getattr(agent, attr_lane, None):
+        return getattr(agent, attr_lane), getattr(agent, attr_tail)
 
     from db import ConversationDB
     workspace = Path(agent.config.workspace.path).expanduser().resolve()
@@ -89,12 +93,13 @@ def _get_or_create_cursor(agent, branch_from: str) -> str:
         role="system",
         content="session:heartbeat",
     )
-    setattr(agent, attr, node.id)
+    setattr(agent, attr_lane, node.id)
+    setattr(agent, attr_tail, node.id)
     logger.info(
         "[heartbeat] created branch cursor %s (branch_from=%s, parent=%s)",
         node.id, branch_from, parent_id,
     )
-    return node.id
+    return node.id, node.id
 
 
 # ---------------------------------------------------------------------------
@@ -123,23 +128,23 @@ def register(agent) -> None:
 
     # Bootstrap the branch cursor now (while the agent's tail_node_id is
     # fresh and before any user turns advance it further).
-    cursor_node_id = _get_or_create_cursor(agent, branch_from)
+    lane_node_id, tail_node_id = _get_or_create_cursor(agent, branch_from)
 
     task = asyncio.get_event_loop().create_task(
         _heartbeat_loop(
-            agent, cursor_node_id, interval_secs,
+            agent, lane_node_id, tail_node_id, interval_secs,
             prompt, continuation_prompt,
             ack_max, max_continuations,
             active_hours,
         ),
-        name=f"heartbeat:{cursor_node_id}",
+        name=f"heartbeat:{lane_node_id}",
     )
 
     _patch_reset(agent, task)
 
     logger.info(
-        "[heartbeat] started — every %dm, cursor=%s, branch_from=%s, active_hours=%s",
-        every_minutes, cursor_node_id, branch_from, active_hours,
+        "[heartbeat] started — every %dm, lane=%s, branch_from=%s, active_hours=%s",
+        every_minutes, lane_node_id, branch_from, active_hours,
     )
 
 
@@ -149,7 +154,8 @@ def register(agent) -> None:
 
 async def _heartbeat_loop(
     agent,
-    cursor_node_id: str,
+    lane_node_id: str,
+    tail_node_id: str,
     interval_secs: int,
     prompt: str,
     continuation_prompt: str,
@@ -163,8 +169,8 @@ async def _heartbeat_loop(
     while True:
         try:
             if _in_active_window(active_hours):
-                await _tick(
-                    agent, cursor_node_id,
+                tail_node_id = await _tick(
+                    agent, lane_node_id, tail_node_id,
                     prompt, continuation_prompt,
                     ack_max, max_continuations,
                 )
@@ -184,35 +190,33 @@ async def _heartbeat_loop(
 
 async def _tick(
     agent,
-    cursor_node_id: str,
+    lane_node_id: str,
+    tail_node_id: str,
     prompt: str,
     continuation_prompt: str,
     ack_max: int,
     max_continuations: int,
-) -> None:
-    logger.debug("[heartbeat] tick start (cursor=%s)", cursor_node_id)
+) -> str:
+    """Run one heartbeat tick. Returns the updated tail_node_id."""
+    logger.debug("[heartbeat] tick start (lane=%s, tail=%s)", lane_node_id, tail_node_id)
 
-    reply, new_cursor = await _run_turn(agent, cursor_node_id, prompt)
-    if new_cursor:
-        cursor_node_id = new_cursor
+    reply, tail_node_id = await _run_turn(agent, lane_node_id, tail_node_id, prompt)
 
     is_ok, alert = _parse_reply(reply, ack_max)
     if is_ok:
         logger.debug("[heartbeat] OK on initial turn")
-        return
+        return tail_node_id
 
     _emit_alert(alert)
 
     for turn in range(1, max_continuations + 1):
         logger.debug("[heartbeat] continuation turn %d/%d", turn, max_continuations)
-        reply, new_cursor = await _run_turn(agent, cursor_node_id, continuation_prompt)
-        if new_cursor:
-            cursor_node_id = new_cursor
+        reply, tail_node_id = await _run_turn(agent, lane_node_id, tail_node_id, continuation_prompt)
 
         is_ok, alert = _parse_reply(reply, ack_max)
         if is_ok:
             logger.debug("[heartbeat] OK after %d continuation turn(s)", turn)
-            return
+            return tail_node_id
 
         _emit_alert(alert)
 
@@ -220,26 +224,38 @@ async def _tick(
         "[heartbeat] max_continuations (%d) reached without HEARTBEAT_OK — giving up",
         max_continuations,
     )
+    return tail_node_id
 
 
-async def _run_turn(agent, cursor_node_id: str, text: str) -> tuple[str, str | None]:
+async def _run_turn(
+    agent,
+    lane_node_id: str,
+    tail_node_id: str,
+    text: str,
+) -> tuple[str, str]:
     """
     Push a heartbeat message through the gateway on the heartbeat branch.
 
-    Returns (reply_text, updated_cursor_node_id | None).
-    The cursor advances as the AgentLoop writes new DB nodes; we read the
-    new tail off the lane after the turn completes so the next tick resumes
-    from the correct leaf.
+    lane_node_id — stable lane key, used for cursor-handler registration.
+                   router._dispatch_event always dispatches via event.lane_node_id,
+                   which is set to the lane's original node_id and never advances.
+                   Registering the handler under this key ensures events are
+                   delivered correctly even after the tail cursor has moved forward.
+
+    tail_node_id — the current DB leaf; passed as InboundMessage.tail_node_id so
+                   the agent loop appends new nodes to the correct branch position.
+
+    Returns (reply_text, new_tail_node_id).
     """
     from contracts import AgentTextChunk, AgentTextFinal, AgentError
 
     gateway = getattr(agent, "gateway", None)
     if gateway is None:
         logger.error("[heartbeat] agent.gateway not set — cannot run tick")
-        return "", None
+        return "", tail_node_id
 
     msg = InboundMessage(
-        tail_node_id=cursor_node_id,
+        tail_node_id=tail_node_id,
         author=_HEARTBEAT_AUTHOR,
         content_type=ContentType.TEXT,
         text=text,
@@ -247,8 +263,8 @@ async def _run_turn(agent, cursor_node_id: str, text: str) -> tuple[str, str | N
         timestamp=time.time(),
     )
 
-    parts: list[str]  = []
-    reply_event       = asyncio.Event()
+    parts: list[str] = []
+    reply_event      = asyncio.Event()
 
     async def _collect(event) -> None:
         if isinstance(event, AgentTextChunk):
@@ -261,26 +277,24 @@ async def _run_turn(agent, cursor_node_id: str, text: str) -> tuple[str, str | N
             parts.append(event.message)
             reply_event.set()
 
-    gateway.register_cursor_handler(cursor_node_id, _collect)
+    # Register under lane_node_id — the stable key that _dispatch_event uses.
+    gateway.register_cursor_handler(lane_node_id, _collect)
     try:
         await gateway.push(msg)
         await asyncio.wait_for(reply_event.wait(), timeout=120)
     except asyncio.TimeoutError:
         logger.error("[heartbeat] turn timed out after 120s")
     finally:
-        gateway.unregister_cursor_handler(cursor_node_id)
+        gateway.unregister_cursor_handler(lane_node_id)
 
-    # Advance cursor to the lane's current tail so the next turn continues
-    # from the correct leaf rather than re-sending to the old node.
-    new_cursor: str | None = None
-    lane = gateway._lane_router._lanes.get(cursor_node_id)
-    if lane and lane.loop._tail_node_id != cursor_node_id:
-        new_cursor = lane.loop._tail_node_id
-        # Cache the updated cursor on the agent so _get_or_create_cursor
-        # returns the right value if re-called (e.g. after reset).
-        setattr(agent, "_heartbeat_cursor_node_id", new_cursor)
+    # Advance tail to the lane's current DB tail so the next turn appends
+    # to the correct leaf rather than re-using the old node.
+    lane = gateway._lane_router._lanes.get(lane_node_id)
+    if lane and lane.loop._tail_node_id != tail_node_id:
+        tail_node_id = lane.loop._tail_node_id
+        setattr(agent, "_heartbeat_cursor_node_id", tail_node_id)
 
-    return "".join(parts).strip(), new_cursor
+    return "".join(parts).strip(), tail_node_id
 
 
 # ---------------------------------------------------------------------------
