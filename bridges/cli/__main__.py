@@ -155,13 +155,12 @@ class CLIBridge:
             self._console.print(preview, markup=False, style="bright_black")
 
         elif isinstance(event, AgentTextFinal):
-            final_text = (self._current_content + (event.text or "")).strip()
+            final_text = (event.text or self._current_content).strip()
             # If we were streaming, update one last time then stop
             if self._live:
                 self._live.update(self._get_live_render(final_text))
             
             self._stop_live()
-            self._console.print() # Final spacer
             
             # RESET EVERYTHING
             self._current_content = ""
