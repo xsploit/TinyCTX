@@ -194,29 +194,46 @@ def test_cli_drag_selection_can_autoscroll_output(tmp_path):
     with patch("bridges.cli.__main__.Application", return_value=SimpleNamespace()):
         bridge._build_application()
 
-    assert bridge._output_area is not None
-    bridge._application = SimpleNamespace(
-        layout=SimpleNamespace(focus=MagicMock()),
-        invalidate=MagicMock(),
-    )
+    async def _run() -> None:
+        assert bridge._output_area is not None
+        bridge._loop = asyncio.get_running_loop()
+        bridge._application = SimpleNamespace(
+            layout=SimpleNamespace(focus=MagicMock()),
+            invalidate=MagicMock(),
+        )
 
-    original_mouse_handler = MagicMock(return_value=None)
-    bridge._output_area.control.mouse_handler = original_mouse_handler
-    bridge._wrap_mouse_handler_for_paste(bridge._output_area)
-    bridge._output_area.window.render_info = SimpleNamespace(displayed_lines=[object()] * 20)
-    bridge._output_area.window._scroll_down = MagicMock()
-    bridge._output_area.window._scroll_up = MagicMock()
+        original_mouse_handler = MagicMock(return_value=None)
+        bridge._output_area.control.mouse_handler = original_mouse_handler
+        bridge._wrap_mouse_handler_for_paste(bridge._output_area)
+        bridge._output_area.window.render_info = SimpleNamespace(
+            displayed_lines=[object()] * 20,
+            top_visible=False,
+            bottom_visible=False,
+        )
+        bridge._output_area.window._scroll_down = MagicMock()
+        bridge._output_area.window._scroll_up = MagicMock()
 
-    mouse_event = SimpleNamespace(
-        event_type=MouseEventType.MOUSE_MOVE,
-        button=MouseButton.LEFT,
-        position=Point(x=0, y=19),
-    )
+        mouse_down = SimpleNamespace(
+            event_type=MouseEventType.MOUSE_DOWN,
+            button=MouseButton.LEFT,
+            position=Point(x=0, y=10),
+        )
+        mouse_move = SimpleNamespace(
+            event_type=MouseEventType.MOUSE_MOVE,
+            button=MouseButton.LEFT,
+            position=Point(x=0, y=19),
+        )
 
-    bridge._output_area.control.mouse_handler(mouse_event)
+        bridge._output_area.control.mouse_handler(mouse_down)
+        bridge._output_area.control.mouse_handler(mouse_move)
+        await asyncio.sleep(0.12)
+        bridge._stop_output_drag_tracking()
+        await asyncio.sleep(0)
 
-    bridge._output_area.window._scroll_down.assert_called_once()
-    assert original_mouse_handler.call_count == 2
+        assert bridge._output_area.window._scroll_down.call_count >= 2
+        assert original_mouse_handler.call_count >= 3
+
+    asyncio.run(_run())
 
 
 def test_cli_style_uses_black_background_and_red_banner(tmp_path):

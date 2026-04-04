@@ -369,6 +369,10 @@ class CLIBridge:
         self._next_paste_id = 1
         self._tool_records: list[dict[str, object]] = []
         self._tool_records_by_call_id: dict[str, dict[str, object]] = {}
+        self._output_drag_selecting = False
+        self._output_drag_edge_direction = 0
+        self._output_drag_mouse_event = None
+        self._output_drag_task: asyncio.Task | None = None
 
     def _resolve_runtime_log_level(self) -> int:
         config = getattr(self._gateway, "_config", None)
@@ -845,6 +849,8 @@ class CLIBridge:
         enabled = (not current) if value is None else bool(value)
         if enabled == current:
             return enabled
+        if not enabled:
+            self._stop_output_drag_tracking()
         self._apply_cli_option(
             "mouse_capture",
             enabled,
@@ -1423,38 +1429,91 @@ class CLIBridge:
             self._application.invalidate()
         return True
 
+    def _stop_output_drag_tracking(self) -> None:
+        self._output_drag_selecting = False
+        self._output_drag_edge_direction = 0
+        self._output_drag_mouse_event = None
+        task = self._output_drag_task
+        self._output_drag_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
     def _wrap_mouse_handler_for_paste(self, area: TextArea | None) -> None:
         if area is None:
             return
         original_mouse_handler = area.control.mouse_handler
         is_output_area = area is self._output_area
 
-        def _drag_autoscroll_output(mouse_event) -> bool:
+        def _current_drag_edge_direction(mouse_event) -> int:
+            if not is_output_area or self._output_area is None:
+                return 0
+            window = self._output_area.window
+            render_info = window.render_info
+            if render_info is None:
+                return 0
+            visible_height = max(1, len(render_info.displayed_lines))
+            if visible_height <= 1:
+                return 0
+            threshold = 1
+            if mouse_event.position.y <= threshold:
+                return -1
+            if mouse_event.position.y >= visible_height - 1 - threshold:
+                return 1
+            return 0
+
+        def _drag_autoscroll_output() -> bool:
             if not is_output_area or self._output_area is None:
                 return False
-            if (
-                mouse_event.event_type != MouseEventType.MOUSE_MOVE
-                or mouse_event.button == MouseButton.NONE
-            ):
+            direction = int(self._output_drag_edge_direction)
+            if direction == 0:
                 return False
             window = self._output_area.window
             render_info = window.render_info
             if render_info is None:
                 return False
-            visible_height = max(1, len(render_info.displayed_lines))
-            if visible_height <= 1:
-                return False
-            threshold = 1
-            scrolled = False
-            if mouse_event.position.y <= threshold:
+            if direction < 0:
+                if getattr(render_info, "top_visible", False):
+                    return False
                 window._scroll_up()
-                scrolled = True
-            elif mouse_event.position.y >= visible_height - 1 - threshold:
+            else:
+                if getattr(render_info, "bottom_visible", False):
+                    return False
                 window._scroll_down()
-                scrolled = True
-            if scrolled and self._application is not None:
+            if self._output_drag_mouse_event is not None:
+                original_mouse_handler(self._output_drag_mouse_event)
+            if self._application is not None:
                 self._application.invalidate()
-            return scrolled
+            return True
+
+        def _ensure_output_drag_loop() -> None:
+            if not is_output_area or not self._output_drag_selecting or self._output_drag_edge_direction == 0:
+                return
+            task = self._output_drag_task
+            if task is not None and not task.done():
+                return
+
+            async def _drag_loop() -> None:
+                current_task = asyncio.current_task()
+                try:
+                    while (
+                        self._output_drag_selecting
+                        and self._output_drag_edge_direction != 0
+                        and self._bool_option("mouse_capture", True)
+                    ):
+                        await asyncio.sleep(0.05)
+                        if not _drag_autoscroll_output():
+                            break
+                except asyncio.CancelledError:
+                    raise
+                finally:
+                    if self._output_drag_task is current_task:
+                        self._output_drag_task = None
+
+            try:
+                loop = self._loop or asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            self._output_drag_task = loop.create_task(_drag_loop())
 
         def _mouse_handler(mouse_event):
             if (
@@ -1465,6 +1524,9 @@ class CLIBridge:
                 and self._application is not None
             ):
                 self._application.layout.focus(area)
+                self._output_drag_selecting = True
+                self._output_drag_mouse_event = mouse_event
+                self._output_drag_edge_direction = _current_drag_edge_direction(mouse_event)
             if (
                 not self._settings_open()
                 and mouse_event.event_type == MouseEventType.MOUSE_UP
@@ -1478,8 +1540,15 @@ class CLIBridge:
                 if self._paste_clipboard_into_input():
                     return None
             result = original_mouse_handler(mouse_event)
-            if _drag_autoscroll_output(mouse_event):
-                result = original_mouse_handler(mouse_event)
+            if is_output_area and not self._settings_open():
+                if mouse_event.event_type == MouseEventType.MOUSE_MOVE and self._output_drag_selecting:
+                    self._output_drag_mouse_event = mouse_event
+                    self._output_drag_edge_direction = _current_drag_edge_direction(mouse_event)
+                    if _drag_autoscroll_output():
+                        result = None
+                    _ensure_output_drag_loop()
+                elif mouse_event.event_type == MouseEventType.MOUSE_UP:
+                    self._stop_output_drag_tracking()
             return result
 
         area.control.mouse_handler = _mouse_handler
@@ -2311,6 +2380,7 @@ class CLIBridge:
                 with patch_stdout(raw=True):
                     await self._application.run_async()
         finally:
+            self._stop_output_drag_tracking()
             if self._send_task is not None and not self._send_task.done():
                 self._send_task.cancel()
             print(self._theme.t("bye_message"))
