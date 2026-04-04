@@ -187,6 +187,33 @@ class TestBasicReply:
         await _collect(agent, _make_msg("second", node_id=agent.tail_node_id))
         assert agent._turn_count == 2
 
+    @pytest.mark.asyncio
+    async def test_empty_post_tool_reply_retries_with_direct_answer_nudge(self, make_agent):
+        calls = {"n": 0}
+
+        async def stream(messages, tools=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                yield ToolCallAssembled(call_id="call-1", tool_name="peek", args={})
+                return
+            if calls["n"] == 2:
+                if False:
+                    yield TextDelta(text="")
+                return
+            yield TextDelta(text="done")
+
+        agent = make_agent(stream)
+
+        def peek() -> str:
+            """Peek at the repo."""
+            return "repo summary"
+
+        agent.tool_handler.register_tool(peek)
+        chunks = await _collect(agent, _make_msg("look around", node_id=agent.tail_node_id))
+
+        assert "".join(chunk.text for chunk in chunks if isinstance(chunk, (AgentTextChunk, AgentTextFinal))) == "done"
+        assert calls["n"] == 3
+
 
 # ---------------------------------------------------------------------------
 # Context accumulation

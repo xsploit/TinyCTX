@@ -121,7 +121,7 @@ def test_cli_output_wraps_while_input_stays_single_line(tmp_path):
         app = bridge._build_application()
     assert bridge._output_area is not None
     assert bridge._input_area is not None
-    assert bridge._output_area.wrap_lines is False
+    assert bridge._output_area.wrap_lines is True
     assert bridge._output_area.control.focusable() is True
     assert bridge._output_area.control.focus_on_click() is True
     assert bridge._input_area.buffer.multiline() is False

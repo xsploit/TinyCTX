@@ -1214,6 +1214,10 @@ class CLIBridge:
             return self._write_clipboard_text(self._input_area.text)
         return False
 
+    def _focus_input(self) -> None:
+        if self._application is not None and self._input_area is not None:
+            self._application.layout.focus(self._input_area)
+
     def _generation_running(self) -> bool:
         return self._send_task is not None and not self._send_task.done()
 
@@ -1646,6 +1650,7 @@ class CLIBridge:
             if final_text:
                 self._append_block(final_text)
             self._set_status("ready")
+            self._focus_input()
             self._refresh_output(log_level)
             self._reply_done.set()
         elif isinstance(event, AgentError):
@@ -1656,6 +1661,7 @@ class CLIBridge:
             else:
                 self._append_block(f"error: {event.message}")
             self._set_status("ready")
+            self._focus_input()
             self._refresh_output(log_level)
             self._reply_done.set()
 
@@ -1817,7 +1823,7 @@ class CLIBridge:
             focusable=True,
             focus_on_click=True,
             scrollbar=True,
-            wrap_lines=False,
+            wrap_lines=True,
             style="class:output-area",
             input_processors=[_DimToolLineProcessor(lambda: self._bool_option("dim_tools", True))],
         )
@@ -1901,8 +1907,29 @@ class CLIBridge:
         @key_bindings.add("c-c", eager=True)
         @key_bindings.add("c-insert", eager=True)
         def _copy_or_exit(event) -> None:
-            if not self._copy_primary_text():
+            if self._copy_primary_text():
+                self._focus_input()
+                return
+            if self._generation_running():
+                self._abort_active_generation()
+                return
+            if self._input_area is not None and self._application is not None:
+                self._application.layout.focus(self._input_area)
+                return
+            else:
                 event.app.exit(result=None)
+
+        @key_bindings.add("<any>", filter=~showing_settings, eager=True)
+        def _recover_input_focus(event) -> None:
+            if self._application is None or self._input_area is None or self._output_area is None:
+                return
+            if not self._application.layout.has_focus(self._output_area):
+                return
+            data = event.data or ""
+            if len(data) != 1 or not data.isprintable():
+                return
+            self._application.layout.focus(self._input_area)
+            self._input_area.buffer.insert_text(data)
 
         @key_bindings.add("c-q", eager=True)
         def _exit(event) -> None:

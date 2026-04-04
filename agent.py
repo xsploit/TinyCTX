@@ -81,6 +81,11 @@ logger = logging.getLogger(__name__)
 
 MODULES_DIR = Path("modules")
 _SHELL_EXIT_ERROR_RE_END = re.compile(r"(?:^|\n)\[exit \d+\]\s*\Z")
+_EMPTY_REPLY_RETRY_PROMPT = (
+    "You already have the tool results for this turn. "
+    "If you do not need another tool, answer the user directly now. "
+    "Do not return an empty response."
+)
 
 
 def _tool_cache_key(call: ToolCall) -> str:
@@ -460,6 +465,7 @@ class AgentLoop:
         final_text       = ""
         streaming_active = False
         tool_result_cache: dict[str, ToolResult] = {}
+        had_tool_activity = False
 
         compacted_this_turn = False
         for cycle in range(max_cycles):
@@ -498,82 +504,111 @@ class AgentLoop:
                 break
 
             # Stage 3: Inference — walk primary → fallback chain
-            text_chunks:      list[str]      = []
-            tool_calls:       list[ToolCall] = []
-            error:            str | None     = None
-            streaming_active                 = False
-            last_http_status: int | None     = None
-
             model_chain = [self.config.llm.primary] + list(self.config.llm.fallback)
+            inference_messages = list(messages)
+            empty_reply_retries = 0
 
-            for model_name in model_chain:
-                llm              = self._models[model_name]
-                text_chunks      = []
-                tool_calls       = []
-                error            = None
-                streaming_active = False
-                last_http_status = None
+            while True:
+                text_chunks:      list[str]      = []
+                tool_calls:       list[ToolCall] = []
+                error:            str | None     = None
+                streaming_active                 = False
+                last_http_status: int | None     = None
 
-                async for llm_event in llm.stream(messages, tools=tools):
-                    if abort_event and abort_event.is_set():
-                        logger.info("[%s] aborted mid-stream", self._tail_node_id)
-                        yield AgentError(message="[generation aborted]", **ev)
-                        return
+                for model_name in model_chain:
+                    llm              = self._models[model_name]
+                    text_chunks      = []
+                    tool_calls       = []
+                    error            = None
+                    streaming_active = False
+                    last_http_status = None
 
-                    if isinstance(llm_event, ThinkingDelta):
-                        yield AgentThinkingChunk(text=llm_event.text, **ev)
+                    async for llm_event in llm.stream(inference_messages, tools=tools):
+                        if abort_event and abort_event.is_set():
+                            logger.info("[%s] aborted mid-stream", self._tail_node_id)
+                            yield AgentError(message="[generation aborted]", **ev)
+                            return
 
-                    elif isinstance(llm_event, TextDelta):
-                        text_chunks.append(llm_event.text)
-                        if not tool_calls:
-                            streaming_active = True
-                            yield AgentTextChunk(text=llm_event.text, **ev)
+                        if isinstance(llm_event, ThinkingDelta):
+                            yield AgentThinkingChunk(text=llm_event.text, **ev)
 
-                    elif isinstance(llm_event, ToolCallAssembled):
-                        tool_calls.append(ToolCall(
-                            call_id=llm_event.call_id,
-                            tool_name=llm_event.tool_name,
-                            args=llm_event.args,
-                        ))
+                        elif isinstance(llm_event, TextDelta):
+                            text_chunks.append(llm_event.text)
+                            if not tool_calls:
+                                streaming_active = True
+                                yield AgentTextChunk(text=llm_event.text, **ev)
 
-                    elif isinstance(llm_event, LLMError):
-                        error = llm_event.message
-                        if llm_event.message.startswith("HTTP "):
-                            try:
-                                last_http_status = int(llm_event.message.split()[1].rstrip(":"))
-                            except (IndexError, ValueError):
-                                pass
+                        elif isinstance(llm_event, ToolCallAssembled):
+                            tool_calls.append(ToolCall(
+                                call_id=llm_event.call_id,
+                                tool_name=llm_event.tool_name,
+                                args=llm_event.args,
+                            ))
+
+                        elif isinstance(llm_event, LLMError):
+                            error = llm_event.message
+                            if llm_event.message.startswith("HTTP "):
+                                try:
+                                    last_http_status = int(llm_event.message.split()[1].rstrip(":"))
+                                except (IndexError, ValueError):
+                                    pass
+                            break
+
+                    if not error:
+                        if model_name != self.config.llm.primary:
+                            logger.info(
+                                "[cursor=%s] inference succeeded on fallback model '%s'",
+                                self._tail_node_id, model_name,
+                            )
+                            mc = self.config.models.get(model_name)
+                            self.context.set_image_tokens(mc.tokens_per_image if mc else None)
                         break
 
-                if not error:
-                    if model_name != self.config.llm.primary:
-                        logger.info(
-                            "[cursor=%s] inference succeeded on fallback model '%s'",
-                            self._tail_node_id, model_name,
+                    fo = self.config.llm.fallback_on
+                    should_fallback = fo.any_error or (
+                        last_http_status is not None and last_http_status in fo.http_codes
+                    )
+                    if should_fallback and model_name != model_chain[-1]:
+                        logger.warning(
+                            "[cursor=%s] model '%s' failed (%s) — trying next fallback",
+                            self._tail_node_id, model_name, error,
                         )
-                        # Sync image token cost to the model that actually ran.
-                        mc = self.config.models.get(model_name)
-                        self.context.set_image_tokens(mc.tokens_per_image if mc else None)
+                        continue
                     break
 
-                fo = self.config.llm.fallback_on
-                should_fallback = fo.any_error or (
-                    last_http_status is not None and last_http_status in fo.http_codes
-                )
-                if should_fallback and model_name != model_chain[-1]:
+                if error:
+                    break
+
+                response_text = "".join(text_chunks)
+                if tool_calls or response_text.strip():
+                    break
+
+                if empty_reply_retries >= 1:
+                    if had_tool_activity:
+                        response_text = "[No final response returned after tool use.]"
+                    else:
+                        response_text = "[No response returned.]"
                     logger.warning(
-                        "[cursor=%s] model '%s' failed (%s) — trying next fallback",
-                        self._tail_node_id, model_name, error,
+                        "[cursor=%s] assistant returned empty final response after retry",
+                        self._tail_node_id,
                     )
-                    continue
-                break
+                    break
+
+                empty_reply_retries += 1
+                logger.warning(
+                    "[cursor=%s] assistant returned empty final response — retrying once with direct-answer nudge",
+                    self._tail_node_id,
+                )
+                inference_messages = list(messages) + [{
+                    "role": "system",
+                    "content": _EMPTY_REPLY_RETRY_PROMPT,
+                }]
 
             if error:
                 logger.error("[cursor=%s] LLM error (all models exhausted): %s", self._tail_node_id, error)
                 yield AgentError(message=f"[LLM error: {error}]", **ev)
                 return
 
-            response_text = "".join(text_chunks)
             self.context.add(HistoryEntry.assistant(
                 content=response_text,
                 tool_calls=tool_calls if tool_calls else None,
@@ -585,6 +620,7 @@ class AgentLoop:
 
             # Stages 4 & 5: Tool execution + result backfill
             logger.debug("[%s] cycle %d — %d tool call(s)", self._tail_node_id, cycle, len(tool_calls))
+            had_tool_activity = True
             for tc in tool_calls:
                 yield AgentToolCall(call_id=tc.call_id, tool_name=tc.tool_name, args=tc.args, **ev)
                 result = await self._execute_tool(tc, tool_result_cache=tool_result_cache)
