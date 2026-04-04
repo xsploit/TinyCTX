@@ -338,7 +338,8 @@ class TestToolExecution:
         assert tool_invocations["n"] == 1
         assert len(tool_results) == 2
         assert "result for https://example.com" in tool_results[0].content
-        assert "cached identical tool call reused earlier result" in tool_results[1].content
+        assert "cached exact same tool call reused earlier result" in tool_results[1].content
+        assert 'my_tool(url="https://example.com")' in tool_results[1].content
 
     @pytest.mark.asyncio
     async def test_different_tool_args_do_not_reuse_cached_result(self, make_agent):

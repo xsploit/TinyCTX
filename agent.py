@@ -79,10 +79,32 @@ from compact import (
 logger = logging.getLogger(__name__)
 
 MODULES_DIR = Path("modules")
-_REPEATED_TOOL_RESULT_NOTICE = (
-    "[cached identical tool call reused earlier result from this turn — "
-    "refer to the previous tool result instead of calling it again]"
-)
+
+
+def _tool_cache_key(call: ToolCall) -> str:
+    return call.tool_name + "::" + json.dumps(call.args, sort_keys=True, ensure_ascii=False)
+
+
+def _summarize_cached_tool_call(call: ToolCall, *, max_chars: int = 160) -> str:
+    if not call.args:
+        return f"{call.tool_name}()"
+    parts = [
+        f"{key}={json.dumps(value, ensure_ascii=False)}"
+        for key, value in sorted(call.args.items())
+    ]
+    summary = f"{call.tool_name}(" + ", ".join(parts) + ")"
+    summary = summary.replace("\n", " ")
+    if len(summary) > max_chars:
+        return summary[: max_chars - 1] + "…"
+    return summary
+
+
+def _cached_tool_result_notice(call: ToolCall) -> str:
+    return (
+        "[cached exact same tool call reused earlier result from this turn: "
+        + _summarize_cached_tool_call(call)
+        + " — refer to the previous tool result instead of calling it again]"
+    )
 
 
 def _build_llm(cfg: ModelConfig) -> LLM:
@@ -607,11 +629,7 @@ class AgentLoop:
     ) -> ToolResult:
         cache_key = None
         if tool_result_cache is not None:
-            cache_key = (
-                call.tool_name
-                + "::"
-                + json.dumps(call.args, sort_keys=True, ensure_ascii=False)
-            )
+            cache_key = _tool_cache_key(call)
             cached = tool_result_cache.get(cache_key)
             if cached is not None:
                 logger.info(
@@ -621,7 +639,7 @@ class AgentLoop:
                 return ToolResult(
                     call_id=call.call_id,
                     tool_name=call.tool_name,
-                    output=_REPEATED_TOOL_RESULT_NOTICE,
+                    output=_cached_tool_result_notice(call),
                     is_error=cached.is_error,
                     is_image=False,
                 )
