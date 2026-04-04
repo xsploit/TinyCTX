@@ -7,7 +7,13 @@ from pathlib import Path
 from unittest.mock import patch
 import yaml
 
-from bridges.cli.__main__ import CLIBridge, _DimToolLineProcessor
+from prompt_toolkit.document import Document
+
+from bridges.cli.__main__ import (
+    CLIBridge,
+    _DimToolLineProcessor,
+    _SlashCommandCompleter,
+)
 from config import (
     BridgeConfig,
     Config,
@@ -157,6 +163,28 @@ def test_cli_wraps_transcript_by_words(tmp_path):
     )
     assert "Pacific" in wrapped
     assert "Pacif\nic" not in wrapped
+
+
+def test_slash_command_completer_matches_prefix():
+    completions = list(
+        _SlashCommandCompleter().get_completions(
+            Document(text="/se", cursor_position=3),
+            None,
+        )
+    )
+    assert [completion.display_text for completion in completions] == ["/settings"]
+    assert [completion.text for completion in completions] == ["ttings"]
+
+
+def test_slash_command_completer_supports_multiword_command():
+    completions = list(
+        _SlashCommandCompleter().get_completions(
+            Document(text="/debug h", cursor_position=8),
+            None,
+        )
+    )
+    assert [completion.display_text for completion in completions] == ["/debug heartbeat"]
+    assert [completion.text for completion in completions] == ["eartbeat"]
 
 
 def test_settings_command_opens_menu(tmp_path):
@@ -350,3 +378,15 @@ bridges:
     raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     assert raw["llm"]["primary"] == "ollama"
     assert cfg.llm.primary == "ollama"
+
+
+def test_tab_completion_fills_unique_slash_command(tmp_path):
+    cfg = _make_config(tmp_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+    with patch("bridges.cli.__main__.Application", return_value=SimpleNamespace()):
+        bridge._build_application()
+    assert bridge._input_area is not None
+    assert isinstance(bridge._input_area.completer, _SlashCommandCompleter)
+    bridge._input_area.buffer.document = Document(text="/set", cursor_position=4)
+    bridge._complete_input()
+    assert bridge._input_area.text == "/settings"

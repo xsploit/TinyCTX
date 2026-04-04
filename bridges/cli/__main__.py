@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from prompt_toolkit.application import Application
+from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.key_binding import KeyBindings
@@ -63,6 +64,13 @@ _CLI_OPTION_DEFAULTS = {
     "word_wrap": True,
     "quiet_startup": True,
 }
+_SLASH_COMMANDS = (
+    ("/help", "show available commands"),
+    ("/reset", "start a new session"),
+    ("/resume", "reuse the saved session"),
+    ("/settings", "open CLI settings"),
+    ("/debug heartbeat", "fire a heartbeat tick now"),
+)
 _LOG_LEVEL_CHOICES = ("inherit", "warning", "info", "debug", "error")
 _ROUND_TRIP_CHOICES = (10, 20, 30, 40, 60)
 _PROVIDER_PRESETS = {
@@ -123,6 +131,17 @@ _PROVIDER_PRESETS = {
 }
 
 
+def _matching_slash_commands(prefix: str) -> list[tuple[str, str]]:
+    if not prefix.startswith("/"):
+        return []
+    lowered = prefix.lower()
+    return [
+        (command, meta)
+        for command, meta in _SLASH_COMMANDS
+        if command.startswith(lowered)
+    ]
+
+
 class _DimToolLineProcessor(Processor):
     def __init__(self, enabled_getter=None) -> None:
         self._enabled_getter = enabled_getter or (lambda: True)
@@ -134,8 +153,22 @@ class _DimToolLineProcessor(Processor):
         if text.startswith(_DIMMED_LINE_PREFIXES):
             return Transformation(
                 [("class:tool-dim", fragment[1]) for fragment in transformation_input.fragments]
-            )
+        )
         return Transformation(transformation_input.fragments)
+
+
+class _SlashCommandCompleter(Completer):
+    def get_completions(self, document: Document, complete_event):
+        prefix = document.text_before_cursor
+        for command, meta in _matching_slash_commands(prefix):
+            yield Completion(
+                command[len(prefix):],
+                start_position=0,
+                display=command,
+                display_meta=meta,
+                style="class:tool-dim",
+                selected_style="class:menu.selected",
+            )
 
 
 @dataclass
@@ -1160,6 +1193,24 @@ class CLIBridge:
         self._input_area.buffer.reset()
         self._send_task = asyncio.create_task(self._submit_text(text))
 
+    def _complete_input(self) -> None:
+        if self._input_area is None:
+            return
+        buffer = self._input_area.buffer
+        prefix = buffer.text
+        matches = _matching_slash_commands(prefix)
+        if not matches:
+            return
+        if len(matches) == 1:
+            command = matches[0][0]
+            if prefix != command:
+                buffer.document = Document(text=command, cursor_position=len(command))
+            return
+        if buffer.complete_state is None:
+            buffer.start_completion(select_first=False)
+        else:
+            buffer.complete_next()
+
     def _style(self) -> Style:
         return Style.from_dict({
             "": "#d7d7d7 bg:#000000",
@@ -1194,6 +1245,10 @@ class CLIBridge:
             prompt="› ",
             height=1,
             style="class:input-area",
+            completer=_SlashCommandCompleter(),
+            complete_while_typing=Condition(
+                lambda: self._input_area is not None and self._input_area.text.startswith("/")
+            ),
         )
         self._settings_control = FormattedTextControl(
             self._settings_fragments,
@@ -1223,6 +1278,10 @@ class CLIBridge:
         @key_bindings.add("enter", filter=showing_settings, eager=True)
         def _settings_enter(_event) -> None:
             self._activate_settings_selection()
+
+        @key_bindings.add("tab", filter=~showing_settings, eager=True)
+        def _complete(_event) -> None:
+            self._complete_input()
 
         @key_bindings.add("up", filter=showing_settings, eager=True)
         def _settings_up(_event) -> None:
