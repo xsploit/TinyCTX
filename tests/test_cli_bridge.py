@@ -133,6 +133,26 @@ def test_cli_output_wraps_while_input_stays_single_line(tmp_path):
     assert app is not None
 
 
+def test_cli_mouse_capture_defaults_off(tmp_path):
+    cfg = _make_config(tmp_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+    with patch("bridges.cli.__main__.Application", return_value=SimpleNamespace()) as app_cls:
+        bridge._build_application()
+
+    mouse_support = app_cls.call_args.kwargs["mouse_support"]
+    assert mouse_support() is False
+
+
+def test_cli_mouse_capture_can_be_enabled(tmp_path):
+    cfg = _make_config(tmp_path, cli_options={"mouse_capture": True})
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={"mouse_capture": True})
+    with patch("bridges.cli.__main__.Application", return_value=SimpleNamespace()) as app_cls:
+        bridge._build_application()
+
+    mouse_support = app_cls.call_args.kwargs["mouse_support"]
+    assert mouse_support() is True
+
+
 def test_cli_style_uses_black_background_and_red_banner(tmp_path):
     cfg = _make_config(tmp_path)
     bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
@@ -344,6 +364,15 @@ bridges:
     bridge._apply_cli_option("compact_tools", False)
     raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     assert raw["bridges"]["cli"]["options"]["compact_tools"] is False
+
+
+def test_settings_appearance_menu_shows_mouse_capture(tmp_path):
+    cfg = _make_config(tmp_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+    bridge._settings_path = ["root", "appearance"]
+    bridge._settings_selected = [0, 0]
+    lines = "".join(fragment[1] for fragment in bridge._settings_fragments())
+    assert "Mouse capture" in lines
 
 
 def test_settings_root_contains_session_submenu(tmp_path):
@@ -753,6 +782,7 @@ def test_help_mentions_right_click_paste(tmp_path):
     assert "Right click  copy selection, otherwise paste clipboard" in bridge._transcript_blocks[-1]
     assert "Ctrl+C       copy selected text or the transcript" in bridge._transcript_blocks[-1]
     assert "Ctrl+V       paste clipboard into input" in bridge._transcript_blocks[-1]
+    assert "Mouse capture off lets Windows Terminal handle drag-select copy" in bridge._transcript_blocks[-1]
 
 
 def test_copy_command_copies_last_tool_block(tmp_path):

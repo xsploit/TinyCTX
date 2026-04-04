@@ -75,6 +75,7 @@ _MD_CODE_RE = re.compile(r"`[^`\n]+`")
 _CLI_OPTION_DEFAULTS = {
     "compact_tools": True,
     "dim_tools": True,
+    "mouse_capture": False,
     "word_wrap": True,
     "quiet_startup": True,
 }
@@ -574,6 +575,12 @@ class CLIBridge:
                     "kind": "toggle",
                     "option": "word_wrap",
                     "default": True,
+                },
+                {
+                    "label": "Mouse capture",
+                    "kind": "toggle",
+                    "option": "mouse_capture",
+                    "default": False,
                 },
                 {"label": "Back", "kind": "action", "action": "back"},
             ]
@@ -1881,6 +1888,7 @@ class CLIBridge:
                 "  Ctrl+C       copy selected text or the transcript\n"
                 "  Ctrl+V       paste clipboard into input\n"
                 "  Right click  copy selection, otherwise paste clipboard\n"
+                "  Mouse capture off lets Windows Terminal handle drag-select copy\n"
                 "  Ctrl+Q       exit TinyCTX\n"
                 "  /copy all-tools    copy all raw tool calls/results\n"
                 "  /copy transcript   copy the full transcript\n"
@@ -2168,7 +2176,7 @@ class CLIBridge:
             layout=Layout(root, focused_element=self._input_area),
             key_bindings=key_bindings,
             full_screen=True,
-            mouse_support=True,
+            mouse_support=Condition(lambda: self._bool_option("mouse_capture", False)),
             enable_page_navigation_bindings=True,
             style=self._style(),
             before_render=self._before_render,
