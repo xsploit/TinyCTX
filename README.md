@@ -2,6 +2,15 @@
 
 A lightweight agentic assistant framework. Connect it to your LLM, configure a bridge (CLI, Discord, Matrix, or HTTP), and you have a persistent, tool-using AI agent.
 
+## Highlights
+
+- Fullscreen terminal UI with persistent session restore, slash commands, paste refs, and copy helpers
+- Direct web browsing via `web_search`, `browse_url`, and `navigate`
+- Branch-backed conversation history with automatic compaction when context pressure gets high
+- Static + searchable memory with BM25 or embeddings, plus background memory consolidation
+- Detached child branches via `spawn_agent` / `wait_agent` for bounded subagent work
+- Provider presets in the CLI for OpenAI, OpenRouter, Ollama, LM Studio, `llama.cpp`, and custom OpenAI-compatible endpoints
+
 ---
 
 > [!WARNING]
@@ -40,6 +49,7 @@ Open `config.yaml` and set at minimum:
 - Your model's `base_url` and `model` name under `models:`
 - `api_key_env` — the environment variable holding your API key, or `N/A` for local endpoints
 - Which bridge to enable under `bridges:`
+- `max_tool_cycles` — max LLM/tool round trips per turn (default: `20`)
 
 Then export your key and run:
 
@@ -49,6 +59,8 @@ python main.py
 ```
 
 **`example.config.yaml` is the full configuration reference** — every option is documented there with defaults and examples.
+
+If you use the CLI bridge, `/settings` can also update common runtime settings and provider presets without hand-editing `config.yaml`.
 
 ---
 
@@ -65,9 +77,37 @@ bridges:
     options:
       quiet_startup: true      # default: hide startup/runtime INFO chatter in the terminal
       log_level: WARNING       # use INFO or inherit if you want live module logs
+      compact_tools: true      # shorter tool call/result lines in the transcript
+      dim_tools: true          # grey tool/progress rows so chat stands out
+      word_wrap: true          # wrap transcript lines instead of hard-clipping
 ```
 
-Type messages directly in the terminal. `/reset` clears the session, `exit` quits. No extra dependencies.
+The CLI bridge is a fullscreen `prompt_toolkit` TUI with:
+
+- persistent transcript restore from the last CLI session
+- slash command autocomplete
+- provider/settings menus via `/settings`
+- explicit copy helpers via `/copy transcript`, `/copy last-tool`, and `/copy last-error`
+- paste refs like `[Pasted text #1, 332 chars]` for large or multiline clipboard content
+
+Useful keys and commands:
+
+- `Enter` — send message
+- `Ctrl+C` — copy selected text, or copy the transcript if nothing is selected
+- `Ctrl+Q` — quit TinyCTX
+- `/reset` — start a fresh CLI session
+- `/resume` — keep using the saved CLI session
+- `/settings` — open the settings UI
+- `/debug heartbeat` — trigger one heartbeat tick immediately
+
+The settings UI exposes the current round-trip limit (`max_tool_cycles`) plus provider presets for:
+
+- OpenAI
+- OpenRouter
+- Ollama
+- LM Studio
+- `llama.cpp`
+- Custom OpenAI-compatible endpoints
 
 ---
 
@@ -179,6 +219,8 @@ Layout:
 
 ```
 ~/.tinyctx/
+├── agent.db       # Full branch-backed conversation tree
+├── cursors/       # Per-bridge/session cursors (CLI resume uses this)
 ├── SOUL.md        # Agent personality — loaded first, every turn
 ├── AGENTS.md      # Sub-agent or persona definitions
 ├── MEMORY.md      # Long-term facts always in context
@@ -193,6 +235,8 @@ Layout:
 ```
 
 Edit these files any time — they're re-read every turn, no restart needed.
+
+TinyCTX does not keep chat state only in RAM. Conversations are stored in `agent.db` as a branch tree, and the CLI bridge restores the visible transcript from the saved cursor on startup.
 
 ---
 
@@ -227,6 +271,22 @@ The agent also has a `memory_search` tool it can call explicitly to look things 
 
 See `example.config.yaml` under `memory_search:` for all options (chunk strategy, budget, top-k, auto-inject, etc.).
 
+When the turn grows enough to threaten context budget, TinyCTX can also spawn a background memory-consolidation branch instead of stuffing more memory inline.
+
+---
+
+## Conversation Compaction
+
+TinyCTX persists the full conversation tree in `agent.db`, but it does not blindly replay every old message forever. When the active turn gets close to the configured context limit, the agent compacts older history into a summary boundary and keeps the most recent dialogue raw.
+
+This means:
+
+- older work is still preserved on disk
+- active prompt assembly stays smaller and faster
+- the CLI can resume prior sessions without needing the full raw transcript in-context every turn
+
+Compaction is automatic; no extra configuration is required beyond setting a sane `context:` limit for your model.
+
 ---
 
 ## Skills
@@ -236,6 +296,27 @@ Skills are reusable instruction sets the agent can load on demand. Place a folde
 The agent sees a compact index of available skills in its system prompt and calls `use_skill("name")` to load the full instructions when it needs them.
 
 Skills follow the [agentskills.io](https://agentskills.io) convention. Any skill written to that standard works here.
+
+---
+
+## Subagents
+
+TinyCTX can spawn bounded detached child branches for parallel side work:
+
+- `spawn_agent(prompt="...")`
+- `wait_agent(task_id="...")`
+
+Subagents run as child `AgentLoop`s on their own branches and report back by task ID. They are capped by `subagents.max_concurrent` and completed handles are pruned after `subagents.completed_ttl_seconds`.
+
+Example config:
+
+```yaml
+subagents:
+  max_concurrent: 4
+  completed_ttl_seconds: 900
+```
+
+Use them for isolated side tasks, not trivial work you can finish faster in the current turn.
 
 ---
 
@@ -252,8 +333,11 @@ The following tools are available to the agent out of the box (if the correspond
 | `grep` | Search file contents with regex (ripgrep with Python fallback) |
 | `glob_search` | Find files by name pattern, sorted by modification time |
 | `web_search` | Search the web via DuckDuckGo |
-| `browse_url` | Fetch and scrape a specific URL; optional `prompt` param runs a secondary LLM call to extract specific info |
+| `browse_url` | Fetch and scrape a specific URL; supports text or HTML output, optional JS rendering, and an optional `prompt` for focused extraction |
+| `navigate` | Open a page in the browser automation session and return a compact element map |
 | `memory_search` | Search the semantic memory index |
+| `spawn_agent` | Start a detached subagent on a child branch |
+| `wait_agent` | Wait for a spawned subagent to finish or poll its current status |
 | `use_skill` | Load a skill by name |
 | `todo_write` | Update the session task checklist (for multi-step work) |
 | `todo_read` | View the current task list |
