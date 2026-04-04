@@ -24,6 +24,11 @@ compaction:
 #                               max_tokens and temperature are ignored
 #
 #   Embedding models are NOT eligible for llm: routing.
+#
+#   llama.cpp-only prompt reuse knobs:
+#     llama_cpp_cache_prompt: true   # send cache_prompt=true
+#     llama_cpp_sticky_slots: true   # remember returned slot id per TinyCTX session
+#     llama_cpp_slot_id: 0           # optional fixed slot id override
 # ---------------------------------------------------------------------------
 models:
   smart:
@@ -46,6 +51,9 @@ models:
     model: qwen3:32b
     max_tokens: 8192
     temperature: 0.6
+    # If this points at a llama.cpp server instead of Ollama, enable:
+    # llama_cpp_cache_prompt: true
+    # llama_cpp_sticky_slots: true
 
   embed:
     kind: embedding

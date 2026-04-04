@@ -28,6 +28,9 @@ class ModelConfig:
     budget_tokens:    int | None = None   # Anthropic extended thinking: budget_tokens > 0
     reasoning_effort: str | None = None   # OpenAI-compat: "low" | "medium" | "high"
     cache_prompts:      bool        = False  # Anthropic prompt caching on last system message
+    llama_cpp_cache_prompt: bool        = False  # Send cache_prompt=true to llama.cpp-compatible servers
+    llama_cpp_sticky_slots: bool        = False  # Reuse the returned slot id across turns
+    llama_cpp_slot_id:      int | None  = None   # Optional fixed slot id override for llama.cpp servers
     vision:             bool        = False  # Back-compat alias for multimodal chat models
     tokens_per_image:   int | None  = None   # Flat token cost per image_url block (None = vision disabled)
 
@@ -272,6 +275,12 @@ def _parse_model(raw: dict) -> ModelConfig:
         if budget_tokens <= 0:
             raise ValueError(f"budget_tokens must be > 0, got {budget_tokens}")
 
+    llama_cpp_slot_id = raw.get("llama_cpp_slot_id")
+    if llama_cpp_slot_id is not None:
+        llama_cpp_slot_id = int(llama_cpp_slot_id)
+        if llama_cpp_slot_id < 0:
+            raise ValueError(f"llama_cpp_slot_id must be >= 0, got {llama_cpp_slot_id}")
+
     vision = bool(raw.get("vision", False))
 
     return ModelConfig(
@@ -284,6 +293,9 @@ def _parse_model(raw: dict) -> ModelConfig:
         budget_tokens=budget_tokens,
         reasoning_effort=reasoning_effort,
         cache_prompts=bool(raw.get("cache_prompts", False)),
+        llama_cpp_cache_prompt=bool(raw.get("llama_cpp_cache_prompt", False)),
+        llama_cpp_sticky_slots=bool(raw.get("llama_cpp_sticky_slots", False)),
+        llama_cpp_slot_id=llama_cpp_slot_id,
         vision=vision,
         tokens_per_image=tokens_per_image,
     )

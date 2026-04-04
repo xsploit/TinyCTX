@@ -75,6 +75,9 @@ class TestModelConfig:
         assert m.kind == "chat"
         assert m.max_tokens == 2048
         assert m.temperature == 0.7
+        assert m.llama_cpp_cache_prompt is False
+        assert m.llama_cpp_sticky_slots is False
+        assert m.llama_cpp_slot_id is None
         assert m.is_embedding is False
 
     def test_embedding_kind(self):
@@ -417,6 +420,25 @@ class TestLoadHappyPath:
         assert cfg.compaction.keep_last_units == 6
         assert cfg.compaction.summary_max_chars == 4000
 
+    def test_llama_cpp_prompt_cache_flags_parsed(self, tmp_path):
+        p = _write_config(tmp_path, _minimal("""
+            models:
+              main:
+                base_url: http://localhost:8080/v1
+                model: llama3
+                api_key_env: N/A
+                llama_cpp_cache_prompt: true
+                llama_cpp_sticky_slots: true
+                llama_cpp_slot_id: 2
+            llm:
+              primary: main
+        """))
+        cfg = load(str(p))
+        m = cfg.models["main"]
+        assert m.llama_cpp_cache_prompt is True
+        assert m.llama_cpp_sticky_slots is True
+        assert m.llama_cpp_slot_id == 2
+
 
 # ---------------------------------------------------------------------------
 # load() — error cases
@@ -508,6 +530,20 @@ class TestLoadErrors:
     def test_invalid_log_level_raises(self, tmp_path):
         p = _write_config(tmp_path, _minimal("logging:\n  level: CHATTY"))
         with pytest.raises(ValueError, match="Invalid log level"):
+            load(str(p))
+
+    def test_negative_llama_cpp_slot_id_raises(self, tmp_path):
+        p = _write_config(tmp_path, """
+            models:
+              main:
+                base_url: http://localhost/v1
+                model: llama3
+                api_key_env: N/A
+                llama_cpp_slot_id: -1
+            llm:
+              primary: main
+        """)
+        with pytest.raises(ValueError, match="llama_cpp_slot_id"):
             load(str(p))
 
 

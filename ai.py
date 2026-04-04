@@ -91,6 +91,27 @@ def _inject_cache_control(messages: list[dict]) -> list[dict]:
     return messages
 
 
+def _coerce_slot_id(value: Any) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        raw = value.strip()
+        if raw and raw.lstrip("-").isdigit():
+            return int(raw)
+    return None
+
+
+def _extract_slot_id(payload: dict[str, Any]) -> int | None:
+    for container in (payload, payload.get("__verbose")):
+        if not isinstance(container, dict):
+            continue
+        for key in ("id_slot", "slot_id"):
+            slot_id = _coerce_slot_id(container.get(key))
+            if slot_id is not None and slot_id >= 0:
+                return slot_id
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Chat client
 # ---------------------------------------------------------------------------
@@ -113,6 +134,9 @@ class LLM:
         budget_tokens:    int | None = None,
         reasoning_effort: str | None = None,
         cache_prompts:    bool       = False,
+        llama_cpp_cache_prompt: bool      = False,
+        llama_cpp_sticky_slots: bool      = False,
+        llama_cpp_slot_id:      int | None = None,
     ) -> None:
         self.model            = model
         self.endpoint         = f"{base_url.rstrip('/')}/chat/completions"
@@ -123,6 +147,24 @@ class LLM:
         self.budget_tokens    = budget_tokens
         self.reasoning_effort = reasoning_effort
         self.cache_prompts    = cache_prompts
+        self.llama_cpp_cache_prompt = llama_cpp_cache_prompt
+        self.llama_cpp_sticky_slots = llama_cpp_sticky_slots
+        self.llama_cpp_slot_id      = llama_cpp_slot_id
+        self._sticky_slot_id: int | None = None
+
+    def _request_slot_id(self) -> int | None:
+        if self.llama_cpp_slot_id is not None:
+            return self.llama_cpp_slot_id
+        if self.llama_cpp_sticky_slots:
+            return self._sticky_slot_id
+        return None
+
+    def _capture_slot_id(self, payload: dict[str, Any]) -> None:
+        if self.llama_cpp_slot_id is not None or not self.llama_cpp_sticky_slots:
+            return
+        slot_id = _extract_slot_id(payload)
+        if slot_id is not None:
+            self._sticky_slot_id = slot_id
 
     async def stream(
         self,
@@ -180,6 +222,11 @@ class LLM:
             payload["thinking"] = {"type": "enabled", "budget_tokens": self.budget_tokens}
         if self.reasoning_effort is not None:
             payload["reasoning_effort"] = self.reasoning_effort
+        if self.llama_cpp_cache_prompt:
+            payload["cache_prompt"] = True
+        if (slot_id := self._request_slot_id()) is not None:
+            payload["id_slot"] = slot_id
+            payload["slot_id"] = slot_id
 
         headers = {
             "Content-Type":  "application/json",
@@ -211,6 +258,8 @@ class LLM:
                             data = json.loads(data_str)
                         except json.JSONDecodeError:
                             continue
+
+                        self._capture_slot_id(data)
 
                         choices = data.get("choices")
                         if not choices:
