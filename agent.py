@@ -80,7 +80,7 @@ from compact import (
 logger = logging.getLogger(__name__)
 
 MODULES_DIR = Path("modules")
-_EXIT_ERROR_RE = re.compile(r"(^|\n)\[exit \d+\](?=\n|$)")
+_SHELL_EXIT_ERROR_RE_END = re.compile(r"(?:^|\n)\[exit \d+\]\s*\Z")
 
 
 def _tool_cache_key(call: ToolCall) -> str:
@@ -115,11 +115,21 @@ def _cached_tool_result_notice(call: ToolCall, *, is_error: bool) -> str:
     )
 
 
-def _looks_like_failed_tool_output(output: str) -> bool:
+def _looks_like_failed_shell_output(output: str) -> bool:
     lowered = (output or "").lstrip().lower()
-    if lowered.startswith("[error") or lowered.startswith("[blocked") or lowered.startswith("error:"):
+    if lowered.startswith("[error") or lowered.startswith("[blocked"):
         return True
-    return bool(_EXIT_ERROR_RE.search(output or ""))
+    return bool(_SHELL_EXIT_ERROR_RE_END.search(output or ""))
+
+
+def _normalize_error_output(tool_name: str, output: str) -> str:
+    text = (output or "").strip()
+    lowered = text.lstrip().lower()
+    if lowered.startswith("[error") or lowered.startswith("[blocked"):
+        return text
+    if tool_name == "shell":
+        return text
+    return f"[error: {text}]"
 
 
 def _build_llm(cfg: ModelConfig) -> LLM:
@@ -665,7 +675,11 @@ class AgentLoop:
         }
         result = await self.tool_handler.execute_tool_call(proxy)
         raw_output = str(result.get("result", result.get("error", "[no output]")))
-        is_error    = (not result.get("success", False)) or _looks_like_failed_tool_output(raw_output)
+        is_error = not result.get("success", False)
+        if not is_error and call.tool_name == "shell":
+            is_error = _looks_like_failed_shell_output(raw_output)
+        if is_error:
+            raw_output = _normalize_error_output(call.tool_name, raw_output)
 
         # --- vision unwrap ---
         # If view() returned an IMAGE_BLOCK sentinel and the primary model

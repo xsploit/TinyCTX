@@ -29,12 +29,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Awaitable
 
 from contracts import (
-    InboundMessage, AgentEvent,
+    InboundMessage, AgentEvent, AgentError,
     GroupPolicy, ActivationMode,
 )
 from agent import AgentLoop
@@ -102,6 +103,20 @@ class Lane:
                         logger.exception("Event handler raised for %s", self.node_id)
             except Exception:
                 logger.exception("AgentLoop raised for %s — lane continues", self.node_id)
+                try:
+                    reply_to_message_id = msg.message_id if msg is not None else "synthetic"
+                    trace_id = msg.trace_id if msg is not None else str(uuid.uuid4())
+                    await self.event_handler(
+                        AgentError(
+                            tail_node_id=getattr(self.loop, "_tail_node_id", self.node_id),
+                            lane_node_id=self.node_id,
+                            trace_id=trace_id,
+                            reply_to_message_id=reply_to_message_id,
+                            message="[internal error]",
+                        )
+                    )
+                except Exception:
+                    logger.exception("Failed to surface AgentLoop crash for %s", self.node_id)
             finally:
                 self.queue.task_done()
 

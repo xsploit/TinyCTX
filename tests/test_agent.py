@@ -386,12 +386,36 @@ class TestToolExecution:
             """Tool."""
             return "[stderr]\nmissing path\n[exit 1]"
 
-        agent.tool_handler.register_tool(my_tool)
+        agent.tool_handler.register_tool(my_tool, name="shell")
         chunks = await _collect(agent, _make_msg("go", node_id=agent.tail_node_id))
 
         tool_events = [chunk for chunk in chunks if isinstance(chunk, AgentToolResult)]
         assert len(tool_events) == 1
         assert tool_events[0].is_error is True
+
+    @pytest.mark.asyncio
+    async def test_non_shell_output_with_exit_marker_is_not_marked_error(self, make_agent):
+        call_count = {"n": 0}
+
+        async def stream(messages, tools=None):
+            if call_count["n"] == 0:
+                call_count["n"] += 1
+                yield ToolCallAssembled(call_id="c1", tool_name="my_tool", args={})
+            else:
+                yield TextDelta(text="done")
+
+        agent = make_agent(stream)
+
+        def my_tool() -> str:
+            """Tool."""
+            return "build log line\n[exit 1]"
+
+        agent.tool_handler.register_tool(my_tool)
+        chunks = await _collect(agent, _make_msg("go", node_id=agent.tail_node_id))
+
+        tool_events = [chunk for chunk in chunks if isinstance(chunk, AgentToolResult)]
+        assert len(tool_events) == 1
+        assert tool_events[0].is_error is False
 
 
 # ---------------------------------------------------------------------------

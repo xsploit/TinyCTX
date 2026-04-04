@@ -61,7 +61,7 @@ _TINYCTX_BANNER = (
 )
 _DIMMED_LINE_PREFIXES = ("tool ", "ok ", "err ", "thinking…")
 _PASTED_TEXT_REF = re.compile(r"\[Pasted text #(\d+)(?:[^\]]*)\]")
-_EXIT_ERROR_RE = re.compile(r"(^|\n)\[exit \d+\](?=\n|$)")
+_SHELL_EXIT_ERROR_RE_END = re.compile(r"(?:^|\n)\[exit \d+\]\s*\Z")
 _CLI_OPTION_DEFAULTS = {
     "compact_tools": True,
     "dim_tools": True,
@@ -964,14 +964,13 @@ class CLIBridge:
             return "[non-text content]"
         return str(content).strip()
 
-    def _looks_like_error_output(self, output: str) -> bool:
+    def _looks_like_error_output(self, tool_name: str, output: str) -> bool:
         lowered = (output or "").lstrip().lower()
-        return (
-            lowered.startswith("[error")
-            or lowered.startswith("error:")
-            or lowered.startswith("[blocked")
-            or bool(_EXIT_ERROR_RE.search(output or ""))
-        )
+        if lowered.startswith("[error") or lowered.startswith("[blocked"):
+            return True
+        if tool_name == "shell":
+            return bool(_SHELL_EXIT_ERROR_RE_END.search(output or ""))
+        return False
 
     def _paste_ref(self, paste_id: int, text: str) -> str:
         char_count = len(text)
@@ -1056,6 +1055,28 @@ class CLIBridge:
         if self._input_area is not None and self._input_area.text:
             return self._write_clipboard_text(self._input_area.text)
         return False
+
+    def _generation_running(self) -> bool:
+        return self._send_task is not None and not self._send_task.done()
+
+    def _notify_generation_running(self) -> None:
+        notice = "[generation already running — press Esc to abort or wait for the current reply]"
+        self._set_status("busy")
+        if not self._transcript_blocks or self._transcript_blocks[-1] != notice:
+            self._append_block(notice)
+        self._refresh_output(self._resolve_runtime_log_level())
+
+    def _abort_active_generation(self) -> bool:
+        if not self._generation_running() or not self._cursor:
+            return False
+        abort_generation = getattr(self._gateway, "abort_generation", None)
+        if abort_generation is None:
+            return False
+        if not abort_generation(self._cursor):
+            return False
+        self._set_status("aborting")
+        self._refresh_output(self._resolve_runtime_log_level())
+        return True
 
     def _is_tool_block(self, block: str) -> bool:
         return block.startswith(("tool ", "ok ", "err "))
@@ -1206,12 +1227,12 @@ class CLIBridge:
                 tool_name = tool_names.get(entry.tool_call_id or "", "tool")
                 if output:
                     blocks.append(
-                        self._tool_result_line(
-                            tool_name,
-                            output,
-                            self._looks_like_error_output(output),
+                            self._tool_result_line(
+                                tool_name,
+                                output,
+                                self._looks_like_error_output(tool_name, output),
+                            )
                         )
-                    )
 
         self._transcript_blocks = blocks
         return len(blocks)
@@ -1363,8 +1384,11 @@ class CLIBridge:
         elif isinstance(event, AgentError):
             self._thinking = False
             self._current_stream = ""
-            self._set_status("error")
-            self._append_block(f"error: {event.message}")
+            if event.message == "[generation aborted]":
+                self._append_block("[generation aborted]")
+            else:
+                self._append_block(f"error: {event.message}")
+            self._set_status("ready")
             self._refresh_output(log_level)
             self._reply_done.set()
 
@@ -1416,6 +1440,7 @@ class CLIBridge:
             self._append_block(
                 "shortcuts\n"
                 "  Enter        send message\n"
+                "  Esc          abort the current generation\n"
                 "  Ctrl+C       copy selected text or the transcript\n"
                 "  Ctrl+Q       exit TinyCTX\n"
                 "  /copy transcript   copy the full transcript\n"
@@ -1467,7 +1492,8 @@ class CLIBridge:
     def _submit_from_buffer(self) -> None:
         if self._input_area is None:
             return
-        if self._send_task is not None and not self._send_task.done():
+        if self._generation_running():
+            self._notify_generation_running()
             return
         text = self._input_area.text
         pasted_texts = dict(self._pasted_texts)
@@ -1595,6 +1621,10 @@ class CLIBridge:
         @key_bindings.add("escape", filter=showing_settings, eager=True)
         def _settings_back(_event) -> None:
             self._back_settings()
+
+        @key_bindings.add("escape", filter=~showing_settings, eager=True)
+        def _abort_generation(_event) -> None:
+            self._abort_active_generation()
 
         @key_bindings.add("c-c", eager=True)
         @key_bindings.add("c-insert", eager=True)

@@ -20,6 +20,7 @@ import pytest
 
 from contracts import (
     ActivationMode,
+    AgentError,
     ContentType,
     GroupPolicy,
     InboundMessage,
@@ -462,3 +463,33 @@ class TestRouterGroupLaneIntegration:
         await asyncio.sleep(0)
         result = gw.set_group_activation(nid, "always")
         assert result is False  # plain Lane, not GroupLane
+
+    @pytest.mark.asyncio
+    async def test_lane_crash_surfaces_agent_error(self, gw):
+        nid = _node_id()
+        handler = AsyncMock()
+        gw.register_platform_handler("matrix", handler)
+        gw._node_platforms[nid] = "matrix"
+
+        async def _boom_run(msg, abort_event=None):
+            raise RuntimeError("boom")
+            yield
+
+        gw._mock_loop_instance.run = _boom_run
+
+        msg = InboundMessage(
+            tail_node_id=nid,
+            author=_make_user(),
+            content_type=ContentType.TEXT,
+            text="hello",
+            message_id="m1",
+            timestamp=time.time(),
+        )
+
+        await gw.push(msg)
+        await asyncio.sleep(0)
+
+        assert handler.await_count == 1
+        event = handler.await_args.args[0]
+        assert isinstance(event, AgentError)
+        assert event.message == "[internal error]"

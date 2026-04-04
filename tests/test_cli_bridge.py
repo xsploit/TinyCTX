@@ -5,7 +5,7 @@ import json
 import logging
 from types import SimpleNamespace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import yaml
 
 from prompt_toolkit.document import Document
@@ -15,6 +15,7 @@ from bridges.cli.__main__ import (
     _DimToolLineProcessor,
     _SlashCommandCompleter,
 )
+from contracts import AgentError
 from config import (
     BridgeConfig,
     Config,
@@ -472,6 +473,37 @@ def test_submit_text_renders_placeholder_but_sends_expanded_paste(tmp_path):
     assert bridge._transcript_blocks[-1] == "› [Pasted text #1, 10 chars]"
 
 
+def test_submit_from_buffer_reports_running_generation(tmp_path):
+    cfg = _make_config(tmp_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+    with patch("bridges.cli.__main__.Application", return_value=SimpleNamespace()):
+        bridge._build_application()
+
+    assert bridge._input_area is not None
+    bridge._input_area.text = "hello"
+    bridge._send_task = MagicMock()
+    bridge._send_task.done.return_value = False
+
+    bridge._submit_from_buffer()
+
+    assert bridge._input_area.text == "hello"
+    assert bridge._transcript_blocks[-1] == "[generation already running — press Esc to abort or wait for the current reply]"
+    assert bridge._footer_text() == "working busy"
+
+
+def test_abort_active_generation_calls_gateway(tmp_path):
+    cfg = _make_config(tmp_path)
+    gateway = SimpleNamespace(_config=cfg, abort_generation=MagicMock(return_value=True))
+    bridge = CLIBridge(gateway, options={})
+    bridge._cursor = "cursor-1"
+    bridge._send_task = MagicMock()
+    bridge._send_task.done.return_value = False
+
+    assert bridge._abort_active_generation() is True
+    gateway.abort_generation.assert_called_once_with("cursor-1")
+    assert bridge._footer_text() == "working aborting"
+
+
 def test_copy_primary_text_prefers_selected_output(tmp_path):
     cfg = _make_config(tmp_path)
     bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
@@ -536,6 +568,24 @@ def test_copy_command_copies_last_error_block(tmp_path):
         "tool shell bad command\nerr shell [stderr] boom [exit 1]"
     )
     assert bridge._transcript_blocks[-1] == "copied last error block"
+
+
+def test_agent_error_resets_status_to_ready(tmp_path):
+    cfg = _make_config(tmp_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+
+    event = AgentError(
+        tail_node_id="tail-1",
+        lane_node_id="lane-1",
+        trace_id="trace-1",
+        reply_to_message_id="msg-1",
+        message="[internal error]",
+    )
+
+    asyncio.run(bridge.handle_event(event))
+
+    assert bridge._transcript_blocks[-1] == "error: [internal error]"
+    assert bridge._footer_text() == "working ready"
 
 
 def test_cli_restores_transcript_from_saved_cursor(tmp_path):
@@ -621,3 +671,35 @@ def test_cli_restores_shell_error_history_as_err(tmp_path):
 
     assert restored == 3
     assert bridge._transcript_blocks[2].startswith("err shell")
+
+
+def test_cli_restore_non_shell_exit_marker_stays_ok(tmp_path):
+    cfg = _make_config(tmp_path)
+    gateway = SimpleNamespace(_config=cfg)
+    bridge = CLIBridge(gateway, options={})
+
+    db = ConversationDB(tmp_path / "agent.db")
+    root = db.get_root()
+    session = db.add_node(parent_id=root.id, role="system", content="session:cli")
+    user = db.add_node(parent_id=session.id, role="user", content="show logs")
+    assistant = db.add_node(
+        parent_id=user.id,
+        role="assistant",
+        content="",
+        tool_calls=json.dumps([
+            {"id": "call-1", "name": "my_tool", "arguments": {}}
+        ]),
+    )
+    tool = db.add_node(
+        parent_id=assistant.id,
+        role="tool",
+        content="build log line\n[exit 1]",
+        tool_call_id="call-1",
+    )
+    bridge._cursor = tool.id
+    db.close()
+
+    restored = bridge._restore_transcript_from_cursor()
+
+    assert restored == 3
+    assert bridge._transcript_blocks[2].startswith("ok my_tool")
