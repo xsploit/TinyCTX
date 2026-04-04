@@ -1857,6 +1857,13 @@ class CLIBridge:
 
         key_bindings = KeyBindings()
         showing_settings = Condition(self._settings_open)
+        output_has_focus = Condition(
+            lambda: (
+                self._application is not None
+                and self._output_area is not None
+                and self._application.layout.has_focus(self._output_area)
+            )
+        )
 
         @key_bindings.add("enter", filter=~showing_settings, eager=True)
         def _submit(_event) -> None:
@@ -1919,11 +1926,9 @@ class CLIBridge:
             else:
                 event.app.exit(result=None)
 
-        @key_bindings.add("<any>", filter=~showing_settings, eager=True)
+        @key_bindings.add("<any>", filter=~showing_settings & output_has_focus, eager=True)
         def _recover_input_focus(event) -> None:
             if self._application is None or self._input_area is None or self._output_area is None:
-                return
-            if not self._application.layout.has_focus(self._output_area):
                 return
             data = event.data or ""
             if len(data) != 1 or not data.isprintable():
