@@ -106,19 +106,26 @@ def register(agent) -> None:
     blacklist = load_blacklist()
 
     # ------------------------------------------------------------------
-    # File-state tracking (read-before-write + staleness detection)
+    # File-state tracking (read-before-write + staleness + unchanged detection)
     # ------------------------------------------------------------------
-    # Maps absolute file path → mtime (float) at the time of last view().
+    # Maps absolute file path → dict with:
+    #   mtime:      float — mtime at last read/write
+    #   view_range: tuple | None — (start, end) from last view(), None = full file
+    #   line_count: int — total lines at last full read
     # Persists for the session lifetime; cleared on agent reset.
     if not hasattr(agent, '_file_read_state'):
         agent._file_read_state = {}
 
-    file_read_state: dict[str, float] = agent._file_read_state
+    file_read_state: dict[str, dict] = agent._file_read_state
 
-    def _record_read(p: Path) -> None:
-        """Record that we just read a file — store its current mtime."""
+    def _record_read(p: Path, *, view_range: tuple | None = None, line_count: int = 0) -> None:
+        """Record that we just read a file — store its current mtime and read params."""
         try:
-            file_read_state[str(p)] = p.stat().st_mtime
+            file_read_state[str(p)] = {
+                "mtime": p.stat().st_mtime,
+                "view_range": view_range,
+                "line_count": line_count,
+            }
         except OSError:
             pass
 
@@ -137,7 +144,7 @@ def register(agent) -> None:
             current_mtime = p.stat().st_mtime
         except OSError:
             return None  # file vanished — let the write handle it
-        recorded_mtime = file_read_state[abs_key]
+        recorded_mtime = file_read_state[abs_key]["mtime"]
         if current_mtime > recorded_mtime:
             return (
                 f"[error: {p.name} has been modified since it was last read "
@@ -146,12 +153,43 @@ def register(agent) -> None:
             )
         return None
 
+    _WRITTEN_SENTINEL = object()  # distinguishes "written" from "read with no range"
+
     def _update_after_write(p: Path) -> None:
-        """Update tracked mtime after a successful write."""
+        """Update tracked mtime after a successful write. Uses a sentinel
+        view_range so a subsequent view() won't return the unchanged stub."""
         try:
-            file_read_state[str(p)] = p.stat().st_mtime
+            file_read_state[str(p)] = {
+                "mtime": p.stat().st_mtime,
+                "view_range": _WRITTEN_SENTINEL,  # never matches a real read
+                "line_count": 0,
+            }
         except OSError:
             pass
+
+    def _check_unchanged(p: Path, view_range: tuple | None) -> str | None:
+        """If the file hasn't changed since the last identical read, return a
+        short stub instead of the full content. Returns None if the file should
+        be read normally."""
+        abs_key = str(p)
+        if abs_key not in file_read_state:
+            return None
+        state = file_read_state[abs_key]
+        # Only dedup when the view_range matches the previous read
+        if state.get("view_range") != view_range:
+            return None
+        try:
+            current_mtime = p.stat().st_mtime
+        except OSError:
+            return None
+        if current_mtime != state["mtime"]:
+            return None
+        lc = state.get("line_count", 0)
+        line_info = f", {lc} lines" if lc else ""
+        return (
+            f"[{p.name} unchanged since last read{line_info}. "
+            "The content from the earlier view() is still current.]"
+        )
 
     def resolve(raw: str) -> Path:
         p = Path(raw)
@@ -199,34 +237,45 @@ def register(agent) -> None:
             return f"{IMAGE_BLOCK_PREFIX}{mime};{b64}"
 
         # --- text handling ---
+        # Normalize view_range early so we can use it for unchanged detection.
+        parsed_range: tuple | None = None
+        if view_range:
+            try:
+                if isinstance(view_range, str):
+                    range_parts = []
+                    for chunk in view_range.split(','):
+                        chunk = chunk.strip()
+                        if '-' in chunk:
+                            s, e = chunk.split('-', 1)
+                            range_parts.extend([s.strip(), e.strip()])
+                        else:
+                            range_parts.append(chunk)
+                    view_range = range_parts
+                parsed_range = (int(view_range[0]), int(view_range[1]))
+            except (ValueError, IndexError):
+                return "[error: view_range must be [start, end] or 'start,end' integers]"
+
+        # Check if the file is unchanged since the last identical read.
+        # Returns a short stub to save tokens on repetitive reads.
+        unchanged = _check_unchanged(p, parsed_range)
+        if unchanged:
+            return unchanged
+
         try:
             text = p.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             return "[error: binary file, cannot read as text]"
 
-        # Track that we read this file (for staleness detection).
-        _record_read(p)
-
         lines = text.splitlines()
         total = len(lines)
-        if view_range:
-            try:
-                # If the agent sent a string like "1,20", convert it to a list [1, 20]
-                if isinstance(view_range, str):
-                    parts = []
-                    for chunk in view_range.split(','):
-                        chunk = chunk.strip()
-                        if '-' in chunk:
-                            start, end = chunk.split('-', 1)
-                            parts.extend([start.strip(), end.strip()])
-                        else:
-                            parts.append(chunk)
-                    view_range = parts
-                start = int(view_range[0]) - 1
-                end   = int(view_range[1]) if int(view_range[1]) != -1 else total
-                lines = lines[start:end]
-            except (ValueError, IndexError):
-                return "[error: view_range must be [start, end] or 'start,end' integers]"
+
+        # Track that we read this file (for staleness detection).
+        _record_read(p, view_range=parsed_range, line_count=total)
+
+        if parsed_range:
+            start = parsed_range[0] - 1
+            end = parsed_range[1] if parsed_range[1] != -1 else total
+            lines = lines[start:end]
 
         return f"[{p} | {total} lines]\n" + "\n".join(
             f"{i:>6}\t{l}" for i, l in enumerate(lines, 1)

@@ -406,3 +406,68 @@ class TestTrailingWhitespace:
         assert "replaced" in result
         content = (workspace / "indent.txt").read_text(encoding="utf-8")
         assert "    return 42" in content
+
+
+# ===================================================================
+# Unchanged file detection — view() returns stub on re-read
+# ===================================================================
+
+class TestUnchangedDetection:
+    def test_second_read_returns_stub(self, tools, workspace):
+        """Reading the same file twice without changes returns a short stub."""
+        result1 = tools["view"](path="hello.py")
+        assert "def hello" in result1  # full content
+        result2 = tools["view"](path="hello.py")
+        assert "unchanged" in result2
+        assert "def hello" not in result2  # no full content
+
+    def test_stub_includes_line_count(self, tools, workspace):
+        result1 = tools["view"](path="hello.py")
+        result2 = tools["view"](path="hello.py")
+        assert "2 lines" in result2  # hello.py has 2 lines
+
+    def test_modified_file_not_stubbed(self, tools, workspace):
+        """If the file changes between reads, return full content."""
+        tools["view"](path="hello.py")
+        time.sleep(0.05)
+        (workspace / "hello.py").write_text("# changed\n", encoding="utf-8")
+        result = tools["view"](path="hello.py")
+        assert "changed" in result
+        assert "unchanged" not in result
+
+    def test_different_range_not_stubbed(self, tools, workspace):
+        """Different view_range should return full content."""
+        tools["view"](path="hello.py")  # full read
+        result = tools["view"](path="hello.py", view_range=[1, 1])  # partial read
+        assert "unchanged" not in result
+
+    def test_same_range_returns_stub(self, tools, workspace):
+        """Same view_range on unchanged file returns stub."""
+        tools["view"](path="hello.py", view_range=[1, 1])
+        result = tools["view"](path="hello.py", view_range=[1, 1])
+        assert "unchanged" in result
+
+    def test_write_clears_stub(self, tools, workspace):
+        """After str_replace, next view() returns full content (not stub)."""
+        tools["view"](path="hello.py")
+        tools["str_replace"](path="hello.py", old_str="world", new_str="earth")
+        result = tools["view"](path="hello.py")
+        assert "earth" in result
+        assert "unchanged" not in result
+
+    def test_write_file_clears_stub(self, tools, workspace):
+        """After write_file, next view() returns full content."""
+        tools["view"](path="hello.py")
+        tools["write_file"](path="hello.py", content="# new\n", mode="overwrite")
+        result = tools["view"](path="hello.py")
+        assert "new" in result
+        assert "unchanged" not in result
+
+    def test_directory_listing_not_affected(self, tools, workspace):
+        """Directory listing should never return a stub."""
+        result1 = tools["view"](path=".")
+        result2 = tools["view"](path=".")
+        # Both should be full listings
+        assert "hello.py" in result1
+        assert "hello.py" in result2
+        assert "unchanged" not in result2
