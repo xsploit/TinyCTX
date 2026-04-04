@@ -4,6 +4,7 @@ from config.__main__ import (
     apply_logging,
     resolve_log_level,
     update_config_values,
+    update_config_section,
     update_model_profile,
     update_bridge_options,
     set_primary_model,
@@ -17,4 +18,5 @@ from config.__main__ import (
     WorkspaceConfig,
     LoggingConfig,
     AttachmentConfig,
+    CompactionConfig,
 )

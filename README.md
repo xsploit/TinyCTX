@@ -277,7 +277,7 @@ When the turn grows enough to threaten context budget, TinyCTX can also spawn a 
 
 ## Conversation Compaction
 
-TinyCTX persists the full conversation tree in `agent.db`, but it does not blindly replay every old message forever. When the active turn gets close to the configured context limit, the agent compacts older history into a summary boundary and keeps the most recent dialogue raw.
+TinyCTX persists the full conversation tree in `agent.db`, but it does not blindly replay every old message forever. When the active turn gets close to the configured context limit, the agent can compact older history into a summary boundary and keep the most recent dialogue raw.
 
 This means:
 
@@ -285,7 +285,23 @@ This means:
 - active prompt assembly stays smaller and faster
 - the CLI can resume prior sessions without needing the full raw transcript in-context every turn
 
-Compaction is automatic; no extra configuration is required beyond setting a sane `context:` limit for your model.
+Compaction is configurable through the top-level `compaction:` block:
+
+```yaml
+compaction:
+  enabled: true
+  trigger_pct: 0.90
+  keep_last_units: 4
+  summary_max_chars: 6000
+```
+
+Useful notes:
+
+- set `enabled: false` to disable summary compaction entirely
+- raise `trigger_pct` to `0.95` or `1.0` if you want it to interfere less with llama.cpp prompt-cache reuse
+- increase `keep_last_units` if you want more recent raw turns preserved outside the compact summary
+
+The CLI settings UI also exposes the main compaction controls under `Behavior`.
 
 ---
 

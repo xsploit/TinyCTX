@@ -217,7 +217,7 @@ def test_settings_navigation_enters_submenu_and_applies_choice(tmp_path):
     bridge._move_settings(2)
     bridge._activate_settings_selection()
     assert bridge._settings_path[-1] == "behavior"
-    bridge._move_settings(1)
+    bridge._move_settings(2)
     bridge._activate_settings_selection()
     assert bridge._settings_path[-1] == "log_level"
     bridge._move_settings(3)
@@ -309,6 +309,87 @@ def test_settings_behavior_menu_shows_round_trips_value(tmp_path):
     lines = "".join(fragment[1] for fragment in bridge._settings_fragments())
     assert "Agent round trips" in lines
     assert "20" in lines
+
+
+def test_settings_behavior_menu_shows_compaction_value(tmp_path):
+    cfg = _make_config(tmp_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+    bridge._settings_path = ["root", "behavior"]
+    bridge._settings_selected = [0, 0]
+    lines = "".join(fragment[1] for fragment in bridge._settings_fragments())
+    assert "Context compaction" in lines
+    assert "on" in lines
+
+
+def test_settings_compaction_menu_updates_runtime_config(tmp_path):
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(
+        """
+models:
+  main:
+    base_url: http://localhost:8080/v1
+    model: llama3
+    api_key_env: N/A
+llm:
+  primary: main
+compaction:
+  enabled: true
+  trigger_pct: 0.9
+  keep_last_units: 4
+bridges:
+  cli:
+    enabled: true
+    options: {}
+""".strip(),
+        encoding="utf-8",
+    )
+    cfg = _make_config(tmp_path)
+    setattr(cfg, "_source_path", cfg_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+
+    bridge._settings_path = ["root", "behavior", "compaction"]
+    bridge._settings_selected = [0, 0, 0]
+    bridge._activate_settings_selection()
+
+    raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert raw["compaction"]["enabled"] is False
+    assert cfg.compaction.enabled is False
+
+
+def test_settings_compaction_trigger_menu_updates_runtime_config(tmp_path):
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(
+        """
+models:
+  main:
+    base_url: http://localhost:8080/v1
+    model: llama3
+    api_key_env: N/A
+llm:
+  primary: main
+compaction:
+  enabled: true
+  trigger_pct: 0.9
+  keep_last_units: 4
+bridges:
+  cli:
+    enabled: true
+    options: {}
+""".strip(),
+        encoding="utf-8",
+    )
+    cfg = _make_config(tmp_path)
+    setattr(cfg, "_source_path", cfg_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+
+    bridge._settings_path = ["root", "behavior", "compaction", "compaction_trigger"]
+    bridge._settings_selected = [0, 0, 0, 2]
+    bridge._activate_settings_selection()
+
+    raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert raw["compaction"]["trigger_pct"] == 1.0
+    assert cfg.compaction.trigger_pct == 1.0
+    assert bridge._settings_path[-1] == "compaction"
 
 
 def test_settings_providers_menu_shows_active_profile_context(tmp_path):

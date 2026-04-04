@@ -160,6 +160,25 @@ class LoggingConfig:
 
 
 @dataclass
+class CompactionConfig:
+    enabled: bool = True
+    trigger_pct: float = 0.90
+    keep_last_units: int = 4
+    summary_max_chars: int = 6000
+
+    def __post_init__(self) -> None:
+        self.trigger_pct = float(self.trigger_pct)
+        self.keep_last_units = int(self.keep_last_units)
+        self.summary_max_chars = int(self.summary_max_chars)
+        if self.trigger_pct <= 0:
+            raise ValueError("compaction.trigger_pct must be > 0")
+        if self.keep_last_units < 1:
+            raise ValueError("compaction.keep_last_units must be >= 1")
+        if self.summary_max_chars < 1:
+            raise ValueError("compaction.summary_max_chars must be >= 1")
+
+
+@dataclass
 class Config:
     models:          dict[str, ModelConfig]
     llm:             LLMRoutingConfig
@@ -170,6 +189,7 @@ class Config:
     logging:         LoggingConfig           = field(default_factory=LoggingConfig)
     max_tool_cycles: int                     = 20
     context:         int                     = 16384
+    compaction:      CompactionConfig        = field(default_factory=CompactionConfig)
     attachments:     AttachmentConfig        = field(default_factory=AttachmentConfig)
     # Catch-all for unknown top-level keys (e.g. mcp:, custom module config, etc.)
     # Modules access this via agent.config.extra.get("mcp", {})
@@ -269,10 +289,19 @@ def _parse_model(raw: dict) -> ModelConfig:
     )
 
 
+def _parse_compaction(raw: dict) -> CompactionConfig:
+    return CompactionConfig(
+        enabled=bool(raw.get("enabled", True)),
+        trigger_pct=float(raw.get("trigger_pct", 0.90)),
+        keep_last_units=int(raw.get("keep_last_units", 4)),
+        summary_max_chars=int(raw.get("summary_max_chars", 6000)),
+    )
+
+
 # Known top-level keys — everything else goes into Config.extra
 _KNOWN_KEYS = {
     "models", "llm", "router", "bridges", "gateway", "workspace",
-    "logging", "max_tool_cycles", "context", "attachments",
+    "logging", "max_tool_cycles", "context", "compaction", "attachments",
 }
 
 
@@ -362,6 +391,9 @@ def load(path="config.yaml") -> Config:
         uploads_dir=att_raw.get("uploads_dir", "uploads"),
     )
 
+    # ------------------------------------------------------------------ compaction
+    compaction = _parse_compaction(raw.get("compaction", {}))
+
     # ------------------------------------------------------------------ extra
     extra = {k: v for k, v in raw.items() if k not in _KNOWN_KEYS}
 
@@ -378,6 +410,7 @@ def load(path="config.yaml") -> Config:
         logging=LoggingConfig(level=log_raw.get("level", "INFO")),
         max_tool_cycles=int(raw.get("max_tool_cycles", 20)),
         context=int(raw.get("context", 16384)),
+        compaction=compaction,
         attachments=attachments,
         extra=extra,
     )
@@ -399,6 +432,32 @@ def update_config_values(
         raw = yaml.safe_load(f) or {}
 
     raw.update(updates)
+
+    with p.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(raw, f, sort_keys=False)
+
+    return p.resolve()
+
+
+def update_config_section(
+    section_name: str,
+    updates: dict,
+    *,
+    path: str | Path = "config.yaml",
+) -> Path:
+    """Merge updates into a top-level mapping section in config.yaml."""
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Config file not found: {p.resolve()}")
+
+    with p.open(encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+
+    section = raw.get(section_name)
+    if not isinstance(section, dict):
+        section = {}
+    section.update(updates)
+    raw[section_name] = section
 
     with p.open("w", encoding="utf-8") as f:
         yaml.safe_dump(raw, f, sort_keys=False)

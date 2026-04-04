@@ -20,6 +20,7 @@ import yaml
 
 from config import (
     load,
+    update_config_section,
     update_config_values,
     update_model_profile,
     update_bridge_options,
@@ -32,6 +33,7 @@ from config import (
     LoggingConfig,
     LLMRoutingConfig,
     FallbackOnConfig,
+    CompactionConfig,
 )
 
 
@@ -93,6 +95,19 @@ class TestModelConfig:
         monkeypatch.setenv("MY_API_KEY", "secret-123")
         m = ModelConfig(model="x", base_url="http://x", api_key_env="MY_API_KEY")
         assert m.api_key == "secret-123"
+
+
+class TestCompactionConfig:
+    def test_defaults(self):
+        cfg = CompactionConfig()
+        assert cfg.enabled is True
+        assert cfg.trigger_pct == 0.90
+        assert cfg.keep_last_units == 4
+        assert cfg.summary_max_chars == 6000
+
+    def test_invalid_trigger_pct_raises(self):
+        with pytest.raises(ValueError, match="trigger_pct"):
+            CompactionConfig(trigger_pct=0)
 
 
 # ---------------------------------------------------------------------------
@@ -383,8 +398,24 @@ class TestLoadHappyPath:
         cfg = load(str(p))
         assert cfg.context == 16384
         assert cfg.max_tool_cycles == 20
+        assert cfg.compaction.enabled is True
+        assert cfg.compaction.trigger_pct == 0.90
         assert cfg.gateway.enabled is False
         assert cfg.logging.level == "INFO"
+
+    def test_compaction_block_parsed(self, tmp_path):
+        p = _write_config(tmp_path, _minimal("""
+            compaction:
+              enabled: false
+              trigger_pct: 1.0
+              keep_last_units: 6
+              summary_max_chars: 4000
+        """))
+        cfg = load(str(p))
+        assert cfg.compaction.enabled is False
+        assert cfg.compaction.trigger_pct == 1.0
+        assert cfg.compaction.keep_last_units == 6
+        assert cfg.compaction.summary_max_chars == 4000
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +545,20 @@ class TestUpdateConfigValues:
         update_config_values({"max_tool_cycles": 30}, path=p)
         raw = yaml.safe_load(p.read_text(encoding="utf-8"))
         assert raw["max_tool_cycles"] == 30
+
+
+class TestUpdateConfigSection:
+    def test_updates_nested_section_values(self, tmp_path):
+        p = _write_config(tmp_path, _minimal("""
+            compaction:
+              enabled: true
+              trigger_pct: 0.9
+        """))
+        update_config_section("compaction", {"enabled": False, "keep_last_units": 6}, path=p)
+        raw = yaml.safe_load(p.read_text(encoding="utf-8"))
+        assert raw["compaction"]["enabled"] is False
+        assert raw["compaction"]["trigger_pct"] == 0.9
+        assert raw["compaction"]["keep_last_units"] == 6
 
 
 class TestUpdateModelProfile:

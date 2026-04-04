@@ -303,12 +303,20 @@ class AgentLoop:
                 logger.exception("Failed to load module '%s'", entry.name)
 
     async def _maybe_compact_context(self) -> bool:
-        pretrim_tokens = int(self.context.state.get("tokens_used_pre_trim", 0) or 0)
-        token_limit = int(self.config.context or 0)
-        if not should_compact(pretrim_tokens, token_limit):
+        compaction_cfg = getattr(self.config, "compaction", None)
+        if compaction_cfg is not None and not getattr(compaction_cfg, "enabled", True):
             return False
 
-        plan = build_compaction_plan(self.context.dialogue)
+        pretrim_tokens = int(self.context.state.get("tokens_used_pre_trim", 0) or 0)
+        token_limit = int(self.config.context or 0)
+        trigger_pct = float(getattr(compaction_cfg, "trigger_pct", 0.90) if compaction_cfg is not None else 0.90)
+        keep_last_units = int(getattr(compaction_cfg, "keep_last_units", 4) if compaction_cfg is not None else 4)
+        summary_max_chars = int(getattr(compaction_cfg, "summary_max_chars", 6000) if compaction_cfg is not None else 6000)
+
+        if not should_compact(pretrim_tokens, token_limit, trigger_pct=trigger_pct):
+            return False
+
+        plan = build_compaction_plan(self.context.dialogue, keep_last_units=keep_last_units)
         if plan is None:
             return False
 
@@ -321,7 +329,7 @@ class AgentLoop:
             return False
 
         active = self.context.compact(
-            format_summary(summary),
+            format_summary(summary, max_chars=summary_max_chars),
             preserved_tail=plan.preserved_tail,
             metadata={
                 "entries_summarized": len(plan.to_summarize),

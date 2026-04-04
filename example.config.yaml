@@ -4,6 +4,18 @@
 context: 16384
 
 # ---------------------------------------------------------------------------
+# compaction:
+#   Summary-based history compaction when the active prompt gets large.
+#   Disable this or raise trigger_pct if you want to preserve llama.cpp
+#   prompt-cache locality more aggressively during long tool chains.
+# ---------------------------------------------------------------------------
+compaction:
+  enabled: true
+  trigger_pct: 0.90
+  keep_last_units: 4
+  summary_max_chars: 6000
+
+# ---------------------------------------------------------------------------
 # models:
 #   Named model definitions. Add as many as you need.
 #

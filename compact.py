@@ -13,9 +13,9 @@ from dataclasses import dataclass
 
 from context import HistoryEntry, ROLE_ASSISTANT, ROLE_TOOL
 
-COMPACT_TRIGGER_PCT = 0.90
-COMPACT_KEEP_LAST_UNITS = 4
-COMPACT_SUMMARY_MAX_CHARS = 6000
+DEFAULT_COMPACT_TRIGGER_PCT = 0.90
+DEFAULT_COMPACT_KEEP_LAST_UNITS = 4
+DEFAULT_COMPACT_SUMMARY_MAX_CHARS = 6000
 
 COMPACT_SYSTEM_PROMPT = (
     "You are compressing older TinyCTX conversation history so work can continue "
@@ -38,16 +38,21 @@ class CompactionPlan:
     preserved_units: int
 
 
-def should_compact(tokens_used: int, token_limit: int) -> bool:
+def should_compact(
+    tokens_used: int,
+    token_limit: int,
+    *,
+    trigger_pct: float = DEFAULT_COMPACT_TRIGGER_PCT,
+) -> bool:
     if token_limit <= 0:
         return False
-    return (tokens_used / token_limit) >= COMPACT_TRIGGER_PCT
+    return (tokens_used / token_limit) >= trigger_pct
 
 
 def build_compaction_plan(
     entries: list[HistoryEntry],
     *,
-    keep_last_units: int = COMPACT_KEEP_LAST_UNITS,
+    keep_last_units: int = DEFAULT_COMPACT_KEEP_LAST_UNITS,
 ) -> CompactionPlan | None:
     units = _group_entries(entries)
     if len(units) <= keep_last_units:
@@ -69,12 +74,12 @@ def build_compaction_plan(
     )
 
 
-def format_summary(summary: str) -> str:
+def format_summary(summary: str, *, max_chars: int = DEFAULT_COMPACT_SUMMARY_MAX_CHARS) -> str:
     summary = (summary or "").strip()
     if not summary:
         summary = "- Earlier context was compacted, but the summary came back empty."
-    if len(summary) > COMPACT_SUMMARY_MAX_CHARS:
-        summary = summary[: COMPACT_SUMMARY_MAX_CHARS - 3].rstrip() + "..."
+    if len(summary) > max_chars:
+        summary = summary[: max_chars - 3].rstrip() + "..."
     return "Compact summary:\n" + summary
 
 

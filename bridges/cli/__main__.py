@@ -32,6 +32,7 @@ from config import (
     resolve_log_level,
     set_primary_model,
     update_bridge_options,
+    update_config_section,
     update_config_values,
     update_model_profile,
 )
@@ -80,6 +81,8 @@ _SLASH_COMMANDS = (
 )
 _LOG_LEVEL_CHOICES = ("inherit", "warning", "info", "debug", "error")
 _ROUND_TRIP_CHOICES = (10, 20, 30, 40, 60)
+_COMPACTION_TRIGGER_CHOICES = (0.90, 0.95, 1.00)
+_COMPACTION_KEEP_CHOICES = (2, 4, 6, 8)
 _PROVIDER_PRESETS = {
     "openai": {
         "label": "OpenAI",
@@ -280,6 +283,22 @@ class CLIBridge:
         config = getattr(self._gateway, "_config", None)
         return int(getattr(config, "max_tool_cycles", 20) or 20)
 
+    def _compaction_config(self):
+        config = getattr(self._gateway, "_config", None)
+        return getattr(config, "compaction", None)
+
+    def _compaction_enabled(self) -> bool:
+        compaction = self._compaction_config()
+        return bool(getattr(compaction, "enabled", True))
+
+    def _compaction_trigger_pct(self) -> float:
+        compaction = self._compaction_config()
+        return float(getattr(compaction, "trigger_pct", 0.90) or 0.90)
+
+    def _compaction_keep_last_units(self) -> int:
+        compaction = self._compaction_config()
+        return int(getattr(compaction, "keep_last_units", 4) or 4)
+
     def _profile_names(self) -> list[str]:
         config = getattr(self._gateway, "_config", None)
         models = getattr(config, "models", {}) or {}
@@ -339,6 +358,7 @@ class CLIBridge:
             "logging",
             "max_tool_cycles",
             "context",
+            "compaction",
             "attachments",
             "extra",
         ):
@@ -446,6 +466,7 @@ class CLIBridge:
         if menu_id == "behavior":
             return "Behavior", [
                 {"label": "Agent round trips", "kind": "submenu", "target": "round_trips"},
+                {"label": "Context compaction", "kind": "submenu", "target": "compaction"},
                 {"label": "Log level", "kind": "submenu", "target": "log_level"},
                 {
                     "label": "Quiet startup",
@@ -476,6 +497,65 @@ class CLIBridge:
                 })
             items.append({"label": "Back", "kind": "action", "action": "back"})
             return "Agent Round Trips", items
+        if menu_id == "compaction":
+            return "Context Compaction", [
+                {
+                    "label": "Enabled",
+                    "kind": "toggle_section_bool",
+                    "section": "compaction",
+                    "section_key": "enabled",
+                    "default": True,
+                },
+                {"label": "Trigger threshold", "kind": "submenu", "target": "compaction_trigger"},
+                {"label": "Raw turns kept", "kind": "submenu", "target": "compaction_keep"},
+                {"label": "Back", "kind": "action", "action": "back"},
+            ]
+        if menu_id == "compaction_trigger":
+            current = self._compaction_trigger_pct()
+            items = []
+            for value in _COMPACTION_TRIGGER_CHOICES:
+                items.append({
+                    "label": f"{int(value * 100)}%",
+                    "kind": "set_section_config",
+                    "section": "compaction",
+                    "section_key": "trigger_pct",
+                    "value": value,
+                    "selected": abs(current - value) < 0.0001,
+                })
+            if all(abs(current - value) >= 0.0001 for value in _COMPACTION_TRIGGER_CHOICES):
+                items.append({
+                    "label": f"{current * 100:.0f}%",
+                    "kind": "set_section_config",
+                    "section": "compaction",
+                    "section_key": "trigger_pct",
+                    "value": current,
+                    "selected": True,
+                })
+            items.append({"label": "Back", "kind": "action", "action": "back"})
+            return "Compaction Trigger", items
+        if menu_id == "compaction_keep":
+            current = self._compaction_keep_last_units()
+            items = []
+            for value in _COMPACTION_KEEP_CHOICES:
+                items.append({
+                    "label": str(value),
+                    "kind": "set_section_config",
+                    "section": "compaction",
+                    "section_key": "keep_last_units",
+                    "value": value,
+                    "selected": current == value,
+                })
+            if current not in _COMPACTION_KEEP_CHOICES:
+                items.append({
+                    "label": str(current),
+                    "kind": "set_section_config",
+                    "section": "compaction",
+                    "section_key": "keep_last_units",
+                    "value": current,
+                    "selected": True,
+                })
+            items.append({"label": "Back", "kind": "action", "action": "back"})
+            return "Compaction Tail", items
         if menu_id == "log_level":
             current = self._string_option("log_level", "warning")
             items = []
@@ -585,6 +665,17 @@ class CLIBridge:
         if self._application is not None:
             self._application.invalidate()
 
+    def _apply_section_config_value(self, section: str, key: str, value, *, notice: str | None = None) -> None:
+        update_config_section(section, {key: value}, path=self._config_source_path())
+        self._reload_runtime_config()
+        if notice:
+            self._settings_notice = notice
+        else:
+            self._settings_notice = f"{section}.{key} set to {value!r}"
+        self._refresh_output(self._resolve_runtime_log_level())
+        if self._application is not None:
+            self._application.invalidate()
+
     def _apply_provider_preset(
         self,
         profile_name: str,
@@ -685,6 +776,33 @@ class CLIBridge:
             if self._settings_path and self._settings_path[-1] == "round_trips":
                 self._back_settings()
                 return
+        elif kind == "toggle_section_bool":
+            current = bool(
+                getattr(
+                    getattr(getattr(self._gateway, "_config", None), item["section"], None),
+                    item["section_key"],
+                    item.get("default", False),
+                )
+            )
+            new_value = not current
+            self._apply_section_config_value(
+                item["section"],
+                item["section_key"],
+                new_value,
+                notice=f"{item['label'].lower()} {'enabled' if new_value else 'disabled'}",
+            )
+        elif kind == "set_section_config":
+            section_key = item["section_key"]
+            label = item["label"]
+            self._apply_section_config_value(
+                item["section"],
+                section_key,
+                item["value"],
+                notice=f"{section_key.replace('_', ' ')} set to {label}",
+            )
+            if self._settings_path and self._settings_path[-1] in {"compaction_trigger", "compaction_keep"}:
+                self._back_settings()
+                return
         elif kind == "set_primary_profile":
             self._apply_primary_profile(item["profile_name"])
             if self._settings_path and self._settings_path[-1] == "providers_primary":
@@ -732,6 +850,12 @@ class CLIBridge:
                 f"provider {self._provider_label_for_profile(current_primary)}",
                 f"base url {getattr(profile, 'base_url', '')}",
             ]
+        if menu_id in {"compaction", "compaction_trigger", "compaction_keep"}:
+            return [
+                f"enabled {'yes' if self._compaction_enabled() else 'no'}",
+                f"trigger {self._compaction_trigger_pct() * 100:.0f}%",
+                f"raw turns kept {self._compaction_keep_last_units()}",
+            ]
         profile_name = self._profile_menu_name()
         if profile_name:
             profile = self._model_profile(profile_name)
@@ -769,10 +893,38 @@ class CLIBridge:
                 available = max(1, width - len(prefix) - len(suffix) - 1)
                 line = prefix + self._fit(label, available)
                 return self._fit(f"{line}{' ' * max(1, width - len(line) - len(suffix))}{suffix}", width)
+            if item.get("target") == "compaction":
+                suffix = "on" if self._compaction_enabled() else "off"
+                line = f"{prefix}{label}"
+                available = max(1, width - len(prefix) - len(suffix) - 1)
+                line = prefix + self._fit(label, available)
+                return self._fit(f"{line}{' ' * max(1, width - len(line) - len(suffix))}{suffix}", width)
+            if item.get("target") == "compaction_trigger":
+                suffix = f"{self._compaction_trigger_pct() * 100:.0f}%"
+                line = f"{prefix}{label}"
+                available = max(1, width - len(prefix) - len(suffix) - 1)
+                line = prefix + self._fit(label, available)
+                return self._fit(f"{line}{' ' * max(1, width - len(line) - len(suffix))}{suffix}", width)
+            if item.get("target") == "compaction_keep":
+                suffix = str(self._compaction_keep_last_units())
+                line = f"{prefix}{label}"
+                available = max(1, width - len(prefix) - len(suffix) - 1)
+                line = prefix + self._fit(label, available)
+                return self._fit(f"{line}{' ' * max(1, width - len(line) - len(suffix))}{suffix}", width)
             suffix = ">"
         elif item["kind"] == "toggle":
             suffix = "on" if self._bool_option(item["option"], bool(item.get("default", False))) else "off"
+        elif item["kind"] == "toggle_section_bool":
+            suffix = "on" if bool(
+                getattr(
+                    getattr(getattr(self._gateway, "_config", None), item["section"], None),
+                    item["section_key"],
+                    item.get("default", False),
+                )
+            ) else "off"
         elif item["kind"] in {"set", "set_config"} and item.get("selected"):
+            suffix = "current"
+        elif item["kind"] == "set_section_config" and item.get("selected"):
             suffix = "current"
         elif item["kind"] == "set_primary_profile":
             suffix = "current" if item.get("selected") else self._provider_label_for_profile(item["profile_name"])

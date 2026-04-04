@@ -53,6 +53,10 @@ def _make_config(tmp_path):
     cfg.max_tool_cycles = 5
     cfg.workspace.path = str(tmp_path)
     cfg.attachments = MagicMock()
+    cfg.compaction.enabled = True
+    cfg.compaction.trigger_pct = 0.90
+    cfg.compaction.keep_last_units = 4
+    cfg.compaction.summary_max_chars = 6000
     cfg.get_model_config = MagicMock(return_value=MagicMock(vision=False))
     return cfg
 
@@ -552,6 +556,33 @@ class TestCompaction:
         final_text = "".join(chunk.text for chunk in chunks if isinstance(chunk, (AgentTextChunk, AgentTextFinal)))
         assert final_text == "done"
         assert compact_calls["n"] == 1
+
+    @pytest.mark.asyncio
+    async def test_compaction_can_be_disabled_in_config(self, make_agent):
+        calls = []
+
+        async def stream(messages, tools=None):
+            calls.append(messages)
+            yield TextDelta(text="no compact")
+
+        agent = make_agent(stream)
+        agent.config.context = 120
+        agent.config.compaction.enabled = False
+
+        for i in range(6):
+            agent.context.add(HistoryEntry.user(f"user-{i} " + ("x" * 80)))
+            agent.context.add(HistoryEntry.assistant(f"assistant-{i} " + ("y" * 80)))
+
+        chunks = await _collect(
+            agent,
+            _make_msg("latest request " + ("z" * 80), node_id=agent.tail_node_id),
+        )
+
+        assert _full_text(chunks) == "no compact"
+        assert all(
+            not messages or messages[0].get("content") != COMPACT_SYSTEM_PROMPT
+            for messages in calls
+        )
 
 
 # ---------------------------------------------------------------------------
