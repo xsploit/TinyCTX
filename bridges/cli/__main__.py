@@ -1926,7 +1926,7 @@ class CLIBridge:
             else:
                 event.app.exit(result=None)
 
-        @key_bindings.add("<any>", filter=~showing_settings & output_has_focus, eager=True)
+        @key_bindings.add("<any>", filter=~showing_settings & output_has_focus)
         def _recover_input_focus(event) -> None:
             if self._application is None or self._input_area is None or self._output_area is None:
                 return
