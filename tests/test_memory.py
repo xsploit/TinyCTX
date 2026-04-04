@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import re
 import struct
 from pathlib import Path
 
@@ -598,6 +599,17 @@ def _make_agent(nudge_threshold=0.8, nudge_message=None):
     from modules.memory.__main__ import register
     register(agent)
     return agent
+
+
+def test_memory_register_injects_runtime_clock_prompt():
+    agent = _make_agent()
+    messages = agent.context.assemble()
+
+    system_message = next(m for m in messages if m["role"] == "system")["content"]
+    assert "<runtime_clock>" in system_message
+    assert re.search(r"Current local date: \d{4}-\d{2}-\d{2}", system_message)
+    assert re.search(r"Current local time: \d{2}:\d{2}", system_message)
+    assert re.search(r"UTC offset: [+-]\d{2}:\d{2}", system_message)
 
 
 # ---------------------------------------------------------------------------

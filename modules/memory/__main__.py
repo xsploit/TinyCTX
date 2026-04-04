@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import datetime
 import logging
 from pathlib import Path
 
@@ -71,6 +72,25 @@ def _read_file(path: Path) -> str | None:
 def _estimate_tokens(text: str) -> int:
     """Fast character-based token estimate (1 token ≈ 4 chars)."""
     return len(text) // 4
+
+
+def _runtime_clock_prompt() -> str:
+    """Always-on local clock context so the model can ground relative dates."""
+    now = datetime.datetime.now().astimezone()
+    offset = now.strftime("%z")
+    offset_fmt = f"{offset[:3]}:{offset[3:]}" if len(offset) == 5 else offset or "unknown"
+    tz_name = now.tzname() or "local"
+    return (
+        "<runtime_clock>\n"
+        f"Current local date: {now.strftime('%Y-%m-%d')}\n"
+        f"Current local time: {now.strftime('%H:%M')}\n"
+        f"Current local datetime: {now.strftime('%Y-%m-%d %H:%M')} {tz_name}\n"
+        f"UTC offset: {offset_fmt}\n"
+        "Use these values when interpreting relative dates and times such as today, "
+        "tomorrow, yesterday, now, this morning, or tonight unless the user provides "
+        "a different reference time.\n"
+        "</runtime_clock>"
+    )
 
 
 def _format_results(results: list[dict], budget_tokens: int) -> str | None:
@@ -156,6 +176,12 @@ def register(agent) -> None:
 
     resolver = MacroResolver()
 
+    agent.context.register_prompt(
+        "runtime_clock",
+        lambda _ctx: _runtime_clock_prompt(),
+        role="system",
+        priority=-10,
+    )
     agent.context.register_prompt(
         "soul",
         make_provider(soul_path, workspace, extra_macros=resolver),
