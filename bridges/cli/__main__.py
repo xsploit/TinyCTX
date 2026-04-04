@@ -86,6 +86,9 @@ _SLASH_COMMANDS = (
     ("/copy last-tool-call", "copy the most recent raw tool call"),
     ("/copy last-tool-result", "copy the most recent raw tool result"),
     ("/copy last-error", "copy the most recent error block"),
+    ("/mouse", "toggle mouse capture / selection mode"),
+    ("/mouse off", "disable app mouse capture for terminal selection"),
+    ("/mouse on", "enable app mouse capture for scrolling"),
     ("/debug", "fire a heartbeat tick now"),
     ("/help", "show available commands"),
     ("/reset", "start a new session"),
@@ -836,6 +839,26 @@ class CLIBridge:
         self._refresh_output(self._resolve_runtime_log_level())
         if self._application is not None:
             self._application.invalidate()
+
+    def _toggle_mouse_capture(self, value: bool | None = None) -> bool:
+        current = self._bool_option("mouse_capture", True)
+        enabled = (not current) if value is None else bool(value)
+        if enabled == current:
+            return enabled
+        self._apply_cli_option(
+            "mouse_capture",
+            enabled,
+            notice=f"mouse capture {'enabled' if enabled else 'disabled'}",
+        )
+        message = (
+            "[mouse capture on — app scroll and mouse interactions enabled]"
+            if enabled
+            else "[mouse capture off — terminal-native drag selection enabled]"
+        )
+        self._append_block(message)
+        self._set_status("ready")
+        self._refresh_output(self._resolve_runtime_log_level())
+        return enabled
 
     def _invoke_settings_action(self, action: str) -> None:
         if action == "close_settings":
@@ -1842,6 +1865,19 @@ class CLIBridge:
             self._append_block(message)
             self._refresh_output(self._resolve_runtime_log_level())
             return
+        if text.lower() in {"/mouse", "/mouse on", "/mouse off"}:
+            forced = None
+            if text.lower().endswith(" on"):
+                forced = True
+            elif text.lower().endswith(" off"):
+                forced = False
+            enabled = self._toggle_mouse_capture(forced)
+            self._set_status("ready")
+            self._append_block(
+                "mouse capture on" if enabled else "mouse capture off"
+            )
+            self._refresh_output(self._resolve_runtime_log_level())
+            return
         if text.lower() in {"/debug", "/debug heartbeat"}:
             self._set_status("heartbeat")
             await _debug_heartbeat(
@@ -1887,6 +1923,7 @@ class CLIBridge:
                 "  Esc          abort the current generation\n"
                 "  Ctrl+C       copy selected text or the transcript\n"
                 "  Ctrl+V       paste clipboard into input\n"
+                "  Ctrl+T       toggle mouse capture / selection mode\n"
                 "  Right click  copy selection, otherwise paste clipboard\n"
                 "  Disable Mouse capture in /settings if you want terminal-native drag-select copy\n"
                 "  Ctrl+Q       exit TinyCTX\n"
@@ -1897,6 +1934,7 @@ class CLIBridge:
                 "  /copy last-tool-result  copy the most recent raw tool result\n"
                 "  /copy last-error   copy the most recent tool error\n"
                 "  /copy errors       copy the most recent tool error\n"
+                "  /mouse       toggle mouse capture / selection mode\n"
                 "  /reset       start a new session\n"
                 "  /resume      keep using the saved session\n"
                 "  /settings    open CLI settings\n"
@@ -2076,6 +2114,10 @@ class CLIBridge:
         @key_bindings.add("tab", filter=~showing_settings, eager=True)
         def _complete(_event) -> None:
             self._complete_input()
+
+        @key_bindings.add("c-t", filter=~showing_settings, eager=True)
+        def _toggle_mouse(_event) -> None:
+            self._toggle_mouse_capture()
 
         @key_bindings.add("up", filter=showing_settings, eager=True)
         def _settings_up(_event) -> None:

@@ -278,6 +278,20 @@ def test_slash_command_completer_supports_copy_tool_command():
     ]
 
 
+def test_slash_command_completer_supports_mouse_command():
+    completions = list(
+        _SlashCommandCompleter().get_completions(
+            Document(text="/mo", cursor_position=3),
+            None,
+        )
+    )
+    assert [completion.display_text for completion in completions] == [
+        "/mouse",
+        "/mouse off",
+        "/mouse on",
+    ]
+
+
 def test_settings_command_opens_menu(tmp_path):
     cfg = _make_config(tmp_path)
     bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
@@ -364,6 +378,40 @@ bridges:
     bridge._apply_cli_option("compact_tools", False)
     raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     assert raw["bridges"]["cli"]["options"]["compact_tools"] is False
+
+
+def test_mouse_command_toggles_runtime_option(tmp_path):
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(
+        """
+models:
+  main:
+    base_url: http://localhost:8080/v1
+    model: llama3
+    api_key_env: N/A
+llm:
+  primary: main
+bridges:
+  cli:
+    enabled: true
+    options:
+      mouse_capture: true
+""".strip(),
+        encoding="utf-8",
+    )
+    cfg = _make_config(tmp_path)
+    setattr(cfg, "_source_path", cfg_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={"mouse_capture": True})
+
+    asyncio.run(bridge._handle_command("/mouse"))
+    raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert raw["bridges"]["cli"]["options"]["mouse_capture"] is False
+    assert bridge._options["mouse_capture"] is False
+
+    asyncio.run(bridge._handle_command("/mouse on"))
+    raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert raw["bridges"]["cli"]["options"]["mouse_capture"] is True
+    assert bridge._options["mouse_capture"] is True
 
 
 def test_settings_appearance_menu_shows_mouse_capture(tmp_path):
@@ -782,7 +830,9 @@ def test_help_mentions_right_click_paste(tmp_path):
     assert "Right click  copy selection, otherwise paste clipboard" in bridge._transcript_blocks[-1]
     assert "Ctrl+C       copy selected text or the transcript" in bridge._transcript_blocks[-1]
     assert "Ctrl+V       paste clipboard into input" in bridge._transcript_blocks[-1]
+    assert "Ctrl+T       toggle mouse capture / selection mode" in bridge._transcript_blocks[-1]
     assert "Disable Mouse capture in /settings if you want terminal-native drag-select copy" in bridge._transcript_blocks[-1]
+    assert "/mouse       toggle mouse capture / selection mode" in bridge._transcript_blocks[-1]
 
 
 def test_copy_command_copies_last_tool_block(tmp_path):
