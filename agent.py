@@ -53,6 +53,7 @@ import asyncio
 import importlib
 import json
 import logging
+import re
 import uuid
 from pathlib import Path
 from typing import AsyncIterator, Callable, Awaitable
@@ -79,6 +80,7 @@ from compact import (
 logger = logging.getLogger(__name__)
 
 MODULES_DIR = Path("modules")
+_EXIT_ERROR_RE = re.compile(r"(^|\n)\[exit \d+\](?=\n|$)")
 
 
 def _tool_cache_key(call: ToolCall) -> str:
@@ -99,12 +101,25 @@ def _summarize_cached_tool_call(call: ToolCall, *, max_chars: int = 160) -> str:
     return summary
 
 
-def _cached_tool_result_notice(call: ToolCall) -> str:
+def _cached_tool_result_notice(call: ToolCall, *, is_error: bool) -> str:
+    if is_error:
+        return (
+            "[error: cached exact same tool call reused earlier error from this turn: "
+            + _summarize_cached_tool_call(call)
+            + " — refer to the previous tool result instead of calling it again]"
+        )
     return (
         "[cached exact same tool call reused earlier result from this turn: "
         + _summarize_cached_tool_call(call)
         + " — refer to the previous tool result instead of calling it again]"
     )
+
+
+def _looks_like_failed_tool_output(output: str) -> bool:
+    lowered = (output or "").lstrip().lower()
+    if lowered.startswith("[error") or lowered.startswith("[blocked") or lowered.startswith("error:"):
+        return True
+    return bool(_EXIT_ERROR_RE.search(output or ""))
 
 
 def _build_llm(cfg: ModelConfig) -> LLM:
@@ -639,7 +654,7 @@ class AgentLoop:
                 return ToolResult(
                     call_id=call.call_id,
                     tool_name=call.tool_name,
-                    output=_cached_tool_result_notice(call),
+                    output=_cached_tool_result_notice(call, is_error=cached.is_error),
                     is_error=cached.is_error,
                     is_image=False,
                 )
@@ -650,7 +665,7 @@ class AgentLoop:
         }
         result = await self.tool_handler.execute_tool_call(proxy)
         raw_output = str(result.get("result", result.get("error", "[no output]")))
-        is_error    = not result.get("success", False)
+        is_error    = (not result.get("success", False)) or _looks_like_failed_tool_output(raw_output)
 
         # --- vision unwrap ---
         # If view() returned an IMAGE_BLOCK sentinel and the primary model

@@ -61,6 +61,7 @@ _TINYCTX_BANNER = (
 )
 _DIMMED_LINE_PREFIXES = ("tool ", "ok ", "err ", "thinking…")
 _PASTED_TEXT_REF = re.compile(r"\[Pasted text #(\d+)(?:[^\]]*)\]")
+_EXIT_ERROR_RE = re.compile(r"(^|\n)\[exit \d+\](?=\n|$)")
 _CLI_OPTION_DEFAULTS = {
     "compact_tools": True,
     "dim_tools": True,
@@ -68,6 +69,9 @@ _CLI_OPTION_DEFAULTS = {
     "quiet_startup": True,
 }
 _SLASH_COMMANDS = (
+    ("/copy transcript", "copy the full transcript"),
+    ("/copy last-tool", "copy the most recent tool block"),
+    ("/copy last-error", "copy the most recent error block"),
     ("/help", "show available commands"),
     ("/reset", "start a new session"),
     ("/resume", "reuse the saved session"),
@@ -962,7 +966,12 @@ class CLIBridge:
 
     def _looks_like_error_output(self, output: str) -> bool:
         lowered = (output or "").lstrip().lower()
-        return lowered.startswith("[error") or lowered.startswith("error:") or lowered.startswith("[blocked")
+        return (
+            lowered.startswith("[error")
+            or lowered.startswith("error:")
+            or lowered.startswith("[blocked")
+            or bool(_EXIT_ERROR_RE.search(output or ""))
+        )
 
     def _paste_ref(self, paste_id: int, text: str) -> str:
         char_count = len(text)
@@ -1047,6 +1056,50 @@ class CLIBridge:
         if self._input_area is not None and self._input_area.text:
             return self._write_clipboard_text(self._input_area.text)
         return False
+
+    def _is_tool_block(self, block: str) -> bool:
+        return block.startswith(("tool ", "ok ", "err "))
+
+    def _latest_tool_block_text(self) -> str:
+        captured: list[str] = []
+        for block in reversed(self._transcript_blocks):
+            if self._is_tool_block(block):
+                captured.append(block)
+                if block.startswith("tool "):
+                    break
+            elif captured:
+                break
+        return "\n".join(reversed(captured)).strip()
+
+    def _latest_error_block_text(self) -> str:
+        for index in range(len(self._transcript_blocks) - 1, -1, -1):
+            block = self._transcript_blocks[index]
+            if not block.startswith("err "):
+                continue
+            captured = [block]
+            if index > 0 and self._transcript_blocks[index - 1].startswith("tool "):
+                captured.insert(0, self._transcript_blocks[index - 1])
+            return "\n".join(captured).strip()
+        return ""
+
+    def _copy_named_target(self, target: str) -> tuple[bool, str]:
+        normalized = target.strip().lower()
+        if normalized in {"", "transcript"}:
+            copied = self._write_clipboard_text(self._output_area.text if self._output_area is not None else "")
+            return copied, "copied transcript" if copied else "copy failed"
+        if normalized in {"tool", "last-tool", "last tool"}:
+            text = self._latest_tool_block_text()
+            if not text:
+                return False, "no tool output to copy"
+            copied = self._write_clipboard_text(text)
+            return copied, "copied last tool block" if copied else "copy failed"
+        if normalized in {"error", "last-error", "last error"}:
+            text = self._latest_error_block_text()
+            if not text:
+                return False, "no error output to copy"
+            copied = self._write_clipboard_text(text)
+            return copied, "copied last error block" if copied else "copy failed"
+        return False, f"unknown copy target: {target}"
 
     def _summarize_value(self, value, max_chars: int = 84) -> str:
         if value is None:
@@ -1316,6 +1369,13 @@ class CLIBridge:
             self._reply_done.set()
 
     async def _handle_command(self, text: str) -> None:
+        if text.lower().startswith("/copy"):
+            target = text[5:].strip()
+            copied, message = self._copy_named_target(target)
+            self._set_status("ready")
+            self._append_block(message)
+            self._refresh_output(self._resolve_runtime_log_level())
+            return
         if text.lower() == "/debug heartbeat":
             self._set_status("heartbeat")
             await _debug_heartbeat(
@@ -1358,6 +1418,9 @@ class CLIBridge:
                 "  Enter        send message\n"
                 "  Ctrl+C       copy selected text or the transcript\n"
                 "  Ctrl+Q       exit TinyCTX\n"
+                "  /copy transcript   copy the full transcript\n"
+                "  /copy last-tool    copy the most recent tool call/result\n"
+                "  /copy last-error   copy the most recent tool error\n"
                 "  /reset       start a new session\n"
                 "  /resume      keep using the saved session\n"
                 "  /settings    open CLI settings\n"

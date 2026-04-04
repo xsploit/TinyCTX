@@ -189,6 +189,17 @@ def test_slash_command_completer_supports_multiword_command():
     assert [completion.text for completion in completions] == ["eartbeat"]
 
 
+def test_slash_command_completer_supports_copy_tool_command():
+    completions = list(
+        _SlashCommandCompleter().get_completions(
+            Document(text="/copy last-t", cursor_position=12),
+            None,
+        )
+    )
+    assert [completion.display_text for completion in completions] == ["/copy last-tool"]
+    assert [completion.text for completion in completions] == ["ool"]
+
+
 def test_settings_command_opens_menu(tmp_path):
     cfg = _make_config(tmp_path)
     bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
@@ -493,6 +504,40 @@ def test_copy_primary_text_falls_back_to_full_transcript(tmp_path):
     assert "line two" in copied_text
 
 
+def test_copy_command_copies_last_tool_block(tmp_path):
+    cfg = _make_config(tmp_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+    bridge._transcript_blocks = [
+        "› hello",
+        "tool shell Get-ChildItem -Path C:\\repo",
+        "err shell [stderr] missing path [exit 1]",
+    ]
+    with patch.object(bridge, "_write_clipboard_text", return_value=True) as copy_mock:
+        asyncio.run(bridge._handle_command("/copy last-tool"))
+
+    copy_mock.assert_called_once_with(
+        "tool shell Get-ChildItem -Path C:\\repo\nerr shell [stderr] missing path [exit 1]"
+    )
+    assert bridge._transcript_blocks[-1] == "copied last tool block"
+
+
+def test_copy_command_copies_last_error_block(tmp_path):
+    cfg = _make_config(tmp_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+    bridge._transcript_blocks = [
+        "tool shell bad command",
+        "err shell [stderr] boom [exit 1]",
+        "› next",
+    ]
+    with patch.object(bridge, "_write_clipboard_text", return_value=True) as copy_mock:
+        asyncio.run(bridge._handle_command("/copy last-error"))
+
+    copy_mock.assert_called_once_with(
+        "tool shell bad command\nerr shell [stderr] boom [exit 1]"
+    )
+    assert bridge._transcript_blocks[-1] == "copied last error block"
+
+
 def test_cli_restores_transcript_from_saved_cursor(tmp_path):
     cfg = _make_config(tmp_path)
     gateway = SimpleNamespace(_config=cfg)
@@ -544,3 +589,35 @@ def test_cli_restores_tool_history_from_saved_cursor(tmp_path):
     assert bridge._transcript_blocks[0] == "› check cwd"
     assert bridge._transcript_blocks[1] == "tool shell pwd"
     assert bridge._transcript_blocks[2] == "ok shell C:\\repo"
+
+
+def test_cli_restores_shell_error_history_as_err(tmp_path):
+    cfg = _make_config(tmp_path)
+    gateway = SimpleNamespace(_config=cfg)
+    bridge = CLIBridge(gateway, options={})
+
+    db = ConversationDB(tmp_path / "agent.db")
+    root = db.get_root()
+    session = db.add_node(parent_id=root.id, role="system", content="session:cli")
+    user = db.add_node(parent_id=session.id, role="user", content="check missing path")
+    assistant = db.add_node(
+        parent_id=user.id,
+        role="assistant",
+        content="",
+        tool_calls=json.dumps([
+            {"id": "call-1", "name": "shell", "arguments": {"command": "Get-ChildItem -Path C:\\missing"}}
+        ]),
+    )
+    tool = db.add_node(
+        parent_id=assistant.id,
+        role="tool",
+        content="[stderr]\nGet-ChildItem : Cannot find path\n[exit 1]",
+        tool_call_id="call-1",
+    )
+    bridge._cursor = tool.id
+    db.close()
+
+    restored = bridge._restore_transcript_from_cursor()
+
+    assert restored == 3
+    assert bridge._transcript_blocks[2].startswith("err shell")
