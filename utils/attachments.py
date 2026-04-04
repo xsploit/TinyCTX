@@ -247,7 +247,7 @@ def build_content_blocks(
             continue
 
         if kind == AttachmentKind.IMAGE:
-            if not model_cfg.vision:
+            if not model_cfg.supports_vision:
                 ref_notes.append(
                     f"[Image uploaded to workspace/uploads/{saved_rel}: {att.filename}"
                     " — model does not support vision, use filesystem tools to inspect]"

@@ -1,0 +1,62 @@
+{
+  "OpenAI": {
+    "base_url": "https://api.openai.com/v1",
+    "key_url": "https://platform.openai.com/api-keys",
+    "key_steps": [
+      "Go to platform.openai.com/api-keys",
+      "Click 'Create new secret key', give it a name",
+      "Copy the key — you won't see it again!"
+    ],
+    "suggested_models": ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1"]
+  },
+  "Anthropic": {
+    "base_url": "https://api.anthropic.com/v1",
+    "key_url": "https://console.anthropic.com/settings/keys",
+    "key_steps": [
+      "Go to console.anthropic.com/settings/keys",
+      "Click 'Create Key', give it a name",
+      "Copy the key — you won't see it again!"
+    ],
+    "suggested_models": ["claude-haiku-4-5-20251001", "claude-sonnet-4-20250514"]
+  },
+  "Gemini": {
+    "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+    "key_url": "https://aistudio.google.com/apikey",
+    "key_steps": [
+      "Go to aistudio.google.com/apikey",
+      "Click 'Create API key'",
+      "Copy the key"
+    ],
+    "suggested_models": ["gemini-2.0-flash", "gemini-2.5-pro-preview-05-06", "gemini-2.5-flash-preview-05-20"]
+  },
+  "Groq": {
+    "base_url": "https://api.groq.com/openai/v1",
+    "key_url": "https://console.groq.com/keys",
+    "key_steps": [
+      "Go to console.groq.com/keys",
+      "Click 'Create API Key'",
+      "Copy the key"
+    ],
+    "suggested_models": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "moonshotai/kimi-k2-instruct"]
+  },
+  "Openrouter": {
+    "base_url": "https://openrouter.ai/api/v1",
+    "key_url": "https://openrouter.ai/settings/keys",
+    "key_steps": [
+      "Go to openrouter.ai/settings/keys",
+      "Click 'Create Key'",
+      "Copy the key — works with hundreds of models!"
+    ],
+    "suggested_models": ["google/gemini-2.0-flash-001", "anthropic/claude-haiku-4-5", "openai/gpt-4.1-mini", "meta-llama/llama-3.3-70b-instruct"]
+  },
+  "Ollama": {
+    "base_url": "http://localhost:11434/v1",
+    "key_url": null,
+    "key_steps": [
+      "Download Ollama from ollama.com",
+      "Run: ollama pull llama3.2  (or any model you like)",
+      "Ollama runs locally — no API key needed!"
+    ],
+    "suggested_models": ["llama3.2", "qwen2.5:7b", "mistral", "phi4"]
+  }
+}

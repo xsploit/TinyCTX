@@ -236,17 +236,63 @@ def register(agent) -> None:
     # ------------------------------------------------------------------
 
     async def _pre_assemble_async(ctx) -> None:
+        # Optimization 1: Only search on user-message turns, not tool-call cycles.
+        # The last entry in dialogue is the trigger: if it's a tool result (or
+        # assistant turn), we're mid-tool-loop — reuse the cached results instead.
+        if ctx.dialogue:
+            last_role = ctx.dialogue[-1].role
+            if last_role in ("tool", "assistant"):
+                # Preserve whatever was found on the first (user) cycle.
+                return
+
         await indexer.sync()
 
         query = ""
         for entry in reversed(ctx.dialogue):
             if entry.role == "user":
-                query = entry.content
-                break
+                content = entry.content
+                # content may be a list[dict] when the user message contains
+                # image blocks (e.g. the synthetic vision injection). Extract
+                # only text parts for the search query.
+                if isinstance(content, list):
+                    query = " ".join(
+                        part.get("text", "")
+                        for part in content
+                        if isinstance(part, dict) and part.get("type") == "text"
+                    ).strip()
+                else:
+                    query = content
+                # Skip the synthetic image-injection turn (no useful text)
+                # and keep looking for the real user message.
+                if query.strip():
+                    break
 
         if not query.strip():
             ctx.state["memory_search_results"] = []
             return
+
+        # Optimization 2: If the total text of all stored chunks fits within
+        # the memory budget already, skip the embedding round-trip entirely —
+        # auto_inject will just return everything via _format_results anyway.
+        if budget_tokens > 0:
+            total_tokens = store.total_chunks_text_tokens()
+            if total_tokens <= budget_tokens:
+                # Fetch all chunks cheaply via BM25 with a broad wildcard,
+                # but only if there's anything stored at all.
+                if total_tokens > 0:
+                    results = store.hybrid_search(
+                        query, None, top_k=999, bm25_weight=1.0,
+                        decay_halflife_days=decay_halflife_days,
+                        decay_weight=decay_weight,
+                    )
+                    ctx.state["memory_search_results"] = results
+                    logger.debug(
+                        "[memory] all chunks fit in budget (%d tokens) — skipped embeddings, returned %d chunk(s)",
+                        total_tokens, len(results),
+                    )
+                else:
+                    ctx.state["memory_search_results"] = []
+                return
 
         query_vector = None
         if embedder is not None:
@@ -291,15 +337,13 @@ def register(agent) -> None:
         token_limit = agent.config.context
         nudge_delta = int(nudge_threshold * token_limit)
 
-        # Import _run_background here to avoid a circular import at module
-        # load time (agent imports memory, memory would import agent).
-        from agent import _run_background
-
         async def _consolidation_hook(tail_node_id: str, config) -> None:
             tokens_now      = agent.context.state.get("tokens_used", 0)
             tokens_at_nudge = agent.context.state.get("memory_nudge_tokens_at_last", 0)
+            current_limit   = int(getattr(config, "context", 0) or 0)
+            current_delta   = int(nudge_threshold * current_limit) if current_limit > 0 else nudge_delta
 
-            if tokens_now - tokens_at_nudge < nudge_delta:
+            if tokens_now - tokens_at_nudge < current_delta:
                 return
 
             import datetime
@@ -330,7 +374,7 @@ def register(agent) -> None:
             logger.info(
                 "[memory] background consolidation spawned off tail=%s "
                 "(delta %d/%d tokens since last nudge)",
-                tail_node_id, tokens_now - tokens_at_nudge, nudge_delta,
+                tail_node_id, tokens_now - tokens_at_nudge, current_delta,
             )
 
         agent.register_background_hook(_consolidation_hook)

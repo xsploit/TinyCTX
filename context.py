@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from copy import deepcopy
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -43,6 +44,17 @@ import logging
 from contracts import ToolCall, ToolResult
 
 logger = logging.getLogger(__name__)
+
+COMPACT_BOUNDARY_PREFIX = "__tinyctx_compact_boundary__:"
+
+
+def _make_compact_boundary_content(metadata: dict[str, Any] | None = None) -> str:
+    payload = metadata or {}
+    return COMPACT_BOUNDARY_PREFIX + json.dumps(payload, sort_keys=True, ensure_ascii=False)
+
+
+def _is_compact_boundary_content(content: str | list) -> bool:
+    return isinstance(content, str) and content.startswith(COMPACT_BOUNDARY_PREFIX)
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +138,10 @@ class HistoryEntry:
     def system(content: str) -> HistoryEntry:
         return HistoryEntry(role=ROLE_SYSTEM, content=content)
 
+    @staticmethod
+    def compact_boundary(metadata: dict[str, Any] | None = None) -> HistoryEntry:
+        return HistoryEntry.system(_make_compact_boundary_content(metadata))
+
 
 # ---------------------------------------------------------------------------
 # PromptSlot — metadata for a registered prompt provider
@@ -160,7 +176,7 @@ class Context:
       Without a DB wired, old in-memory behaviour is preserved.
     """
 
-    def __init__(self, token_limit: int = 16384) -> None:
+    def __init__(self, token_limit: int = 16384, image_tokens_per_block: int = 280) -> None:
         self.dialogue: list[HistoryEntry] = []
 
         # pid -> (PromptSlot, provider callable)
@@ -174,6 +190,15 @@ class Context:
         self.state: dict[str, Any] = {}
 
         self.token_limit = token_limit
+
+        # Flat token cost charged per image_url content block when estimating
+        # context usage.  image_url blocks carry raw base64 data which would
+        # produce wildly inflated byte counts if measured as text.  Instead we
+        # charge a flat cost matching the model's actual vision-encoder overhead.
+        # Sourced from ModelConfig.tokens_per_image in config.yaml.  None means
+        # the model has no vision support; _count_tokens treats it as 0 (no
+        # image_url blocks will appear in the message list for such models).
+        self._image_tokens_per_block: int | None = image_tokens_per_block
 
         # Tree refactor: optional DB backing
         self._db = None            # ConversationDB | None
@@ -198,6 +223,15 @@ class Context:
         and advance it.
         """
         self._tail_node_id = node_id
+
+    def set_image_tokens(self, tokens_per_image: int | None) -> None:
+        """
+        Update the per-image token cost used by _count_tokens().
+        Call this when the active model changes (e.g. fallback kicks in) so
+        the budget estimator reflects the new model's vision-encoder overhead.
+        None means the model has no vision support (image_url blocks cost 0).
+        """
+        self._image_tokens_per_block = tokens_per_image
 
     def set_cursor_callback(self, fn) -> None:
         """
@@ -274,6 +308,8 @@ class Context:
         """
         if self._db is not None and self._tail_node_id is not None:
             # Serialise content: list → JSON string for DB storage.
+            # This applies to user messages with attachments AND tool results
+            # with image blocks (both use list[dict] content).
             content_str = (
                 json.dumps(entry.content, ensure_ascii=False)
                 if isinstance(entry.content, list)
@@ -405,6 +441,47 @@ class Context:
         for i, entry in enumerate(self.dialogue):
             entry.index = i
 
+    def compact(
+        self,
+        summary: str,
+        preserved_tail: list[HistoryEntry] | None = None,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> list[HistoryEntry]:
+        """
+        Replace older active history with a compact summary while preserving a
+        recent raw suffix.
+
+        In DB-backed mode this creates a compact boundary node plus replayed
+        suffix nodes on a new branch, so older ancestors remain in the tree
+        but stop appearing in active context assembly.
+        """
+        preserved_tail = preserved_tail or []
+        summary_entry = HistoryEntry.user(summary)
+        cloned_tail = [self._clone_entry(entry) for entry in preserved_tail]
+
+        if self._db is not None and self._tail_node_id is not None:
+            self.add(HistoryEntry.compact_boundary(metadata))
+            self.add(summary_entry)
+            for entry in cloned_tail:
+                self.add(entry)
+            self.dialogue = self._load_from_db()
+            self._reindex()
+            return list(self.dialogue)
+
+        self.dialogue = [summary_entry, *cloned_tail]
+        self._reindex()
+        return list(self.dialogue)
+
+    def _clone_entry(self, entry: HistoryEntry) -> HistoryEntry:
+        return HistoryEntry(
+            role=entry.role,
+            content=deepcopy(entry.content),
+            tool_calls=deepcopy(entry.tool_calls),
+            tool_call_id=entry.tool_call_id,
+            author_id=entry.author_id,
+        )
+
     # ------------------------------------------------------------------
     # DB-backed history loading
     # ------------------------------------------------------------------
@@ -418,13 +495,23 @@ class Context:
             return []
 
         nodes = self._db.get_ancestors(self._tail_node_id)
+        latest_boundary_idx = None
+        for i, node in enumerate(nodes):
+            if node.role == ROLE_SYSTEM and _is_compact_boundary_content(node.content):
+                latest_boundary_idx = i
+        if latest_boundary_idx is not None:
+            nodes = nodes[latest_boundary_idx + 1 :]
+
         entries: list[HistoryEntry] = []
         for i, node in enumerate(nodes):
             # Deserialise content: JSON → list if it was stored as list.
+            # Only user messages store list content (attachments).
             content: str | list = node.content
             if node.role == ROLE_USER and content.startswith("["):
                 try:
-                    content = json.loads(content)
+                    parsed = json.loads(content)
+                    if isinstance(parsed, list):
+                        content = parsed
                 except (json.JSONDecodeError, ValueError):
                     pass  # leave as string
 
@@ -453,11 +540,26 @@ class Context:
     # ------------------------------------------------------------------
 
     def _count_tokens(self, messages: list[dict], tools: list[dict] | None = None) -> int:
-        tool_chars = len(json.dumps(tools)) if tools else 0
+        tool_chars  = len(json.dumps(tools)) if tools else 0
+        img_cost    = self._image_tokens_per_block or 0  # 0 for non-vision models
+        image_chars = img_cost * 4  # ×4 because the sum is divided by 4
+
         def _content_len(c) -> int:
             if isinstance(c, list):
-                return sum(len(json.dumps(b)) for b in c)
+                total = 0
+                for b in c:
+                    # image_url blocks carry raw base64 — counting those bytes as
+                    # characters wildly inflates the estimate and causes the
+                    # budget-trimmer to evict all prior conversation history.
+                    # Charge a flat per-image cost matching the model's actual
+                    # vision-encoder overhead (image_tokens_per_block in config.yaml).
+                    if isinstance(b, dict) and b.get("type") == "image_url":
+                        total += image_chars
+                    else:
+                        total += len(json.dumps(b))
+                return total
             return len(str(c or ""))
+
         return (sum(
             _content_len(m.get("content", "")) +
             len(json.dumps(m.get("tool_calls", [])))
@@ -485,10 +587,15 @@ class Context:
         # Load from DB if wired; otherwise use in-memory dialogue.
         if self._db is not None and self._tail_node_id is not None:
             source = self._load_from_db()
+            logger.debug(
+                "[assemble] loaded %d entries from DB (tail=%s)",
+                len(source), self._tail_node_id,
+            )
             # Keep self.dialogue in sync so hooks that iterate it see current state.
             self.dialogue = source
         else:
             source = self.dialogue
+            logger.debug("[assemble] using in-memory dialogue (%d entries)", len(source))
 
         n = len(source)
 
@@ -562,9 +669,12 @@ class Context:
                 merged.append(dict(m))
 
         # Token budget enforcement
-        self.state["tokens_used"] = self._count_tokens(merged, tools)
+        self.state["tokens_used_pre_trim"] = self._count_tokens(merged, tools)
+        self.state["tokens_used"] = self.state["tokens_used_pre_trim"]
+        self.state["budget_trimmed"] = False
 
         while self.state["tokens_used"] > self.token_limit:
+            self.state["budget_trimmed"] = True
             drop_idx = next(
                 (i for i, m in enumerate(merged) if m["role"] != ROLE_SYSTEM),
                 None,
@@ -599,7 +709,7 @@ class Context:
         if entry.role == ROLE_TOOL:
             return {
                 "role":         ROLE_TOOL,
-                "content":      entry.content,
+                "content":      entry.content,  # str or list[dict] for image blocks
                 "tool_call_id": entry.tool_call_id,
             }
         if entry.role == ROLE_ASSISTANT:

@@ -53,6 +53,7 @@ import asyncio
 import importlib
 import json
 import logging
+import re
 import uuid
 from pathlib import Path
 from typing import AsyncIterator, Callable, Awaitable
@@ -60,7 +61,7 @@ from typing import AsyncIterator, Callable, Awaitable
 from contracts import (
     InboundMessage, AgentEvent,
     AgentThinkingChunk, AgentTextChunk, AgentTextFinal, AgentToolCall, AgentToolResult, AgentError,
-    ToolCall, ToolResult,
+    ToolCall, ToolResult, IMAGE_BLOCK_PREFIX,
 )
 from context import Context, HistoryEntry, HOOK_PRE_ASSEMBLE_ASYNC
 from config import Config, ModelConfig
@@ -68,10 +69,57 @@ from ai import LLM, TextDelta, ThinkingDelta, ToolCallAssembled, LLMError
 from utils.tool_handler import ToolCallHandler
 from utils.attachments import build_content_blocks
 from db import ConversationDB
+from compact import (
+    COMPACT_SYSTEM_PROMPT,
+    COMPACT_USER_PROMPT,
+    build_compaction_plan,
+    format_summary,
+    should_compact,
+)
 
 logger = logging.getLogger(__name__)
 
 MODULES_DIR = Path("modules")
+_EXIT_ERROR_RE = re.compile(r"(^|\n)\[exit \d+\](?=\n|$)")
+
+
+def _tool_cache_key(call: ToolCall) -> str:
+    return call.tool_name + "::" + json.dumps(call.args, sort_keys=True, ensure_ascii=False)
+
+
+def _summarize_cached_tool_call(call: ToolCall, *, max_chars: int = 160) -> str:
+    if not call.args:
+        return f"{call.tool_name}()"
+    parts = [
+        f"{key}={json.dumps(value, ensure_ascii=False)}"
+        for key, value in sorted(call.args.items())
+    ]
+    summary = f"{call.tool_name}(" + ", ".join(parts) + ")"
+    summary = summary.replace("\n", " ")
+    if len(summary) > max_chars:
+        return summary[: max_chars - 1] + "…"
+    return summary
+
+
+def _cached_tool_result_notice(call: ToolCall, *, is_error: bool) -> str:
+    if is_error:
+        return (
+            "[error: cached exact same tool call reused earlier error from this turn: "
+            + _summarize_cached_tool_call(call)
+            + " — refer to the previous tool result instead of calling it again]"
+        )
+    return (
+        "[cached exact same tool call reused earlier result from this turn: "
+        + _summarize_cached_tool_call(call)
+        + " — refer to the previous tool result instead of calling it again]"
+    )
+
+
+def _looks_like_failed_tool_output(output: str) -> bool:
+    lowered = (output or "").lstrip().lower()
+    if lowered.startswith("[error") or lowered.startswith("[blocked") or lowered.startswith("error:"):
+        return True
+    return bool(_EXIT_ERROR_RE.search(output or ""))
 
 
 def _build_llm(cfg: ModelConfig) -> LLM:
@@ -101,7 +149,7 @@ async def _run_background(tail_node_id: str, config: Config) -> None:
         asyncio.create_task(_run_background(opening.id, agent.config))
     """
     try:
-        loop = AgentLoop(tail_node_id=tail_node_id, config=config)
+        loop = AgentLoop(tail_node_id=tail_node_id, config=config, is_subagent=True)
         async for _ in loop.run(msg=None):
             pass  # events discarded
     except Exception:
@@ -109,11 +157,16 @@ async def _run_background(tail_node_id: str, config: Config) -> None:
 
 
 class AgentLoop:
-    def __init__(self, tail_node_id: str, config: Config) -> None:
+    def __init__(self, tail_node_id: str, config: Config, *, is_subagent: bool = False) -> None:
         self.tail_node_id  = tail_node_id  # cursor — the DB node this agent runs from
         self.lane_node_id  = tail_node_id  # original lane key — never changes
         self.config        = config
-        self.context       = Context(token_limit=config.context)
+        self.is_subagent   = is_subagent
+        primary_mc         = config.models.get(config.llm.primary)
+        self.context       = Context(
+            token_limit=config.context,
+            image_tokens_per_block=primary_mc.tokens_per_image if primary_mc else 280,
+        )
         self.tool_handler  = ToolCallHandler()
         self._turn_count   = 0
         self.gateway       = None  # set by Lane after construction
@@ -239,6 +292,98 @@ class AgentLoop:
             except Exception:
                 logger.exception("Failed to load module '%s'", entry.name)
 
+    async def _maybe_compact_context(self) -> bool:
+        pretrim_tokens = int(self.context.state.get("tokens_used_pre_trim", 0) or 0)
+        token_limit = int(self.config.context or 0)
+        if not should_compact(pretrim_tokens, token_limit):
+            return False
+
+        plan = build_compaction_plan(self.context.dialogue)
+        if plan is None:
+            return False
+
+        summary = await self._generate_compact_summary(plan.to_summarize)
+        if not summary:
+            logger.warning(
+                "[cursor=%s] compaction skipped — summary generation failed",
+                self._tail_node_id,
+            )
+            return False
+
+        active = self.context.compact(
+            format_summary(summary),
+            preserved_tail=plan.preserved_tail,
+            metadata={
+                "entries_summarized": len(plan.to_summarize),
+                "summarized_units": plan.summarized_units,
+            },
+        )
+        logger.info(
+            "[cursor=%s] compacted %d entry(s) into summary + %d preserved entry(s)",
+            self._tail_node_id,
+            len(plan.to_summarize),
+            len(active) - 1,
+        )
+        return True
+
+    async def _generate_compact_summary(self, entries: list[HistoryEntry]) -> str | None:
+        summary_messages = (
+            [{"role": "system", "content": COMPACT_SYSTEM_PROMPT}]
+            + [self.context._render(entry) for entry in entries]
+            + [{"role": "user", "content": COMPACT_USER_PROMPT}]
+        )
+
+        model_chain = [self.config.llm.primary] + list(self.config.llm.fallback)
+        for model_name in model_chain:
+            llm = self._models[model_name]
+            text_chunks: list[str] = []
+            error: str | None = None
+            last_http_status: int | None = None
+
+            async for llm_event in llm.stream(summary_messages, tools=None):
+                if isinstance(llm_event, TextDelta):
+                    text_chunks.append(llm_event.text)
+                elif isinstance(llm_event, ToolCallAssembled):
+                    error = "compaction summary unexpectedly returned tool calls"
+                    break
+                elif isinstance(llm_event, LLMError):
+                    error = llm_event.message
+                    if llm_event.message.startswith("HTTP "):
+                        try:
+                            last_http_status = int(llm_event.message.split()[1].rstrip(":"))
+                        except (IndexError, ValueError):
+                            pass
+                    break
+
+            if not error:
+                summary = "".join(text_chunks).strip()
+                if summary:
+                    return summary
+                error = "empty compaction summary"
+
+            fo = self.config.llm.fallback_on
+            should_fallback = fo.any_error or (
+                last_http_status is not None and last_http_status in fo.http_codes
+            )
+            if should_fallback and model_name != model_chain[-1]:
+                logger.warning(
+                    "[cursor=%s] compaction model '%s' failed (%s) — trying fallback",
+                    self._tail_node_id,
+                    model_name,
+                    error,
+                )
+                continue
+
+            logger.warning(
+                "[cursor=%s] compaction summary failed on model '%s': %s",
+                self._tail_node_id,
+                model_name,
+                error,
+            )
+            break
+
+        return None
+
     # ------------------------------------------------------------------
     # Main entry point
     # ------------------------------------------------------------------
@@ -296,34 +441,43 @@ class AgentLoop:
         max_cycles       = self.config.max_tool_cycles
         final_text       = ""
         streaming_active = False
+        tool_result_cache: dict[str, ToolResult] = {}
 
         for cycle in range(max_cycles):
+            compacted_this_cycle = False
+            while True:
+                # Abort check between cycles
+                if abort_event and abort_event.is_set():
+                    logger.info("[%s] aborted before cycle %d", self._tail_node_id, cycle)
+                    yield AgentError(message="[generation aborted]", **ev)
+                    return
 
-            # Abort check between cycles
-            if abort_event and abort_event.is_set():
-                logger.info("[%s] aborted before cycle %d", self._tail_node_id, cycle)
-                yield AgentError(message="[generation aborted]", **ev)
-                return
+                # Stage 2: Context Assembly
+                await self.context.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
+                tools    = self.tool_handler.get_tool_definitions() or None
+                messages = self.context.assemble(tools=tools)
 
-            # Stage 2: Context Assembly
-            await self.context.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
-            tools    = self.tool_handler.get_tool_definitions() or None
-            messages = self.context.assemble(tools=tools)
+                # Token budget telemetry
+                tokens_used = int(self.context.state.get("tokens_used_pre_trim", 0) or 0)
+                active_tokens = int(self.context.state.get("tokens_used", 0) or 0)
+                token_limit = self.config.context
+                token_pct   = tokens_used / token_limit if token_limit else 0
+                if token_pct >= 0.95:
+                    logger.warning(
+                        "[cursor=%s] context at %.0f%% of token budget (%d/%d, active=%d) — consider compaction",
+                        self._tail_node_id, token_pct * 100, tokens_used, token_limit, active_tokens,
+                    )
+                elif token_pct >= 0.80:
+                    logger.info(
+                        "[cursor=%s] context at %.0f%% of token budget (%d/%d, active=%d)",
+                        self._tail_node_id, token_pct * 100, tokens_used, token_limit, active_tokens,
+                    )
 
-            # Token budget telemetry
-            tokens_used = self.context.state.get("tokens_used", 0)
-            token_limit = self.config.context
-            token_pct   = tokens_used / token_limit if token_limit else 0
-            if token_pct >= 0.95:
-                logger.warning(
-                    "[cursor=%s] context at %.0f%% of token budget (%d/%d) — consider compaction",
-                    self._tail_node_id, token_pct * 100, tokens_used, token_limit,
-                )
-            elif token_pct >= 0.80:
-                logger.info(
-                    "[cursor=%s] context at %.0f%% of token budget (%d/%d)",
-                    self._tail_node_id, token_pct * 100, tokens_used, token_limit,
-                )
+                if not compacted_this_cycle and await self._maybe_compact_context():
+                    compacted_this_cycle = True
+                    continue
+
+                break
 
             # Stage 3: Inference — walk primary → fallback chain
             text_chunks:      list[str]      = []
@@ -379,6 +533,9 @@ class AgentLoop:
                             "[cursor=%s] inference succeeded on fallback model '%s'",
                             self._tail_node_id, model_name,
                         )
+                        # Sync image token cost to the model that actually ran.
+                        mc = self.config.models.get(model_name)
+                        self.context.set_image_tokens(mc.tokens_per_image if mc else None)
                     break
 
                 fo = self.config.llm.fallback_on
@@ -412,12 +569,23 @@ class AgentLoop:
             logger.debug("[%s] cycle %d — %d tool call(s)", self._tail_node_id, cycle, len(tool_calls))
             for tc in tool_calls:
                 yield AgentToolCall(call_id=tc.call_id, tool_name=tc.tool_name, args=tc.args, **ev)
-                result = await self._execute_tool(tc)
+                result = await self._execute_tool(tc, tool_result_cache=tool_result_cache)
                 self.context.add(HistoryEntry.tool_result(result))
+                # For image results, inject a follow-up user message with the image_url
+                # block.  OpenAI-compat servers don't support list content in tool result
+                # messages, so a synthetic user turn is a shitty but ok workaround.
+                if result.is_image:
+                    image_content = [
+                        {"type": "text",      "text": "Here is the image from the tool result:"},
+                        {"type": "image_url", "image_url": {"url": f"data:{result.image_mime};base64,{result.image_b64}"}},
+                    ]
+                    self.context.add(HistoryEntry.user(image_content))
+                # For bridge display, show a tidy label instead of raw base64.
+                display_output = f"[image: {result.image_mime}]" if result.is_image else result.output
                 yield AgentToolResult(
                     call_id=result.call_id,
                     tool_name=result.tool_name,
-                    output=result.output,
+                    output=display_output,
                     is_error=result.is_error,
                     **ev,
                 )
@@ -450,7 +618,7 @@ class AgentLoop:
         """
         logger.debug("[background] starting branch tail=%s", tail_node_id)
         try:
-            loop = AgentLoop(tail_node_id=tail_node_id, config=self.config)
+            loop = AgentLoop(tail_node_id=tail_node_id, config=self.config, is_subagent=True)
             async for _ in loop.run(msg=None):
                 pass  # discard events
             logger.debug("[background] branch complete tail=%s", tail_node_id)
@@ -468,18 +636,79 @@ class AgentLoop:
     # Tool execution
     # ------------------------------------------------------------------
 
-    async def _execute_tool(self, call: ToolCall) -> ToolResult:
+    async def _execute_tool(
+        self,
+        call: ToolCall,
+        *,
+        tool_result_cache: dict[str, ToolResult] | None = None,
+    ) -> ToolResult:
+        cache_key = None
+        if tool_result_cache is not None:
+            cache_key = _tool_cache_key(call)
+            cached = tool_result_cache.get(cache_key)
+            if cached is not None:
+                logger.info(
+                    "[cursor=%s] reusing cached tool result for %s",
+                    self._tail_node_id, call.tool_name,
+                )
+                return ToolResult(
+                    call_id=call.call_id,
+                    tool_name=call.tool_name,
+                    output=_cached_tool_result_notice(call, is_error=cached.is_error),
+                    is_error=cached.is_error,
+                    is_image=False,
+                )
+
         proxy = {
             "function": {"name": call.tool_name, "arguments": call.args},
             "id": call.call_id,
         }
         result = await self.tool_handler.execute_tool_call(proxy)
-        return ToolResult(
+        raw_output = str(result.get("result", result.get("error", "[no output]")))
+        is_error    = (not result.get("success", False)) or _looks_like_failed_tool_output(raw_output)
+
+        # --- vision unwrap ---
+        # If view() returned an IMAGE_BLOCK sentinel and the primary model
+        # supports vision, stash the image data in the ToolResult so the
+        # caller (run()) can inject a follow-up user message containing the
+        # image_url block.  OpenAI-compat servers don't support list content
+        # in tool result messages, so we use a separate user turn instead.
+        if not is_error and raw_output.startswith(IMAGE_BLOCK_PREFIX):
+            payload = raw_output[len(IMAGE_BLOCK_PREFIX):]  # "mime;base64data"
+            sep = payload.index(";")
+            mime    = payload[:sep]
+            b64data = payload[sep + 1:]
+
+            primary_cfg = self.config.get_model_config(self.config.llm.primary)
+            if primary_cfg.supports_vision:
+                tool_result = ToolResult(
+                    call_id=call.call_id,
+                    tool_name=call.tool_name,
+                    output=f"[image/{mime} — see attached image below]",
+                    is_error=False,
+                    is_image=True,
+                    image_mime=mime,
+                    image_b64=b64data,
+                )
+                if cache_key is not None and tool_result_cache is not None:
+                    tool_result_cache[cache_key] = tool_result
+                return tool_result
+            else:
+                # Model doesn't support vision — return a friendly stub.
+                raw_output = (
+                    f"[Image file detected ({mime}) but the current model does not "
+                    "support vision. Use a vision-capable model to inspect this file.]"
+                )
+
+        tool_result = ToolResult(
             call_id=call.call_id,
             tool_name=call.tool_name,
-            output=str(result.get("result", result.get("error", "[no output]"))),
-            is_error=not result.get("success", False),
+            output=raw_output,
+            is_error=is_error,
         )
+        if cache_key is not None and tool_result_cache is not None:
+            tool_result_cache[cache_key] = tool_result
+        return tool_result
 
     # ------------------------------------------------------------------
     # Lifecycle

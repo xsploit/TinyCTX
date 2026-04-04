@@ -48,7 +48,7 @@ main.py
 |------|------|
 | `contracts.py` | Pure data types. No logic. Everything imports from here, never the reverse. `InboundMessage` carries `author` (`UserIdentity`) for all messages. |
 | `config/` | YAML loader + env var resolution. `WorkspaceConfig` (global workspace path). `ModelConfig` supports `kind: chat` (default) or `kind: embedding`, plus `vision: bool`. `AttachmentConfig` (inline thresholds). |
-| `router.py` | Session routing. One `Lane` (bounded queue maxsize=32 + crash-recovering worker task) per `SessionKey`. `router.push()` returns `bool` — `False` means lane queue full. Bridges register platform/session handlers. |
+| `router.py` | Session routing. One `Lane` (bounded queue maxsize=32 + crash-recovering worker task) per `node_id` (cursor). `router.push()` returns `bool` — `False` means lane queue full. Bridges register platform/session handlers. |
 | `gateway/` | HTTP/SSE API gateway. External clients (SillyTavern, custom scripts, etc.) connect here. `run(router, cfg)` called by `main.py`. Accepts `attachments: [{name, data_b64, mime_type}]` on POST /message. |
 | `agent.py` | The 6-stage loop. Owns `Context`, `ToolCallHandler`, and LLM pool. Yields `AgentEvent` stream. Skips embedding models when building LLM pool. Stage 1 calls `build_content_blocks` when `msg.attachments` is non-empty. |
 | `context.py` | Dialogue history + hook pipeline. Sync stages: `pre_assemble`, `filter_turn`, `transform_turn`, `post_assemble`. Async stage: `HOOK_PRE_ASSEMBLE_ASYNC` (awaited by agent before each `assemble()` call). Smart `delete()` / `edit()` / `strip_tool_calls()` for dialogue mutation. `HistoryEntry.content` is `str \| list` — list for user turns with attachments. |
@@ -57,9 +57,17 @@ main.py
 | `utils/bm25.py` | Pure-stdlib in-memory Okapi BM25. Used by `tools_search` to rank tool names+descriptions against a query. Tokeniser splits on underscores/hyphens so `web_search` matches query `"search"`. |
 | `utils/attachments.py` | Attachment classification, saving, and LLM content-block assembly. Pure utility — no tools, hooks, or prompts. Called by bridges and the gateway. |
 
-**Session identity (tree refactor):**
+**Session identity:**
 
-Sessions are represented as tree branches in `agent.db` (SQLite). Each bridge holds a **cursor** — a `node_id` string pointing at the tail of its branch. `InboundMessage.tail_node_id` carries this cursor into the router. There are no `SessionKey` or `sessions/*.json` files.
+Sessions are represented as tree branches in `agent.db` (SQLite). Each bridge holds a **cursor** — a `node_id` string pointing at the tail of its branch. `InboundMessage.tail_node_id` carries this cursor into the router. There are no `SessionKey`, `ChatType`, or `sessions/*.json` files — both are fully removed from `contracts.py`.
+
+**Per-bridge cursor storage:**
+- CLI: `workspace/cursors/cli`
+- Discord: `workspace/cursors/discord.json` (by channel_id)
+- Matrix: `workspace/cursors/matrix.json` (by room_id)
+- Gateway: `workspace/cursors/gateway.json` (by session_id → node_id)
+- Cron: `cursor_node_id` field per job in `CRON.json`
+- Heartbeat: `_heartbeat_cursor_node_id` attribute on the agent instance; node created once in `agent.db` as a child of root (or the session tail, if `branch_from: "session"`), then reused for all subsequent ticks
 
 **Group chat sender attribution:**
 
@@ -209,32 +217,37 @@ Modules access workspace via `agent.config.workspace.path`. There is no `memory.
 All endpoints require `Authorization: Bearer <api_key>`. Health is always public.
 
 ```
-POST   /v1/sessions/{id}/message           send message; SSE stream or JSON response
-GET    /v1/sessions/{id}/history           raw dialogue (all roles, incl. tool calls)
-PATCH  /v1/sessions/{id}/history/{eid}     edit entry content
-DELETE /v1/sessions/{id}/history/{eid}     smart-delete entry + dependents
-POST   /v1/sessions/{id}/reset             wipe session context
-GET    /v1/workspace/files/{path}          read any file under workspace root
-PUT    /v1/workspace/files/{path}          write any file under workspace root
-GET    /v1/health                          status, uptime_s, per-session queue_depth/queue_max/turns
+GET    /v1/sessions                              list all sessions (active lanes + cursor map)
+DELETE /v1/sessions/{id}                         reset in-memory context (tree preserved)
+POST   /v1/sessions/{id}/message                 send message; SSE stream or JSON response
+PUT    /v1/sessions/{id}/generation              trigger generation with no new user message
+DELETE /v1/sessions/{id}/generation             abort in-flight generation (204, no-op if idle)
+POST   /v1/sessions/{id}/reset                  alias for DELETE session (backwards compat)
+GET    /v1/sessions/{id}/history                raw dialogue from agent.db ancestor chain
+GET    /v1/workspace/files/{path}               read any file under workspace root
+PUT    /v1/workspace/files/{path}               write any file under workspace root
+GET    /v1/health                               status, uptime_s, per-lane queue/turn info
 ```
 
-**Backpressure:** `POST /message` returns HTTP 429 if the session lane queue is full (default max 32 pending turns). Retry after backoff.
+**Session identity:** `{id}` is a human-readable string (e.g. `"main"`, `"user-123"`). The gateway maps it to a `node_id` UUID in `workspace/cursors/gateway.json`. On first use a child of the global DB root is created and persisted; subsequent calls reuse the same node_id.
+
+**Backpressure:** `/message` and `/generation` return HTTP 429 if the lane queue is full.
 
 **POST /message body:**
 ```json
 {
   "text": "what is in this image?",
   "stream": true,
-  "session_type": "dm",
   "attachments": [
     {"name": "photo.png", "data_b64": "<base64>", "mime_type": "image/png"}
   ]
 }
 ```
-`text` or `attachments` (or both) must be present.
+`text` or `attachments` (or both) must be present. `stream` defaults to `true`.
 
-**SSE event types** (`POST /message` with `stream: true`):
+**PUT /generation body:** `{ "stream": true }` (optional). Queues a synthetic turn — no user message is added; agent generates against current context as-is.
+
+**SSE event types** (streaming responses):
 ```json
 {"type": "text_chunk",  "text": "..."}
 {"type": "tool_call",   "call_id": "...", "name": "...", "args": {...}}
@@ -243,10 +256,23 @@ GET    /v1/health                          status, uptime_s, per-session queue_d
 {"type": "error",       "message": "..."}
 {"type": "done"}
 ```
+Non-streaming responses return `{ "text": "..." }` (120s timeout).
 
-**Session type** (`session_type: "dm"|"group"`, default `"dm"`):
-- `dm` → `SessionKey.dm(session_id)` — shared across platforms
-- `group` → `SessionKey.group(Platform.API, session_id)` — API-scoped
+**GET /sessions response:**
+```json
+[{ "id": "main", "node_id": "<uuid>", "turns": 5, "queue_depth": 0, "queue_max": 32, "is_active": true }]
+```
+Includes all sessions in the cursor map (active or not) plus any active lanes from other bridges (shown with `node_id` as `id`).
+
+**GET /history response:** Ancestor chain from `agent.db` (root → current tail), system session-marker nodes filtered out. Reads directly from DB — no active lane required:
+```json
+[{ "id": "<uuid>", "role": "user", "content": "...", "tool_calls": null, "tool_call_id": null, "author_id": null, "created_at": 1234567890.0 }]
+```
+
+**GET /health response:**
+```json
+{ "status": "ok", "uptime_s": 42.1, "lanes": { "<node_id>": { "session_id": "main", "turns": 5, "queue_depth": 0, "queue_max": 32 } } }
+```
 
 **Workspace file paths** are resolved relative to `workspace.path`. Path traversal (`..`) is rejected with 403.
 
@@ -284,6 +310,9 @@ When no DB is wired (tests / legacy path), the nudge falls back to the old inlin
 4. Use `content_type_for(text, bool(attachments))` from `contracts.py` to set `content_type`.
 5. Handle `AgentEvent` objects in the handler — switch on type.
 6. Add entry to `config.yaml` under `bridges:` with `enabled: true`.
+   For the CLI bridge, `options.quiet_startup: true` and `options.log_level: WARNING`
+   keep the terminal UI clean; switch `log_level` to `inherit` only when you
+   explicitly want module/runtime INFO logs in the chat session.
 7. Tokens from env vars only — do not add bridge-specific dataclasses to `config/`.
 
 ---
@@ -305,7 +334,7 @@ Modules must not import from `router.py`, `gateway/`, or any bridge.
 
 ## Key conventions
 
-- **`contracts.py` is the shared language.** Never import router/agent/bridges from contracts. Never import contracts from ai.py.
+- **`contracts.py` is the shared language.** Never import router/agent/bridges from contracts. Never import contracts from ai.py. `SessionKey` and `ChatType` no longer exist — do not add them back.
 - **Modules are self-contained.** No hardcoded module names anywhere in core.
 - **Bridges are self-contained.** No hardcoded bridge names anywhere in core.
 - **Config is generic.** `BridgeConfig(enabled, options)` for all bridges. Tokens from env vars.
@@ -345,10 +374,11 @@ agent.tool_handler.enable("tool_name")                 # enable programmatically
 
 | Module | Always-on tools | Deferred tools |
 |--------|----------------|----------------|
-| `filesystem` | `shell`, `view`, `write_file`, `str_replace` | — |
+| `filesystem` | `shell`, `view`, `write_file`, `str_replace`, `grep`, `glob_search` | — |
 | `memory` | `memory_search` | — |
 | `skills` | `use_skill` | — |
-| `web` | `web_search`, `navigate` | `http_request`, `click`, `type_text`, `extract_text`, `extract_html`, `screenshot`, `wait_for`, `manage_browser` |
+| `web` | `web_search`, `browse_url`, `navigate` | `http_request`, `click`, `type_text`, `extract_text`, `extract_html`, `screenshot`, `wait_for`, `manage_browser` |
+| `todo` | — | `todo_write`, `todo_read` |
 | `mcp` | configurable per-tool (see below) | all tools default to deferred |
 | `cron` | `cron_list` | — |
 
@@ -385,6 +415,8 @@ mcp:
 
 **`reset()` does not clear `enabled`.** The enabled set survives a `/reset` — tools the agent searched for in a prior turn remain enabled for the next session.
 
+**Memory hook is cycle-aware.** `HOOK_PRE_ASSEMBLE_ASYNC` checks the last dialogue entry role before doing any work — if it's `tool` or `assistant` (mid-tool-loop), it returns immediately and reuses the cached `ctx.state["memory_search_results"]` from cycle 0. This avoids redundant embedding round-trips on every tool-call cycle within a turn.
+
 ---
 
 ## Context mutation
@@ -409,10 +441,11 @@ Token-budget trimming in `assemble()` follows the same rules: assistant turns wi
 | Module | What it does |
 |--------|-------------|
 | `memory` | Static: injects SOUL.md, AGENTS.md, MEMORY.md as system prompts. Dynamic: hybrid BM25+vector search over `workspace/memory/**/*.md` via async pre-assemble hook + `memory_search` tool. Context nudge: when token delta exceeds threshold, spawns a background branch for memory consolidation instead of injecting inline. Config key: `memory_search:`. |
-| `filesystem` | Tools: `shell`, `view`, `write_file`, `str_replace` — all always-on. Sandboxed to workspace. Shell execution split into `shell.py` (platform detection, blacklist, subprocess dispatch). On Linux/macOS runs via `bash -c`; on Windows via `powershell -NonInteractive`. Blacklist (`blacklist.txt`, glob patterns, case-insensitive) enforced on both platforms — covers bulk destruction, RCE, privilege escalation, persistence, system path writes, and more. Blocked commands return an error string. Blacklist loaded at `register()` time; restart to reload. |
-| `web` | Tools: `web_search` (DuckDuckGo) and `navigate` are always-on. `http_request`, `click`, `type_text`, `extract_text`, `extract_html`, `screenshot`, `wait_for`, `manage_browser` (Playwright) are deferred. |
-| `cron` | Scheduled agent turns. Jobs in `workspace/CRON.json`. Schedule kinds: `every`, `at`, `cron` (requires `croniter`). Tool: `cron_list`. Each job gets its own isolated session (`dm:cron-<id>`). `reset_after_run: true` wipes session context after each run. |
-| `heartbeat` | Periodic timer turns. Agent replies `HEARTBEAT_OK` if nothing needs attention; otherwise triggers a continuation loop. Configurable active hours. |
+| `filesystem` | Tools: `shell`, `view`, `write_file`, `str_replace`, `grep`, `glob_search` — all always-on. `grep` wraps ripgrep with automatic Python fallback; supports files/content/count output modes, glob filtering, file type filtering, context lines, and result limits. `glob_search` finds files by pattern (pathlib), sorted by mtime. **Read-before-write guard:** `write_file` and `str_replace` require the target file to have been read via `view()` first; they also reject writes if the file has been modified since the last read (staleness detection). New file creation is exempt. Sandboxed to workspace. Shell execution split into `shell.py` (platform detection, blacklist, subprocess dispatch). On Linux/macOS runs via `bash -c`; on Windows via `powershell -NonInteractive`. Blacklist (`blacklist.txt`, glob patterns, case-insensitive) enforced on both platforms — covers bulk destruction, RCE, privilege escalation, persistence, system path writes, and more. Blocked commands return an error string. Blacklist loaded at `register()` time; restart to reload. `str_replace` supports `replace_all=true` for multi-occurrence replacements. |
+| `web` | Tools: `web_search` (DuckDuckGo), `browse_url` (direct page fetch/scrape with optional `prompt` for LLM-powered content extraction), and `navigate` are always-on. `browse_url(prompt=...)` fetches a page then runs a secondary LLM call to extract/summarize specific information — saves context by not returning the full page. `http_request`, `click`, `type_text`, `extract_text`, `extract_html`, `screenshot`, `wait_for`, `manage_browser` (Playwright) are deferred. |
+| `todo` | Persistent per-session task checklist. Deferred tools: `todo_write` (create/update task list), `todo_read` (view current tasks). State persisted to `workspace/TODO.json`. Current task list injected into system prompt every turn so the agent always sees its progress. Statuses: `pending`, `in_progress`, `completed`. Use for multi-step work with 3+ steps. |
+| `cron` | Scheduled agent turns. Jobs in `workspace/CRON.json`. Schedule kinds: `every`, `at`, `cron` (requires `croniter`). Tool: `cron_list`. Each job holds its own `cursor_node_id` (child of global root, created on first run). `reset_after_run: true` rewinds the cursor to the job's root node rather than wiping the DB. |
+| `heartbeat` | Periodic timer turns on an isolated DB branch — never pollutes the user's conversation thread. On `register()`, creates a session-init node in `agent.db` and stores its `node_id` as `agent._heartbeat_cursor_node_id`. All ticks push through the gateway (own `Lane` + `AgentLoop`); the cursor advances after each turn and is cached for the next. `branch_from: "root"` (default) — fully isolated; `branch_from: "session"` — branches off the user session tail at startup. Agent replies `HEARTBEAT_OK` if nothing needs attention; otherwise triggers a continuation loop (up to `max_continuations`). Configurable active hours. |
 | `ctx_tools` | Context pipeline hooks: deduplicates repeated identical tool calls, strips `<think>` CoT blocks from old turns, truncates/trims large tool outputs. |
 | `skills` | agentskills.io standard. Scans configured dirs + `~/.agents/skills/` for `SKILL.md` files, injects a compact index as system prompt, tool: `use_skill(name)` (always-on). |
 | `mcp` | stdio MCP server client. Connects at startup, discovers tools, registers them as `mcp__<server>__<tool>`. All tools deferred by default; configure per-tool visibility under `mcp.servers.<n>.tools:`. Requires `pip install mcp`. |
@@ -436,8 +469,9 @@ The memory module has two layers:
 - Chunking strategies (configurable via `chunk_strategy:`): `markdown`, `tokens`, `chars`, `delimiter`
 - Search: hybrid BM25 (FTS5) + cosine vector; numpy fast-path when available
 - `memory_budget_tokens` caps injected block size; first chunk always included
-- `auto_inject: true` — results injected as system prompt every turn
+- `auto_inject: true` — results injected as system prompt every turn (search runs on cycle 0 only; results cached in `ctx.state` for subsequent tool-call cycles)
 - `auto_inject: false` — results only via `memory_search` tool
+- **Search skips embedder** when all chunks fit within `memory_budget_tokens` (`store.total_chunks_text_tokens() ≤ budget_tokens`) — pure BM25 fetch instead, no embedding round-trip
 - Config key: `memory_search:` in `config.yaml` (avoids collision with `workspace:`)
 - **Context nudge (Phase 3):** when threshold is hit and a DB is wired, creates an opening node via `db.add_node()` off the current tail and calls `agent.queue_background_branch()`. The background `AgentLoop` handles consolidation; the live conversation is untouched. Falls back to inline injection when no DB is wired (tests/legacy).
 

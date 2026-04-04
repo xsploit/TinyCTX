@@ -25,12 +25,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from contracts import (
     UserIdentity, InboundMessage,
-    AgentTextChunk, AgentTextFinal, AgentError,
+    AgentTextChunk, AgentTextFinal, AgentError, AgentToolResult,
     Platform, ContentType, ToolCall, ToolResult,
 )
 from context import HistoryEntry
 from ai import TextDelta, ToolCallAssembled, LLMError
 from db import ConversationDB
+from compact import COMPACT_SYSTEM_PROMPT, COMPACT_USER_PROMPT
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +308,91 @@ class TestToolExecution:
         assert any("cycle limit" in c.text.lower() or "tool" in c.text.lower() for c in text_chunks)
         assert always_tool_count["n"] <= 3
 
+    @pytest.mark.asyncio
+    async def test_identical_tool_call_reuses_cached_result_within_turn(self, make_agent):
+        call_count = {"n": 0}
+
+        async def stream(messages, tools=None):
+            if call_count["n"] == 0:
+                call_count["n"] += 1
+                yield ToolCallAssembled(call_id="c1", tool_name="my_tool", args={"url": "https://example.com"})
+            elif call_count["n"] == 1:
+                call_count["n"] += 1
+                yield ToolCallAssembled(call_id="c2", tool_name="my_tool", args={"url": "https://example.com"})
+            else:
+                yield TextDelta(text="done")
+
+        agent = make_agent(stream)
+
+        tool_invocations = {"n": 0}
+
+        def my_tool(url: str) -> str:
+            """Fetch something."""
+            tool_invocations["n"] += 1
+            return f"result for {url}"
+
+        agent.tool_handler.register_tool(my_tool)
+        await _collect(agent, _make_msg("go", node_id=agent.tail_node_id))
+
+        tool_results = [e for e in agent.context.dialogue if e.role == "tool"]
+        assert tool_invocations["n"] == 1
+        assert len(tool_results) == 2
+        assert "result for https://example.com" in tool_results[0].content
+        assert "cached exact same tool call reused earlier result" in tool_results[1].content
+        assert 'my_tool(url="https://example.com")' in tool_results[1].content
+
+    @pytest.mark.asyncio
+    async def test_different_tool_args_do_not_reuse_cached_result(self, make_agent):
+        call_count = {"n": 0}
+
+        async def stream(messages, tools=None):
+            if call_count["n"] == 0:
+                call_count["n"] += 1
+                yield ToolCallAssembled(call_id="c1", tool_name="my_tool", args={"x": 1})
+            elif call_count["n"] == 1:
+                call_count["n"] += 1
+                yield ToolCallAssembled(call_id="c2", tool_name="my_tool", args={"x": 2})
+            else:
+                yield TextDelta(text="done")
+
+        agent = make_agent(stream)
+
+        seen = []
+
+        def my_tool(x: int) -> str:
+            """Tool."""
+            seen.append(x)
+            return str(x)
+
+        agent.tool_handler.register_tool(my_tool)
+        await _collect(agent, _make_msg("go", node_id=agent.tail_node_id))
+
+        assert seen == [1, 2]
+
+    @pytest.mark.asyncio
+    async def test_shell_style_failure_output_marks_tool_result_error(self, make_agent):
+        call_count = {"n": 0}
+
+        async def stream(messages, tools=None):
+            if call_count["n"] == 0:
+                call_count["n"] += 1
+                yield ToolCallAssembled(call_id="c1", tool_name="my_tool", args={})
+            else:
+                yield TextDelta(text="done")
+
+        agent = make_agent(stream)
+
+        def my_tool() -> str:
+            """Tool."""
+            return "[stderr]\nmissing path\n[exit 1]"
+
+        agent.tool_handler.register_tool(my_tool)
+        chunks = await _collect(agent, _make_msg("go", node_id=agent.tail_node_id))
+
+        tool_events = [chunk for chunk in chunks if isinstance(chunk, AgentToolResult)]
+        assert len(tool_events) == 1
+        assert tool_events[0].is_error is True
+
 
 # ---------------------------------------------------------------------------
 # LLM error handling and fallback
@@ -357,6 +443,51 @@ class TestLLMErrors:
 
         chunks = await _collect(agent, _make_msg("hi", node_id=agent.tail_node_id))
         assert _full_text(chunks) == "fallback worked"
+
+
+# ---------------------------------------------------------------------------
+# Compaction
+# ---------------------------------------------------------------------------
+
+class TestCompaction:
+    @pytest.mark.asyncio
+    async def test_context_compacts_before_normal_inference(self, make_agent):
+        calls = []
+
+        async def stream(messages, tools=None):
+            calls.append({"messages": messages, "tools": tools})
+            if messages and messages[0].get("content") == COMPACT_SYSTEM_PROMPT:
+                yield TextDelta(text="- durable older context")
+                return
+            yield TextDelta(text="final after compact")
+
+        agent = make_agent(stream)
+        agent.config.context = 120
+
+        for i in range(6):
+            agent.context.add(HistoryEntry.user(f"user-{i} " + ("x" * 80)))
+            agent.context.add(HistoryEntry.assistant(f"assistant-{i} " + ("y" * 80)))
+
+        chunks = await _collect(
+            agent,
+            _make_msg("latest request " + ("z" * 80), node_id=agent.tail_node_id),
+        )
+
+        assert _full_text(chunks) == "final after compact"
+
+        compact_call = next(
+            call for call in calls if call["messages"][0].get("content") == COMPACT_SYSTEM_PROMPT
+        )
+        assert compact_call["tools"] is None
+        assert compact_call["messages"][-1]["content"] == COMPACT_USER_PROMPT
+
+        active_users = [
+            entry.content
+            for entry in agent.context.dialogue
+            if entry.role == "user" and isinstance(entry.content, str)
+        ]
+        assert any(content.startswith("Compact summary:\n- durable older context") for content in active_users)
+        assert not any(content.startswith("user-0 ") for content in active_users)
 
 
 # ---------------------------------------------------------------------------

@@ -383,6 +383,7 @@ class _CronRunner:
         self._reload_if_changed()
         self._recompute_next_runs()
         self._save()
+        self._ensure_noop_platform_handler()
         self._arm()
         logger.info("[cron] started with %d job(s)", len(self._jobs))
 
@@ -439,6 +440,24 @@ class _CronRunner:
 
         self._timer_task = asyncio.get_event_loop().create_task(_tick())
 
+    def _ensure_noop_platform_handler(self) -> None:
+        gateway = getattr(self._agent, "gateway", None)
+        if gateway is None:
+            return
+
+        handlers = getattr(gateway, "_platform_handlers", None)
+        if not isinstance(handlers, dict):
+            return
+
+        if handlers.get(_CRON_PLATFORM) is None:
+            handlers[_CRON_PLATFORM] = _noop_reply_handler
+            register = getattr(gateway, "register_platform_handler", None)
+            if callable(register):
+                try:
+                    register(_CRON_PLATFORM, _noop_reply_handler)
+                except Exception:
+                    pass
+
     async def _on_timer(self) -> None:
         self._reload_if_changed()
         now = _now_ms()
@@ -486,6 +505,11 @@ class _CronRunner:
                 job.state.last_error  = "agent.gateway not available"
                 return
 
+            # Normal app startup sets agent.gateway after module registration,
+            # so keep a lazy path here even though start() also registers when
+            # the gateway is already available.
+            self._ensure_noop_platform_handler()
+
             node_id = self._get_or_create_job_cursor(job, gateway)
 
             msg = InboundMessage(
@@ -518,17 +542,34 @@ class _CronRunner:
             try:
                 await gateway.push(msg)
                 await asyncio.wait_for(reply_event.wait(), timeout=120)
+            except asyncio.TimeoutError:
+                # Abort the lane before unregistering the cursor handler so the
+                # AgentLoop stops emitting events.  Re-raise so the outer
+                # except block records the timeout status.
+                gateway.abort_generation(node_id)
+                raise
             finally:
                 gateway.unregister_cursor_handler(node_id)
 
-            # Advance cursor to the latest tail after the turn.
-            lane = gateway._lane_router._lanes.get(node_id)
-            if lane and lane.loop._tail_node_id != node_id:
-                job.cursor_node_id = lane.loop._tail_node_id
-
             reply_text = "".join(parts).strip()
             if reply_text:
-                print(f"\n[CRON: {job.name}]\n{reply_text}\n")
+                logger.info("[cron] job '%s' reply:\n%s", job.name, reply_text)
+
+            # Advance the job cursor to the lane's latest tail so the next run
+            # continues from the updated branch head.
+            lane_router = getattr(gateway, "_lane_router", None)
+            lanes = getattr(lane_router, "_lanes", None)
+            if isinstance(lanes, dict):
+                lane = lanes.get(node_id)
+                loop_owner = lane
+                if getattr(loop_owner, "loop", None) is None:
+                    nested_lane = getattr(loop_owner, "_lane", None)
+                    if nested_lane is not None:
+                        loop_owner = nested_lane
+                loop = getattr(loop_owner, "loop", None)
+                tail = getattr(loop, "_tail_node_id", None)
+                if tail:
+                    job.cursor_node_id = tail
 
             job.state.last_status = "ok"
             job.state.last_error  = None

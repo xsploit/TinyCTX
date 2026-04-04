@@ -27,12 +27,22 @@ class ModelConfig:
     temperature:      float      = 0.7
     budget_tokens:    int | None = None   # Anthropic extended thinking: budget_tokens > 0
     reasoning_effort: str | None = None   # OpenAI-compat: "low" | "medium" | "high"
-    cache_prompts:    bool        = False  # Anthropic prompt caching on last system message
-    vision:           bool        = False  # True = model accepts image_url content blocks
+    cache_prompts:      bool        = False  # Anthropic prompt caching on last system message
+    vision:             bool        = False  # Back-compat alias for multimodal chat models
+    tokens_per_image:   int | None  = None   # Flat token cost per image_url block (None = vision disabled)
+
+    def __post_init__(self) -> None:
+        # Back-compat: older configs/tests use `vision: true` without specifying
+        # an explicit token charge for image_url blocks.
+        if self.tokens_per_image is None and self.vision:
+            self.tokens_per_image = 280
+        elif self.tokens_per_image is not None:
+            self.vision = True
 
     @property
     def supports_vision(self) -> bool:
-        return self.vision
+        """True when the model accepts image_url content blocks."""
+        return bool(self.vision or self.tokens_per_image is not None)
 
     @property
     def api_key(self) -> str:
@@ -158,7 +168,7 @@ class Config:
     gateway:         GatewayConfig           = field(default_factory=GatewayConfig)
     workspace:       WorkspaceConfig         = field(default_factory=WorkspaceConfig)
     logging:         LoggingConfig           = field(default_factory=LoggingConfig)
-    max_tool_cycles: int                     = 10
+    max_tool_cycles: int                     = 20
     context:         int                     = 16384
     attachments:     AttachmentConfig        = field(default_factory=AttachmentConfig)
     # Catch-all for unknown top-level keys (e.g. mcp:, custom module config, etc.)
@@ -197,6 +207,17 @@ class Config:
         return cfg
 
 
+def resolve_log_level(level: str | int | None, *, default: int = logging.WARNING) -> int:
+    """Best-effort log-level resolver for bridge/runtime overrides."""
+    if isinstance(level, int):
+        return level
+    if not level:
+        return default
+    if isinstance(level, str):
+        return getattr(logging, level.upper(), default)
+    return default
+
+
 def _parse_fallback_on(raw: dict) -> FallbackOnConfig:
     return FallbackOnConfig(
         any_error=bool(raw.get("any_error", False)),
@@ -212,7 +233,13 @@ def _parse_model(raw: dict) -> ModelConfig:
     kind = raw.get("kind", "chat").lower()
     if kind not in ("chat", "embedding"):
         raise ValueError(f"Model kind must be 'chat' or 'embedding', got '{kind}'")
-    vision = bool(raw.get("vision", False))
+    tokens_per_image_raw = raw.get("tokens_per_image")
+    if tokens_per_image_raw is not None:
+        tokens_per_image = int(tokens_per_image_raw)
+        if tokens_per_image <= 0:
+            raise ValueError(f"tokens_per_image must be > 0, got {tokens_per_image}")
+    else:
+        tokens_per_image = None
     reasoning_effort = raw.get("reasoning_effort")
     if reasoning_effort is not None and reasoning_effort not in ("low", "medium", "high"):
         raise ValueError(
@@ -225,6 +252,8 @@ def _parse_model(raw: dict) -> ModelConfig:
         if budget_tokens <= 0:
             raise ValueError(f"budget_tokens must be > 0, got {budget_tokens}")
 
+    vision = bool(raw.get("vision", False))
+
     return ModelConfig(
         model=raw["model"],
         base_url=raw["base_url"],
@@ -236,6 +265,7 @@ def _parse_model(raw: dict) -> ModelConfig:
         reasoning_effort=reasoning_effort,
         cache_prompts=bool(raw.get("cache_prompts", False)),
         vision=vision,
+        tokens_per_image=tokens_per_image,
     )
 
 
@@ -335,7 +365,7 @@ def load(path="config.yaml") -> Config:
     # ------------------------------------------------------------------ extra
     extra = {k: v for k, v in raw.items() if k not in _KNOWN_KEYS}
 
-    return Config(
+    cfg = Config(
         models=models,
         llm=llm,
         router=RouterConfig(
@@ -346,18 +376,144 @@ def load(path="config.yaml") -> Config:
         gateway=gateway,
         workspace=workspace,
         logging=LoggingConfig(level=log_raw.get("level", "INFO")),
-        max_tool_cycles=int(raw.get("max_tool_cycles", 10)),
+        max_tool_cycles=int(raw.get("max_tool_cycles", 20)),
         context=int(raw.get("context", 16384)),
         attachments=attachments,
         extra=extra,
     )
+    setattr(cfg, "_source_path", p.resolve())
+    return cfg
 
 
-def apply_logging(cfg: LoggingConfig) -> None:
+def update_config_values(
+    updates: dict,
+    *,
+    path: str | Path = "config.yaml",
+) -> Path:
+    """Persist top-level config values back into config.yaml."""
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Config file not found: {p.resolve()}")
+
+    with p.open(encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+
+    raw.update(updates)
+
+    with p.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(raw, f, sort_keys=False)
+
+    return p.resolve()
+
+
+def update_model_profile(
+    profile_name: str,
+    updates: dict,
+    *,
+    path: str | Path = "config.yaml",
+    set_primary: bool | None = None,
+) -> Path:
+    """
+    Persist updates to a named models.<profile> entry and optionally make it the
+    llm.primary profile.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Config file not found: {p.resolve()}")
+
+    with p.open(encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+
+    models = raw.setdefault("models", {})
+    profile = models.get(profile_name)
+    if not isinstance(profile, dict):
+        profile = {}
+    profile.update(updates)
+    models[profile_name] = profile
+
+    if set_primary is not None:
+        llm = raw.setdefault("llm", {})
+        if set_primary:
+            llm["primary"] = profile_name
+        elif llm.get("primary") == profile_name and "primary" in llm:
+            llm.pop("primary", None)
+
+    with p.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(raw, f, sort_keys=False)
+
+    return p.resolve()
+
+
+def set_primary_model(
+    profile_name: str,
+    *,
+    path: str | Path = "config.yaml",
+) -> Path:
+    """
+    Set llm.primary to an existing model profile.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Config file not found: {p.resolve()}")
+
+    with p.open(encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+
+    models = raw.get("models") or {}
+    if profile_name not in models:
+        raise KeyError(f"Model profile '{profile_name}' not found under models:")
+
+    llm = raw.setdefault("llm", {})
+    llm["primary"] = profile_name
+
+    with p.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(raw, f, sort_keys=False)
+
+    return p.resolve()
+
+
+def update_bridge_options(
+    bridge_name: str,
+    updates: dict,
+    *,
+    path: str | Path = "config.yaml",
+    enabled: bool | None = None,
+) -> Path:
+    """
+    Persist bridge option updates back into config.yaml using the canonical
+    nested bridges.<name>.options shape.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Config file not found: {p.resolve()}")
+
+    with p.open(encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+
+    bridges = raw.setdefault("bridges", {})
+    bridge = bridges.setdefault(bridge_name, {})
+    current_enabled = bool(bridge.get("enabled", False))
+    options = bridge.get("options")
+    if not isinstance(options, dict):
+        options = {k: v for k, v in bridge.items() if k not in {"enabled", "options"}}
+
+    options.update(updates)
+    bridge.clear()
+    bridge["enabled"] = current_enabled if enabled is None else bool(enabled)
+    bridge["options"] = options
+
+    with p.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(raw, f, sort_keys=False)
+
+    return p.resolve()
+
+
+def apply_logging(cfg: LoggingConfig, *, level_override: str | int | None = None) -> None:
     import structlog
+    resolved_level = resolve_log_level(level_override or cfg.level, default=logging.INFO)
 
     logging.basicConfig(
-        level=getattr(logging, cfg.level),
+        level=resolved_level,
         format="%(message)s",
         datefmt="%H:%M:%S",
     )
