@@ -343,7 +343,7 @@ def test_settings_command_opens_menu(tmp_path):
     asyncio.run(bridge._handle_command("/settings"))
     assert bridge._settings_open() is True
     assert bridge._settings_menu()[0] == "Settings"
-    assert bridge._footer_text() == "working settings"
+    assert bridge._footer_text() == "working settings | selection"
 
 
 def test_settings_navigation_enters_submenu_and_applies_choice(tmp_path):
@@ -457,6 +457,21 @@ bridges:
     raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     assert raw["bridges"]["cli"]["options"]["mouse_capture"] is True
     assert bridge._options["mouse_capture"] is True
+
+
+def test_mouse_command_updates_footer_without_transcript_spam(tmp_path):
+    cfg = _make_config(tmp_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+
+    assert "working ready | selection" in bridge._footer_text()
+
+    asyncio.run(bridge._handle_command("/mouse on"))
+    assert bridge._transcript_blocks == []
+    assert "working ready | mouse" in bridge._footer_text()
+
+    asyncio.run(bridge._handle_command("/mouse off"))
+    assert bridge._transcript_blocks == []
+    assert "working ready | selection" in bridge._footer_text()
 
 
 def test_settings_appearance_menu_shows_mouse_capture(tmp_path):
@@ -748,7 +763,7 @@ def test_submit_from_buffer_reports_running_generation(tmp_path):
 
     assert bridge._input_area.text == "hello"
     assert bridge._transcript_blocks[-1] == "[generation already running — press Esc to abort or wait for the current reply]"
-    assert bridge._footer_text() == "working busy"
+    assert bridge._footer_text() == "working busy | selection"
 
 
 def test_abort_active_generation_calls_gateway(tmp_path):
@@ -761,7 +776,7 @@ def test_abort_active_generation_calls_gateway(tmp_path):
 
     assert bridge._abort_active_generation() is True
     gateway.abort_generation.assert_called_once_with("cursor-1")
-    assert bridge._footer_text() == "working aborting"
+    assert bridge._footer_text() == "working aborting | selection"
 
 
 def test_copy_primary_text_prefers_selected_output(tmp_path):
@@ -992,7 +1007,7 @@ def test_agent_error_resets_status_to_ready(tmp_path):
     asyncio.run(bridge.handle_event(event))
 
     assert bridge._transcript_blocks[-1] == "error: [internal error]"
-    assert bridge._footer_text() == "working ready"
+    assert bridge._footer_text() == "working ready | selection"
 
 
 def test_tool_result_keeps_status_as_thinking(tmp_path):
@@ -1013,7 +1028,7 @@ def test_tool_result_keeps_status_as_thinking(tmp_path):
     asyncio.run(bridge.handle_event(event))
 
     assert bridge._transcript_blocks[-1] == "[ok shell C:\\repo]"
-    assert bridge._footer_text() == "working thinking"
+    assert bridge._footer_text() == "working thinking | selection"
 
 
 def test_debug_alias_routes_to_heartbeat(tmp_path):

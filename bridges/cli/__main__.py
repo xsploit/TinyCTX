@@ -850,14 +850,6 @@ class CLIBridge:
             enabled,
             notice=f"mouse capture {'enabled' if enabled else 'disabled'}",
         )
-        message = (
-            "[mouse capture on — app scroll and mouse interactions enabled]"
-            if enabled
-            else "[mouse capture off — terminal-native drag selection enabled]"
-        )
-        self._append_block(message)
-        self._set_status("ready")
-        self._refresh_output(self._resolve_runtime_log_level())
         return enabled
 
     def _invoke_settings_action(self, action: str) -> None:
@@ -1237,7 +1229,8 @@ class CLIBridge:
 
     def _footer_text(self) -> str:
         width = self._current_width()
-        return self._fit(f"working {self._settings_status_text()}", width)
+        mouse_mode = "mouse" if self._bool_option("mouse_capture", False) else "selection"
+        return self._fit(f"working {self._settings_status_text()} | {mouse_mode}", width)
 
     def _set_status(self, text: str) -> None:
         self._status_text = text.strip() or "ready"
@@ -1907,11 +1900,8 @@ class CLIBridge:
                 forced = True
             elif text.lower().endswith(" off"):
                 forced = False
-            enabled = self._toggle_mouse_capture(forced)
+            self._toggle_mouse_capture(forced)
             self._set_status("ready")
-            self._append_block(
-                "mouse capture on" if enabled else "mouse capture off"
-            )
             self._refresh_output(self._resolve_runtime_log_level())
             return
         if text.lower() in {"/debug", "/debug heartbeat"}:
