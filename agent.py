@@ -112,7 +112,7 @@ async def _run_background(tail_node_id: str, config: Config) -> None:
         asyncio.create_task(_run_background(opening.id, agent.config))
     """
     try:
-        loop = AgentLoop(tail_node_id=tail_node_id, config=config)
+        loop = AgentLoop(tail_node_id=tail_node_id, config=config, is_subagent=True)
         async for _ in loop.run(msg=None):
             pass  # events discarded
     except Exception:
@@ -120,10 +120,11 @@ async def _run_background(tail_node_id: str, config: Config) -> None:
 
 
 class AgentLoop:
-    def __init__(self, tail_node_id: str, config: Config) -> None:
+    def __init__(self, tail_node_id: str, config: Config, *, is_subagent: bool = False) -> None:
         self.tail_node_id  = tail_node_id  # cursor — the DB node this agent runs from
         self.lane_node_id  = tail_node_id  # original lane key — never changes
         self.config        = config
+        self.is_subagent   = is_subagent
         primary_mc         = config.models.get(config.llm.primary)
         self.context       = Context(
             token_limit=config.context,
@@ -580,7 +581,7 @@ class AgentLoop:
         """
         logger.debug("[background] starting branch tail=%s", tail_node_id)
         try:
-            loop = AgentLoop(tail_node_id=tail_node_id, config=self.config)
+            loop = AgentLoop(tail_node_id=tail_node_id, config=self.config, is_subagent=True)
             async for _ in loop.run(msg=None):
                 pass  # discard events
             logger.debug("[background] branch complete tail=%s", tail_node_id)
