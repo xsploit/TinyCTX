@@ -195,6 +195,7 @@ from bridges.matrix.__main__ import MatrixBridge, _ReplyAccumulator as MatrixAcc
 def _make_router(workspace="/tmp/tinyctx_test"):
     router = MagicMock()
     router.config.workspace.path = workspace
+    router._config.workspace.path = workspace
     router.config.bridges = {}
     router.push = AsyncMock(return_value=True)
     router.register_platform_handler = MagicMock()
