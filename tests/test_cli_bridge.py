@@ -711,13 +711,48 @@ def test_right_click_on_output_pastes_clipboard_into_input(tmp_path):
     bridge._application.invalidate.assert_called()
 
 
+def test_right_click_on_output_copies_selection_before_pasting(tmp_path):
+    cfg = _make_config(tmp_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+    with patch("bridges.cli.__main__.Application", return_value=SimpleNamespace()):
+        bridge._build_application()
+
+    assert bridge._output_area is not None
+    bridge._output_area.buffer.set_document(
+        Document(text="picked output", cursor_position=len("picked output")),
+        bypass_readonly=True,
+    )
+    bridge._output_area.buffer.selection_state = SelectionState(
+        original_cursor_position=0,
+        type=SelectionType.CHARACTERS,
+    )
+    bridge._application = SimpleNamespace(
+        layout=SimpleNamespace(focus=MagicMock()),
+        invalidate=MagicMock(),
+    )
+
+    event = MouseEvent(
+        position=Point(x=0, y=0),
+        event_type=MouseEventType.MOUSE_UP,
+        button=MouseButton.RIGHT,
+        modifiers=frozenset(),
+    )
+
+    with patch.object(bridge, "_write_clipboard_text", return_value=True) as copy_mock:
+        assert bridge._output_area.control.mouse_handler(event) is None
+
+    copy_mock.assert_called_once_with("picked output")
+
+
 def test_help_mentions_right_click_paste(tmp_path):
     cfg = _make_config(tmp_path)
     bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
 
     asyncio.run(bridge._handle_command("/help"))
 
-    assert "Right click  paste clipboard into input" in bridge._transcript_blocks[-1]
+    assert "Right click  copy selection, otherwise paste clipboard" in bridge._transcript_blocks[-1]
+    assert "Ctrl+C       copy selected text or the transcript" in bridge._transcript_blocks[-1]
+    assert "Ctrl+V       paste clipboard into input" in bridge._transcript_blocks[-1]
 
 
 def test_copy_command_copies_last_tool_block(tmp_path):
@@ -752,6 +787,21 @@ def test_copy_command_copies_last_error_block(tmp_path):
         "[tool shell bad command]\n[err shell [stderr] boom [exit 1]]"
     )
     assert bridge._transcript_blocks[-1] == "copied last error block"
+
+
+def test_copy_command_errors_alias_copies_last_error_block(tmp_path):
+    cfg = _make_config(tmp_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+    bridge._transcript_blocks = [
+        "[tool shell bad command]",
+        "[err shell [stderr] boom [exit 1]]",
+    ]
+    with patch.object(bridge, "_write_clipboard_text", return_value=True) as copy_mock:
+        asyncio.run(bridge._handle_command("/copy errors"))
+
+    copy_mock.assert_called_once_with(
+        "[tool shell bad command]\n[err shell [stderr] boom [exit 1]]"
+    )
 
 
 def test_copy_command_uses_raw_tool_history_when_available(tmp_path):

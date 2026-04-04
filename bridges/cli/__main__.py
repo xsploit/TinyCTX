@@ -1323,15 +1323,21 @@ class CLIBridge:
             return ""
         return document.text[start:end]
 
-    def _copy_primary_text(self) -> bool:
+    def _selected_primary_text(self) -> str:
         if self._output_area is not None:
             selected = self._selected_buffer_text(self._output_area.buffer)
             if selected:
-                return self._write_clipboard_text(selected)
+                return selected
         if self._input_area is not None:
             selected = self._selected_buffer_text(self._input_area.buffer)
             if selected:
-                return self._write_clipboard_text(selected)
+                return selected
+        return ""
+
+    def _copy_primary_text(self) -> bool:
+        selected = self._selected_primary_text()
+        if selected:
+            return self._write_clipboard_text(selected)
         if self._has_transcript() and self._output_area is not None and self._output_area.text:
             return self._write_clipboard_text(self._output_area.text)
         if self._input_area is not None and self._input_area.text:
@@ -1363,6 +1369,11 @@ class CLIBridge:
                 and mouse_event.event_type == MouseEventType.MOUSE_UP
                 and mouse_event.button == MouseButton.RIGHT
             ):
+                if self._selected_primary_text():
+                    if self._copy_primary_text():
+                        if self._application is not None:
+                            self._application.invalidate()
+                        return None
                 if self._paste_clipboard_into_input():
                     return None
             return original_mouse_handler(mouse_event)
@@ -1522,7 +1533,7 @@ class CLIBridge:
                 return False, "no tool result to copy"
             copied = self._write_clipboard_text(text)
             return copied, "copied last tool result" if copied else "copy failed"
-        if normalized in {"error", "last-error", "last error"}:
+        if normalized in {"error", "errors", "last-error", "last error"}:
             text = self._latest_error_block_text()
             if not text:
                 return False, "no error output to copy"
@@ -1868,7 +1879,8 @@ class CLIBridge:
                 "  Enter        send message\n"
                 "  Esc          abort the current generation\n"
                 "  Ctrl+C       copy selected text or the transcript\n"
-                "  Right click  paste clipboard into input\n"
+                "  Ctrl+V       paste clipboard into input\n"
+                "  Right click  copy selection, otherwise paste clipboard\n"
                 "  Ctrl+Q       exit TinyCTX\n"
                 "  /copy all-tools    copy all raw tool calls/results\n"
                 "  /copy transcript   copy the full transcript\n"
@@ -1876,6 +1888,7 @@ class CLIBridge:
                 "  /copy last-tool-call    copy the most recent raw tool call\n"
                 "  /copy last-tool-result  copy the most recent raw tool result\n"
                 "  /copy last-error   copy the most recent tool error\n"
+                "  /copy errors       copy the most recent tool error\n"
                 "  /reset       start a new session\n"
                 "  /resume      keep using the saved session\n"
                 "  /settings    open CLI settings\n"
@@ -2085,7 +2098,6 @@ class CLIBridge:
         @key_bindings.add("c-insert", eager=True)
         def _copy_or_exit(event) -> None:
             if self._copy_primary_text():
-                self._focus_input()
                 return
             if self._generation_running():
                 self._abort_active_generation()
