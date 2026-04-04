@@ -406,6 +406,72 @@ def update_config_values(
     return p.resolve()
 
 
+def update_model_profile(
+    profile_name: str,
+    updates: dict,
+    *,
+    path: str | Path = "config.yaml",
+    set_primary: bool | None = None,
+) -> Path:
+    """
+    Persist updates to a named models.<profile> entry and optionally make it the
+    llm.primary profile.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Config file not found: {p.resolve()}")
+
+    with p.open(encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+
+    models = raw.setdefault("models", {})
+    profile = models.get(profile_name)
+    if not isinstance(profile, dict):
+        profile = {}
+    profile.update(updates)
+    models[profile_name] = profile
+
+    if set_primary is not None:
+        llm = raw.setdefault("llm", {})
+        if set_primary:
+            llm["primary"] = profile_name
+        elif llm.get("primary") == profile_name and "primary" in llm:
+            llm.pop("primary", None)
+
+    with p.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(raw, f, sort_keys=False)
+
+    return p.resolve()
+
+
+def set_primary_model(
+    profile_name: str,
+    *,
+    path: str | Path = "config.yaml",
+) -> Path:
+    """
+    Set llm.primary to an existing model profile.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Config file not found: {p.resolve()}")
+
+    with p.open(encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+
+    models = raw.get("models") or {}
+    if profile_name not in models:
+        raise KeyError(f"Model profile '{profile_name}' not found under models:")
+
+    llm = raw.setdefault("llm", {})
+    llm["primary"] = profile_name
+
+    with p.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(raw, f, sort_keys=False)
+
+    return p.resolve()
+
+
 def update_bridge_options(
     bridge_name: str,
     updates: dict,

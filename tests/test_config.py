@@ -21,7 +21,9 @@ import yaml
 from config import (
     load,
     update_config_values,
+    update_model_profile,
     update_bridge_options,
+    set_primary_model,
     Config,
     ModelConfig,
     BridgeConfig,
@@ -512,3 +514,65 @@ class TestUpdateConfigValues:
         update_config_values({"max_tool_cycles": 30}, path=p)
         raw = yaml.safe_load(p.read_text(encoding="utf-8"))
         assert raw["max_tool_cycles"] == 30
+
+
+class TestUpdateModelProfile:
+    def test_updates_existing_model_profile(self, tmp_path):
+        p = _write_config(tmp_path, _minimal("""
+            models:
+              main:
+                base_url: http://localhost:8080/v1
+                model: llama3
+                api_key_env: N/A
+            llm:
+              primary: main
+        """))
+        update_model_profile(
+            "main",
+            {"base_url": "https://api.openai.com/v1", "api_key_env": "OPENAI_API_KEY"},
+            path=p,
+        )
+        raw = yaml.safe_load(p.read_text(encoding="utf-8"))
+        assert raw["models"]["main"]["base_url"] == "https://api.openai.com/v1"
+        assert raw["models"]["main"]["api_key_env"] == "OPENAI_API_KEY"
+
+    def test_creates_new_model_profile_and_can_set_primary(self, tmp_path):
+        p = _write_config(tmp_path, _minimal())
+        update_model_profile(
+            "ollama",
+            {
+                "base_url": "http://localhost:11434/v1",
+                "model": "llama3.1",
+                "api_key_env": "N/A",
+            },
+            path=p,
+            set_primary=True,
+        )
+        raw = yaml.safe_load(p.read_text(encoding="utf-8"))
+        assert raw["models"]["ollama"]["base_url"] == "http://localhost:11434/v1"
+        assert raw["llm"]["primary"] == "ollama"
+
+
+class TestSetPrimaryModel:
+    def test_sets_existing_profile_as_primary(self, tmp_path):
+        p = _write_config(tmp_path, """
+            models:
+              main:
+                base_url: http://localhost:8080/v1
+                model: llama3
+                api_key_env: N/A
+              openai:
+                base_url: https://api.openai.com/v1
+                model: gpt-4o-mini
+                api_key_env: OPENAI_API_KEY
+            llm:
+              primary: main
+        """)
+        set_primary_model("openai", path=p)
+        raw = yaml.safe_load(p.read_text(encoding="utf-8"))
+        assert raw["llm"]["primary"] == "openai"
+
+    def test_raises_for_missing_profile(self, tmp_path):
+        p = _write_config(tmp_path, _minimal())
+        with pytest.raises(KeyError):
+            set_primary_model("missing", path=p)
