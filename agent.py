@@ -151,6 +151,9 @@ def _build_llm(cfg: ModelConfig) -> LLM:
         budget_tokens=cfg.budget_tokens,
         reasoning_effort=cfg.reasoning_effort,
         cache_prompts=cfg.cache_prompts,
+        llama_cpp_cache_prompt=getattr(cfg, "llama_cpp_cache_prompt", False),
+        llama_cpp_sticky_slots=getattr(cfg, "llama_cpp_sticky_slots", False),
+        llama_cpp_slot_id=getattr(cfg, "llama_cpp_slot_id", None),
     )
 
 
@@ -600,7 +603,7 @@ class AgentLoop:
                     self._tail_node_id,
                 )
                 inference_messages = list(messages) + [{
-                    "role": "system",
+                    "role": "user",
                     "content": _EMPTY_REPLY_RETRY_PROMPT,
                 }]
 
