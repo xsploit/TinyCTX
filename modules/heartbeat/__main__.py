@@ -309,14 +309,22 @@ async def _run_turn(
 def _parse_reply(reply: str, ack_max: int) -> tuple[bool, str]:
     """
     Strip HEARTBEAT_OK from the start or end of the reply.
-    is_ok=True when the remainder is ≤ ack_max chars.
+    is_ok=True only when the token is present (or the reply is empty) and the
+    remainder is ≤ ack_max chars.
     """
     text = reply
+    matched = False
+
+    if text == "":
+        return True, ""
+
     if text.startswith(_TOKEN):
         text = text[len(_TOKEN):].lstrip(" \n\r")
+        matched = True
     elif text.endswith(_TOKEN):
         text = text[: -len(_TOKEN)].rstrip(" \n\r")
-    return len(text) <= ack_max, text
+        matched = True
+    return matched and len(text) <= ack_max, text
 
 
 def _emit_alert(text: str) -> None:

@@ -102,6 +102,31 @@ def test_html_to_text_strips_non_visible_tags():
     assert web_module._html_to_text(html) == "Hello\n\nWorld"
 
 
+def test_parse_duckduckgo_results_decodes_redirect_links():
+    html = """
+    <div class="result results_links results_links_deep web-result">
+      <div class="links_main links_deep result__body">
+        <h2 class="result__title">
+          <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fdocs">
+            Example Docs
+          </a>
+        </h2>
+        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fdocs">
+          Useful snippet text.
+        </a>
+      </div>
+    </div>
+    """
+
+    results = web_module._parse_duckduckgo_results(html, max_results=5)
+
+    assert results == [{
+        "title": "Example Docs",
+        "href": "https://example.com/docs",
+        "body": "Useful snippet text.",
+    }]
+
+
 @pytest.mark.asyncio
 async def test_browse_url_uses_http_helper_by_default(agent: _MockAgent, monkeypatch):
     web_module.register(agent)
@@ -252,3 +277,29 @@ async def test_runtime_web_settings_override_defaults(tmp_path: Path, monkeypatc
     result = await agent.tool_handler.tools["browse_url"]("https://example.com")
     payload = json.loads(result)
     assert payload["content"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_web_search_falls_back_when_ddgs_missing(agent: _MockAgent, monkeypatch):
+    web_module.register(agent)
+
+    async def fake_search_with_duckduckgo_html(query: str, *, num_results: int, user_agent: str):
+        assert query == "moltbook twitter verification signup"
+        assert num_results == 3
+        assert user_agent == "TinyCTX/1.1"
+        return [{
+            "title": "Moltbook",
+            "href": "https://www.moltbook.com/",
+            "body": "Agent internet front page.",
+        }]
+
+    monkeypatch.setattr(web_module, "_search_with_duckduckgo_html", fake_search_with_duckduckgo_html)
+    monkeypatch.setitem(sys.modules, "ddgs", None)
+
+    result = await agent.tool_handler.tools["web_search"](
+        "moltbook twitter verification signup",
+        num_results=3,
+    )
+
+    assert "Search results for 'moltbook twitter verification signup':" in result
+    assert "https://www.moltbook.com/" in result

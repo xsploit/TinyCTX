@@ -25,10 +25,11 @@ import asyncio
 import json
 import re
 import time
+from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import aiohttp
 
@@ -167,6 +168,86 @@ def _truncate_content(text: str, max_chars: int) -> tuple[str, bool]:
     return text[:max_chars].rstrip(), True
 
 
+def _decode_search_result_href(href: str) -> str:
+    if not href:
+        return ""
+    if href.startswith("//"):
+        href = "https:" + href
+    elif href.startswith("/"):
+        href = "https://duckduckgo.com" + href
+
+    parsed = urlparse(href)
+    if parsed.netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
+        uddg = parse_qs(parsed.query).get("uddg", [None])[0]
+        if uddg:
+            return unquote(uddg)
+    return href
+
+
+class _DuckDuckGoResultParser(HTMLParser):
+    def __init__(self, max_results: int) -> None:
+        super().__init__(convert_charrefs=True)
+        self._max_results = max_results
+        self.results: list[dict[str, str]] = []
+        self._capture_title = False
+        self._capture_snippet = False
+        self._title_chunks: list[str] = []
+        self._snippet_chunks: list[str] = []
+        self._current_href = ""
+
+    def handle_starttag(self, tag: str, attrs) -> None:  # noqa: ANN001
+        attrs_map = {k: v for k, v in attrs}
+        classes = set((attrs_map.get("class") or "").split())
+
+        if (
+            tag == "a"
+            and "result__a" in classes
+            and len(self.results) < self._max_results
+        ):
+            self._capture_title = True
+            self._title_chunks = []
+            self._current_href = attrs_map.get("href", "")
+            return
+
+        if self.results and "result__snippet" in classes:
+            self._capture_snippet = True
+            self._snippet_chunks = []
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._capture_title and tag == "a":
+            title = _normalise_inline_ws("".join(self._title_chunks))
+            href = _decode_search_result_href(self._current_href)
+            if title and href:
+                self.results.append({"title": title, "href": href, "body": ""})
+            self._capture_title = False
+            self._title_chunks = []
+            self._current_href = ""
+            return
+
+        if self._capture_snippet and tag in {"a", "div", "span"}:
+            snippet = _normalise_inline_ws("".join(self._snippet_chunks))
+            if snippet and self.results and not self.results[-1].get("body"):
+                self.results[-1]["body"] = snippet
+            self._capture_snippet = False
+            self._snippet_chunks = []
+
+    def handle_data(self, data: str) -> None:
+        if self._capture_title:
+            self._title_chunks.append(data)
+        elif self._capture_snippet:
+            self._snippet_chunks.append(data)
+
+
+def _parse_duckduckgo_results(html_text: str, max_results: int) -> list[dict[str, str]]:
+    parser = _DuckDuckGoResultParser(max_results=max_results)
+    parser.feed(html_text)
+    parser.close()
+    for result in parser.results:
+        result["title"] = unescape(result.get("title", ""))
+        result["body"] = unescape(result.get("body", ""))
+    return parser.results
+
+
 def _is_textual_content_type(content_type: str) -> bool:
     ctype = content_type.split(";", 1)[0].strip().lower()
     if not ctype:
@@ -285,6 +366,31 @@ async def _browse_with_http(
                 "title": title,
                 "content": content,
             }
+
+
+async def _search_with_duckduckgo_html(
+    query: str,
+    *,
+    num_results: int,
+    user_agent: str,
+) -> list[dict[str, str]]:
+    timeout = aiohttp.ClientTimeout(total=20)
+    headers = {
+        "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.1",
+        "User-Agent": user_agent,
+    }
+
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        async with session.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": query},
+            allow_redirects=True,
+        ) as resp:
+            body = await _read_response_body(resp, max_bytes=1_000_000)
+            charset = resp.charset or "utf-8"
+            html_text = body.decode(charset, errors="replace")
+
+    return _parse_duckduckgo_results(html_text, max_results=num_results)
 
 
 async def _browse_with_browser(
@@ -546,13 +652,31 @@ def register(agent) -> None:
             query: The search query string.
             num_results: How many results to return (default 5).
         """
-        from ddgs import DDGS
         num_results = int(num_results)
         try:
-            with DDGS() as ddgs:
-                results = list(ddgs.text(query, max_results=num_results))
+            try:
+                from ddgs import DDGS
+            except ImportError:
+                DDGS = None
+
+            results: list[dict] = []
+            if DDGS is not None:
+                try:
+                    with DDGS() as ddgs:
+                        results = list(ddgs.text(query, max_results=num_results))
+                except Exception:
+                    results = []
+
+            if not results:
+                results = await _search_with_duckduckgo_html(
+                    query,
+                    num_results=num_results,
+                    user_agent=st["settings"]["browse_user_agent"],
+                )
+
             if not results:
                 return "No results found."
+
             lines = [f"Search results for '{query}':"]
             for i, r in enumerate(results, 1):
                 lines.append(

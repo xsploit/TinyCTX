@@ -28,12 +28,21 @@ class ModelConfig:
     budget_tokens:    int | None = None   # Anthropic extended thinking: budget_tokens > 0
     reasoning_effort: str | None = None   # OpenAI-compat: "low" | "medium" | "high"
     cache_prompts:      bool        = False  # Anthropic prompt caching on last system message
+    vision:             bool        = False  # Back-compat alias for multimodal chat models
     tokens_per_image:   int | None  = None   # Flat token cost per image_url block (None = vision disabled)
+
+    def __post_init__(self) -> None:
+        # Back-compat: older configs/tests use `vision: true` without specifying
+        # an explicit token charge for image_url blocks.
+        if self.tokens_per_image is None and self.vision:
+            self.tokens_per_image = 280
+        elif self.tokens_per_image is not None:
+            self.vision = True
 
     @property
     def supports_vision(self) -> bool:
         """True when the model accepts image_url content blocks."""
-        return self.tokens_per_image is not None
+        return bool(self.vision or self.tokens_per_image is not None)
 
     @property
     def api_key(self) -> str:
@@ -232,6 +241,8 @@ def _parse_model(raw: dict) -> ModelConfig:
         if budget_tokens <= 0:
             raise ValueError(f"budget_tokens must be > 0, got {budget_tokens}")
 
+    vision = bool(raw.get("vision", False))
+
     return ModelConfig(
         model=raw["model"],
         base_url=raw["base_url"],
@@ -242,6 +253,7 @@ def _parse_model(raw: dict) -> ModelConfig:
         budget_tokens=budget_tokens,
         reasoning_effort=reasoning_effort,
         cache_prompts=bool(raw.get("cache_prompts", False)),
+        vision=vision,
         tokens_per_image=tokens_per_image,
     )
 
