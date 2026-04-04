@@ -75,7 +75,7 @@ _MD_CODE_RE = re.compile(r"`[^`\n]+`")
 _CLI_OPTION_DEFAULTS = {
     "compact_tools": True,
     "dim_tools": True,
-    "mouse_capture": True,
+    "mouse_capture": False,
     "word_wrap": True,
     "quiet_startup": True,
 }
@@ -583,7 +583,7 @@ class CLIBridge:
                     "label": "Mouse capture",
                     "kind": "toggle",
                     "option": "mouse_capture",
-                    "default": True,
+                    "default": False,
                 },
                 {"label": "Back", "kind": "action", "action": "back"},
             ]
@@ -841,7 +841,7 @@ class CLIBridge:
             self._application.invalidate()
 
     def _toggle_mouse_capture(self, value: bool | None = None) -> bool:
-        current = self._bool_option("mouse_capture", True)
+        current = self._bool_option("mouse_capture", False)
         enabled = (not current) if value is None else bool(value)
         if enabled == current:
             return enabled
@@ -1167,6 +1167,11 @@ class CLIBridge:
             return 120
         return max(80, self._application.output.get_size().columns)
 
+    def _current_height(self) -> int:
+        if self._application is None:
+            return 30
+        return max(12, self._application.output.get_size().rows)
+
     def _fit(self, text: str, width: int) -> str:
         if width <= 0:
             return ""
@@ -1377,6 +1382,16 @@ class CLIBridge:
     def _focus_input(self) -> None:
         if self._application is not None and self._input_area is not None:
             self._application.layout.focus(self._input_area)
+
+    def _scroll_output_pages(self, delta_pages: int) -> None:
+        if self._output_area is None:
+            return
+        window = self._output_area.window
+        page_step = max(3, self._current_height() - 6)
+        next_scroll = max(0, int(window.vertical_scroll) + (page_step * delta_pages))
+        window.vertical_scroll = next_scroll
+        if self._application is not None:
+            self._application.invalidate()
 
     def _paste_clipboard_into_input(self) -> bool:
         text = self._read_clipboard_text()
@@ -1924,8 +1939,9 @@ class CLIBridge:
                 "  Ctrl+C       copy selected text or the transcript\n"
                 "  Ctrl+V       paste clipboard into input\n"
                 "  Ctrl+T       toggle mouse capture / selection mode\n"
+                "  PgUp/PgDn    scroll transcript\n"
                 "  Right click  copy selection, otherwise paste clipboard\n"
-                "  Disable Mouse capture in /settings if you want terminal-native drag-select copy\n"
+                "  Mouse capture off keeps terminal-native drag-select copy available\n"
                 "  Ctrl+Q       exit TinyCTX\n"
                 "  /copy all-tools    copy all raw tool calls/results\n"
                 "  /copy transcript   copy the full transcript\n"
@@ -2135,6 +2151,14 @@ class CLIBridge:
         def _settings_page_down(_event) -> None:
             self._move_settings(5)
 
+        @key_bindings.add("pageup", filter=~showing_settings, eager=True)
+        def _output_page_up(_event) -> None:
+            self._scroll_output_pages(-1)
+
+        @key_bindings.add("pagedown", filter=~showing_settings, eager=True)
+        def _output_page_down(_event) -> None:
+            self._scroll_output_pages(1)
+
         @key_bindings.add("left", filter=showing_settings, eager=True)
         @key_bindings.add("escape", filter=showing_settings, eager=True)
         def _settings_back(_event) -> None:
@@ -2218,7 +2242,7 @@ class CLIBridge:
             layout=Layout(root, focused_element=self._input_area),
             key_bindings=key_bindings,
             full_screen=True,
-            mouse_support=Condition(lambda: self._bool_option("mouse_capture", True)),
+            mouse_support=Condition(lambda: self._bool_option("mouse_capture", False)),
             enable_page_navigation_bindings=True,
             style=self._style(),
             before_render=self._before_render,
