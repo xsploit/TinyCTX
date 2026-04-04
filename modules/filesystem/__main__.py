@@ -70,6 +70,19 @@ def _strip_trailing_ws(s: str) -> str:
     return "\n".join(line.rstrip() for line in s.split("\n"))
 
 
+def _coerce_positive_int(value, *, default: int, field: str) -> tuple[int | None, str | None]:
+    """Normalize tool numeric args that may arrive as JSON strings."""
+    if value in (None, ""):
+        return default, None
+    try:
+        ivalue = int(value)
+    except (TypeError, ValueError):
+        return None, f"[error: {field} must be an integer]"
+    if ivalue <= 0:
+        return default, None
+    return ivalue, None
+
+
 # Image MIME types we can pass to a vision model as an image_url block.
 _VISION_MIMES: frozenset[str] = frozenset({
     "image/jpeg", "image/png", "image/gif", "image/webp",
@@ -550,7 +563,9 @@ def register(agent) -> None:
         search_path = resolve(path) if path else workspace
         if not search_path.exists():
             return f"[error: path not found: {search_path}]"
-        effective_limit = limit if limit > 0 else _GREP_DEFAULT_LIMIT
+        effective_limit, err = _coerce_positive_int(limit, default=_GREP_DEFAULT_LIMIT, field="limit")
+        if err:
+            return err
 
         if _has_rg:
             raw = _run_rg(
@@ -628,7 +643,9 @@ def register(agent) -> None:
         search_path = resolve(path) if path else workspace
         if not search_path.exists():
             return f"[error: path not found: {search_path}]"
-        effective_limit = limit if limit > 0 else _GLOB_DEFAULT_LIMIT
+        effective_limit, err = _coerce_positive_int(limit, default=_GLOB_DEFAULT_LIMIT, field="limit")
+        if err:
+            return err
 
         try:
             matches = list(search_path.glob(pattern))

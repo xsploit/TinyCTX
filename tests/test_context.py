@@ -11,6 +11,7 @@ from context import (
     Context, HistoryEntry,
     HOOK_PRE_ASSEMBLE, HOOK_FILTER_TURN, HOOK_TRANSFORM_TURN, HOOK_POST_ASSEMBLE,
     ROLE_USER, ROLE_ASSISTANT, ROLE_TOOL, ROLE_SYSTEM,
+    _TRIMMED_USER_ANCHOR_PREFIX,
 )
 from contracts import ToolCall, ToolResult
 
@@ -333,3 +334,17 @@ class TestTokenBudget:
         asst_tool_msgs = [m for m in messages if m.get("tool_calls")]
         # Either both are present or neither
         assert len(tool_msgs) == len(asst_tool_msgs)
+
+    def test_user_anchor_reinserted_if_budget_trimmer_removes_all_users(self):
+        ctx = Context(token_limit=80)
+        ctx.add(HistoryEntry.user("first request"))
+        ctx.add(HistoryEntry.assistant("A" * 200))
+        ctx.add(HistoryEntry.user("latest request about turboquant"))
+        ctx.add(HistoryEntry.assistant("B" * 500))
+
+        messages = ctx.assemble()
+        user_msgs = [m for m in messages if m["role"] == "user"]
+
+        assert len(user_msgs) == 1
+        assert user_msgs[0]["content"].startswith(_TRIMMED_USER_ANCHOR_PREFIX)
+        assert "latest request about turboquant" in user_msgs[0]["content"]

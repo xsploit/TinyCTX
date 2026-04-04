@@ -46,6 +46,7 @@ from contracts import ToolCall, ToolResult
 logger = logging.getLogger(__name__)
 
 COMPACT_BOUNDARY_PREFIX = "__tinyctx_compact_boundary__:"
+_TRIMMED_USER_ANCHOR_PREFIX = "[Most recent user request preserved after context trimming]"
 
 
 def _make_compact_boundary_content(metadata: dict[str, Any] | None = None) -> str:
@@ -55,6 +56,25 @@ def _make_compact_boundary_content(metadata: dict[str, Any] | None = None) -> st
 
 def _is_compact_boundary_content(content: str | list) -> bool:
     return isinstance(content, str) and content.startswith(COMPACT_BOUNDARY_PREFIX)
+
+
+def _trimmed_user_anchor(content: str | list, *, max_chars: int = 1200) -> str:
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = str(block.get("text", "")).strip()
+                if text:
+                    parts.append(text)
+        text = "\n".join(parts).strip() or "[non-text user content omitted]"
+    else:
+        text = str(content or "").strip()
+
+    if len(text) > max_chars:
+        text = text[: max_chars - 3].rstrip() + "..."
+    if not text:
+        text = "[empty user request]"
+    return f"{_TRIMMED_USER_ANCHOR_PREFIX}\n{text}"
 
 
 # ---------------------------------------------------------------------------
@@ -668,6 +688,11 @@ class Context:
             else:
                 merged.append(dict(m))
 
+        latest_user_content = next(
+            (m.get("content", "") for m in reversed(merged) if m.get("role") == ROLE_USER),
+            None,
+        )
+
         # Token budget enforcement
         self.state["tokens_used_pre_trim"] = self._count_tokens(merged, tools)
         self.state["tokens_used"] = self.state["tokens_used_pre_trim"]
@@ -701,6 +726,20 @@ class Context:
             else:
                 merged.pop(drop_idx)
 
+            self.state["tokens_used"] = self._count_tokens(merged, tools)
+
+        if latest_user_content is not None and not any(m["role"] == ROLE_USER for m in merged):
+            insert_at = next(
+                (i for i, m in enumerate(merged) if m["role"] != ROLE_SYSTEM),
+                len(merged),
+            )
+            merged.insert(
+                insert_at,
+                {
+                    "role": ROLE_USER,
+                    "content": _trimmed_user_anchor(latest_user_content),
+                },
+            )
             self.state["tokens_used"] = self._count_tokens(merged, tools)
 
         return merged

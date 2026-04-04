@@ -546,12 +546,10 @@ class TestCompaction:
 
     @pytest.mark.asyncio
     async def test_context_compacts_at_most_once_per_turn(self, make_agent):
-        compact_calls = {"n": 0}
         normal_calls = {"n": 0}
 
         async def stream(messages, tools=None):
             if messages and messages[0].get("content") == COMPACT_SYSTEM_PROMPT:
-                compact_calls["n"] += 1
                 yield TextDelta(text="- durable older context")
                 return
 
@@ -582,7 +580,12 @@ class TestCompaction:
 
         final_text = "".join(chunk.text for chunk in chunks if isinstance(chunk, (AgentTextChunk, AgentTextFinal)))
         assert final_text == "done"
-        assert compact_calls["n"] == 1
+        compacted_users = [
+            entry.content
+            for entry in agent.context.dialogue
+            if entry.role == "user" and isinstance(entry.content, str) and entry.content.startswith("Compact summary:\n")
+        ]
+        assert len(compacted_users) == 1
 
     @pytest.mark.asyncio
     async def test_compaction_can_be_disabled_in_config(self, make_agent):
@@ -610,6 +613,84 @@ class TestCompaction:
             not messages or messages[0].get("content") != COMPACT_SYSTEM_PROMPT
             for messages in calls
         )
+
+    @pytest.mark.asyncio
+    async def test_generate_compact_summary_splits_oversized_summary_input(self, make_agent):
+        calls = []
+
+        async def stream(messages, tools=None):
+            calls.append(messages)
+            if len(calls) <= 2:
+                yield TextDelta(text=f"partial-{len(calls)}")
+                return
+            yield TextDelta(text="merged-summary")
+
+        agent = make_agent(stream)
+        agent.config.context = 200
+
+        original_count_tokens = agent.context._count_tokens
+
+        def fake_count_tokens(messages, tools=None):
+            if messages and messages[0].get("content") == COMPACT_SYSTEM_PROMPT:
+                if messages[-1].get("content") == COMPACT_USER_PROMPT:
+                    body_tokens = sum(
+                        len(str(m.get("content", ""))) // 4
+                        for m in messages[1:-1]
+                    )
+                    return 40 + body_tokens
+                body_tokens = len(str(messages[-1].get("content", ""))) // 4
+                return 40 + body_tokens
+            return original_count_tokens(messages, tools)
+
+        agent.context._count_tokens = fake_count_tokens
+
+        entries = [
+            HistoryEntry.user("u1 " + ("a" * 320)),
+            HistoryEntry.assistant("a1 " + ("b" * 320)),
+            HistoryEntry.user("u2 " + ("c" * 320)),
+            HistoryEntry.assistant("a2 " + ("d" * 320)),
+        ]
+
+        summary = await agent._generate_compact_summary(entries)
+
+        assert summary == "merged-summary"
+        assert len(calls) == 3
+        assert all(call[0]["content"] == COMPACT_SYSTEM_PROMPT for call in calls)
+        assert calls[0][-1]["content"] == COMPACT_USER_PROMPT
+        assert calls[1][-1]["content"] == COMPACT_USER_PROMPT
+        assert "Partial summary 1:" in calls[2][-1]["content"]
+
+    @pytest.mark.asyncio
+    async def test_generate_compact_summary_truncates_single_oversized_entry(self, make_agent):
+        calls = []
+
+        async def stream(messages, tools=None):
+            calls.append(messages)
+            yield TextDelta(text="chunk-summary")
+
+        agent = make_agent(stream)
+        agent.config.context = 200
+
+        original_count_tokens = agent.context._count_tokens
+
+        def fake_count_tokens(messages, tools=None):
+            if messages and messages[0].get("content") == COMPACT_SYSTEM_PROMPT:
+                if messages[-1].get("content") == COMPACT_USER_PROMPT:
+                    body_tokens = sum(
+                        len(str(m.get("content", ""))) // 4
+                        for m in messages[1:-1]
+                    )
+                    return 40 + body_tokens
+            return original_count_tokens(messages, tools)
+
+        agent.context._count_tokens = fake_count_tokens
+
+        huge_entry = HistoryEntry.user("x" * 4000)
+        summary = await agent._generate_compact_summary([huge_entry])
+
+        assert summary == "chunk-summary"
+        assert len(calls) == 1
+        assert len(calls[0][1]["content"]) < 4000
 
 
 # ---------------------------------------------------------------------------

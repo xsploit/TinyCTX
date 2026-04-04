@@ -55,6 +55,7 @@ import json
 import logging
 import re
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from typing import AsyncIterator, Callable, Awaitable
 
@@ -85,6 +86,15 @@ _EMPTY_REPLY_RETRY_PROMPT = (
     "You already have the tool results for this turn. "
     "If you do not need another tool, answer the user directly now. "
     "Do not return an empty response."
+)
+_COMPACT_SUMMARY_HEADROOM_TOKENS = 4096
+_COMPACT_SUMMARY_MIN_BUDGET = 2048
+_COMPACT_SINGLE_ENTRY_MIN_CHARS = 256
+_COMPACT_MERGE_FALLBACK_MAX_CHARS = 12000
+_COMPACT_MERGE_USER_PROMPT = (
+    "Merge the partial compact summaries below into one coherent compact summary "
+    "for future continuation. Deduplicate overlap, preserve durable facts only, "
+    "and output plain text only."
 )
 
 
@@ -118,6 +128,75 @@ def _cached_tool_result_notice(call: ToolCall, *, is_error: bool) -> str:
         + _summarize_cached_tool_call(call)
         + " — refer to the previous tool result instead of calling it again]"
     )
+
+
+def _group_compaction_entries(entries: list[HistoryEntry]) -> list[list[HistoryEntry]]:
+    groups: list[list[HistoryEntry]] = []
+    i = 0
+
+    while i < len(entries):
+        entry = entries[i]
+        if entry.role == "assistant" and entry.tool_calls:
+            group = [entry]
+            call_ids = {tc["id"] for tc in entry.tool_calls}
+            i += 1
+            while i < len(entries):
+                candidate = entries[i]
+                if candidate.role != "tool" or candidate.tool_call_id not in call_ids:
+                    break
+                group.append(candidate)
+                i += 1
+            groups.append(group)
+            continue
+
+        groups.append([entry])
+        i += 1
+
+    return groups
+
+
+def _flatten_entry_units(units: list[list[HistoryEntry]]) -> list[HistoryEntry]:
+    return [entry for unit in units for entry in unit]
+
+
+def _stringify_compaction_content(content: str | list) -> str:
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "text":
+                    text = str(block.get("text", "")).strip()
+                    if text:
+                        parts.append(text)
+                elif block.get("type") == "image_url":
+                    parts.append("[image omitted]")
+                else:
+                    raw = json.dumps(block, ensure_ascii=False)
+                    if raw:
+                        parts.append(raw)
+            else:
+                raw = str(block).strip()
+                if raw:
+                    parts.append(raw)
+        return "\n".join(parts).strip() or "[non-text content omitted]"
+
+    return str(content or "").strip()
+
+
+def _fallback_merge_compaction_partials(partials: list[str]) -> str:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for partial in partials:
+        text = partial.strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        ordered.append(text)
+
+    merged = "\n\n".join(ordered).strip()
+    if len(merged) > _COMPACT_MERGE_FALLBACK_MAX_CHARS:
+        merged = merged[: _COMPACT_MERGE_FALLBACK_MAX_CHARS - 3].rstrip() + "..."
+    return merged
 
 
 def _looks_like_failed_shell_output(output: str) -> bool:
@@ -352,13 +431,109 @@ class AgentLoop:
         )
         return True
 
-    async def _generate_compact_summary(self, entries: list[HistoryEntry]) -> str | None:
-        summary_messages = (
+    def _compaction_summary_budget(self) -> int:
+        token_limit = int(self.config.context or 0)
+        if token_limit <= 0:
+            return 0
+        reserve = min(
+            _COMPACT_SUMMARY_HEADROOM_TOKENS,
+            max(1024, token_limit // 10),
+        )
+        budget = token_limit - reserve
+        if budget < _COMPACT_SUMMARY_MIN_BUDGET:
+            budget = max(token_limit // 2, min(token_limit, _COMPACT_SUMMARY_MIN_BUDGET))
+        return max(1, min(token_limit, budget))
+
+    def _build_compaction_summary_messages(self, entries: list[HistoryEntry]) -> list[dict]:
+        return (
             [{"role": "system", "content": COMPACT_SYSTEM_PROMPT}]
             + [self.context._render(entry) for entry in entries]
             + [{"role": "user", "content": COMPACT_USER_PROMPT}]
         )
 
+    def _build_compaction_merge_messages(self, partials: list[str]) -> list[dict]:
+        body = "\n\n".join(
+            f"Partial summary {i + 1}:\n{partial.strip()}"
+            for i, partial in enumerate(partials)
+            if partial.strip()
+        ).strip()
+        return [
+            {"role": "system", "content": COMPACT_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": _COMPACT_MERGE_USER_PROMPT + "\n\n" + body,
+            },
+        ]
+
+    def _truncate_compaction_entry(
+        self,
+        entry: HistoryEntry,
+        *,
+        token_budget: int,
+    ) -> HistoryEntry:
+        text = _stringify_compaction_content(entry.content) or "[empty content]"
+        max_chars = min(len(text), max(_COMPACT_SINGLE_ENTRY_MIN_CHARS, token_budget * 2))
+
+        while True:
+            clipped = text if len(text) <= max_chars else text[: max_chars - 3].rstrip() + "..."
+            candidate = replace(entry, content=clipped)
+            tokens = self.context._count_tokens(
+                self._build_compaction_summary_messages([candidate]),
+                tools=None,
+            )
+            if tokens <= token_budget or max_chars <= _COMPACT_SINGLE_ENTRY_MIN_CHARS:
+                return candidate
+            max_chars = max(_COMPACT_SINGLE_ENTRY_MIN_CHARS, max_chars // 2)
+
+    def _build_compaction_summary_chunks(
+        self,
+        entries: list[HistoryEntry],
+        *,
+        token_budget: int,
+    ) -> list[list[HistoryEntry]]:
+        chunks: list[list[HistoryEntry]] = []
+        current_units: list[list[HistoryEntry]] = []
+
+        for unit in _group_compaction_entries(entries):
+            candidate_units = current_units + [unit]
+            candidate_entries = _flatten_entry_units(candidate_units)
+            candidate_tokens = self.context._count_tokens(
+                self._build_compaction_summary_messages(candidate_entries),
+                tools=None,
+            )
+            if candidate_tokens <= token_budget:
+                current_units = candidate_units
+                continue
+
+            if current_units:
+                chunks.append(_flatten_entry_units(current_units))
+                current_units = []
+
+            single_unit_tokens = self.context._count_tokens(
+                self._build_compaction_summary_messages(list(unit)),
+                tools=None,
+            )
+            if single_unit_tokens <= token_budget:
+                current_units = [unit]
+                continue
+
+            truncated_unit = [
+                self._truncate_compaction_entry(entry, token_budget=token_budget)
+                for entry in unit
+            ]
+            chunks.append(truncated_unit)
+
+        if current_units:
+            chunks.append(_flatten_entry_units(current_units))
+
+        return [chunk for chunk in chunks if chunk]
+
+    async def _run_compaction_summary_messages(
+        self,
+        summary_messages: list[dict],
+        *,
+        failure_label: str = "compaction summary",
+    ) -> str | None:
         model_chain = [self.config.llm.primary] + list(self.config.llm.fallback)
         for model_name in model_chain:
             llm = self._models[model_name]
@@ -385,7 +560,7 @@ class AgentLoop:
                 summary = "".join(text_chunks).strip()
                 if summary:
                     return summary
-                error = "empty compaction summary"
+                error = f"empty {failure_label}"
 
             fo = self.config.llm.fallback_on
             should_fallback = fo.any_error or (
@@ -393,22 +568,106 @@ class AgentLoop:
             )
             if should_fallback and model_name != model_chain[-1]:
                 logger.warning(
-                    "[cursor=%s] compaction model '%s' failed (%s) — trying fallback",
+                    "[cursor=%s] %s model '%s' failed (%s) — trying fallback",
                     self._tail_node_id,
+                    failure_label,
                     model_name,
                     error,
                 )
                 continue
 
             logger.warning(
-                "[cursor=%s] compaction summary failed on model '%s': %s",
+                "[cursor=%s] %s failed on model '%s': %s",
                 self._tail_node_id,
+                failure_label,
                 model_name,
                 error,
             )
             break
 
         return None
+
+    async def _generate_compact_summary(self, entries: list[HistoryEntry]) -> str | None:
+        token_budget = self._compaction_summary_budget()
+        if token_budget <= 0:
+            logger.warning(
+                "[cursor=%s] compaction skipped — invalid summary token budget",
+                self._tail_node_id,
+            )
+            return None
+
+        chunks = self._build_compaction_summary_chunks(entries, token_budget=token_budget)
+        if not chunks:
+            return None
+
+        if len(chunks) > 1:
+            logger.info(
+                "[cursor=%s] compaction split %d entry(s) into %d summary chunk(s) to fit budget %d",
+                self._tail_node_id,
+                len(entries),
+                len(chunks),
+                token_budget,
+            )
+
+        partials: list[str] = []
+        for idx, chunk in enumerate(chunks, start=1):
+            summary = await self._run_compaction_summary_messages(
+                self._build_compaction_summary_messages(chunk),
+                failure_label=f"compaction summary chunk {idx}/{len(chunks)}",
+            )
+            if not summary:
+                return None
+            partials.append(summary)
+
+        while len(partials) > 1:
+            merge_budget = token_budget
+            merged_partials: list[str] = []
+            current: list[str] = []
+
+            for partial in partials:
+                candidate = current + [partial]
+                candidate_tokens = self.context._count_tokens(
+                    self._build_compaction_merge_messages(candidate),
+                    tools=None,
+                )
+                if candidate_tokens <= merge_budget:
+                    current = candidate
+                    continue
+
+                if current:
+                    merged = await self._run_compaction_summary_messages(
+                        self._build_compaction_merge_messages(current),
+                        failure_label="compaction summary merge",
+                    )
+                    if not merged:
+                        return None
+                    merged_partials.append(merged)
+                    current = [partial]
+                    continue
+
+                merged_partials.append(partial)
+
+            if current:
+                merged = await self._run_compaction_summary_messages(
+                    self._build_compaction_merge_messages(current),
+                    failure_label="compaction summary merge",
+                )
+                if not merged:
+                    return None
+                merged_partials.append(merged)
+
+            if len(merged_partials) >= len(partials):
+                logger.warning(
+                    "[cursor=%s] compaction merge could not shrink %d partial summaries within budget %d — falling back to local merge",
+                    self._tail_node_id,
+                    len(partials),
+                    merge_budget,
+                )
+                return _fallback_merge_compaction_partials(partials)
+
+            partials = merged_partials
+
+        return partials[0]
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -489,10 +748,24 @@ class AgentLoop:
                 active_tokens = int(self.context.state.get("tokens_used", 0) or 0)
                 token_limit = self.config.context
                 token_pct   = tokens_used / token_limit if token_limit else 0
+                compaction_cfg = getattr(self.config, "compaction", None)
+                compaction_enabled = compaction_cfg is None or getattr(compaction_cfg, "enabled", True)
+                compaction_due = (
+                    compaction_enabled
+                    and not compacted_this_turn
+                    and should_compact(tokens_used, token_limit, trigger_pct=float(
+                        getattr(compaction_cfg, "trigger_pct", 0.90) if compaction_cfg is not None else 0.90
+                    ))
+                )
                 if token_pct >= 0.95:
                     logger.warning(
-                        "[cursor=%s] context at %.0f%% of token budget (%d/%d, active=%d) — consider compaction",
-                        self._tail_node_id, token_pct * 100, tokens_used, token_limit, active_tokens,
+                        "[cursor=%s] context at %.0f%% of token budget (%d/%d, active=%d)%s",
+                        self._tail_node_id,
+                        token_pct * 100,
+                        tokens_used,
+                        token_limit,
+                        active_tokens,
+                        " — attempting compaction" if compaction_due else "",
                     )
                 elif token_pct >= 0.80:
                     logger.info(

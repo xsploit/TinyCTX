@@ -204,6 +204,14 @@ class TestGrep:
         # Should be capped (may include truncation notice)
         assert len(lines) <= 5  # 3 + possible header/footer
 
+    def test_limit_accepts_numeric_string(self, tools):
+        result = tools["grep"](pattern=".", output_mode="content", limit="3")
+        assert "limit must be an integer" not in result.lower()
+
+    def test_limit_rejects_non_numeric_string(self, tools):
+        result = tools["grep"](pattern=".", output_mode="content", limit="abc")
+        assert "limit must be an integer" in result.lower()
+
     def test_subdirectory_search(self, tools):
         result = tools["grep"](pattern="import", path="src")
         assert "main.py" in result
@@ -248,6 +256,14 @@ class TestGlobSearch:
         # Header line + at most 2 file lines
         file_lines = [l for l in lines if not l.startswith("[")]
         assert len(file_lines) <= 2
+
+    def test_limit_accepts_numeric_string(self, tools):
+        result = tools["glob_search"](pattern="**/*", limit="2")
+        assert "error" not in result.lower()
+
+    def test_limit_rejects_non_numeric_string(self, tools):
+        result = tools["glob_search"](pattern="**/*", limit="abc")
+        assert "limit must be an integer" in result.lower()
 
     def test_sorted_by_mtime(self, tools, workspace):
         # Touch hello.py to make it newest

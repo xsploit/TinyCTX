@@ -63,6 +63,14 @@ _TINYCTX_BANNER = (
 _DIMMED_LINE_PREFIXES = ("tool ", "ok ", "err ", "[tool ", "[ok ", "[err ", "thinking…")
 _PASTED_TEXT_REF = re.compile(r"\[Pasted text #(\d+)(?:[^\]]*)\]")
 _SHELL_EXIT_ERROR_RE_END = re.compile(r"(?:^|\n)\[exit \d+\]\s*\Z")
+_MD_HEADING_RE = re.compile(r"^(\s{0,3})(#{1,6})(\s+.*)$")
+_MD_LIST_RE = re.compile(r"^(\s*)([-*+]|\d+\.)(\s+.*)$")
+_MD_QUOTE_RE = re.compile(r"^(\s*)(>+)(\s*.*)$")
+_MD_RULE_RE = re.compile(r"^\s{0,3}([-*_])(?:\s*\1){2,}\s*$")
+_MD_LINK_RE = re.compile(r"\[[^\]]+\]\([^)]+\)")
+_MD_BOLD_RE = re.compile(r"(\*\*[^*\n]+\*\*|__[^_\n]+__)")
+_MD_ITALIC_RE = re.compile(r"(\*[^*\n]+\*|_[^_\n]+_)")
+_MD_CODE_RE = re.compile(r"`[^`\n]+`")
 _CLI_OPTION_DEFAULTS = {
     "compact_tools": True,
     "dim_tools": True,
@@ -169,6 +177,105 @@ class _DimToolLineProcessor(Processor):
                 [("class:tool-dim", fragment[1]) for fragment in transformation_input.fragments]
         )
         return Transformation(transformation_input.fragments)
+
+
+def _markdown_fragments_for_line(text: str, *, in_code_block: bool = False):
+    if not text:
+        return [("", text)]
+
+    if text.startswith(_DIMMED_LINE_PREFIXES):
+        return [("", text)]
+
+    if in_code_block or text.lstrip().startswith("```"):
+        style = "class:md.code-fence" if text.lstrip().startswith("```") else "class:md.code"
+        return [(style, text)]
+
+    heading = _MD_HEADING_RE.match(text)
+    if heading:
+        indent, hashes, rest = heading.groups()
+        return [
+            ("", indent),
+            ("class:md.heading.marker", hashes),
+            ("class:md.heading", rest),
+        ]
+
+    if _MD_RULE_RE.match(text):
+        return [("class:md.rule", text)]
+
+    quote = _MD_QUOTE_RE.match(text)
+    if quote:
+        indent, markers, rest = quote.groups()
+        return [
+            ("", indent),
+            ("class:md.quote.marker", markers),
+            ("class:md.quote", rest),
+        ]
+
+    bullet = _MD_LIST_RE.match(text)
+    if bullet:
+        indent, marker, rest = bullet.groups()
+        return [
+            ("", indent),
+            ("class:md.list.marker", marker),
+            ("class:md.list", rest),
+        ]
+
+    fragments: list[tuple[str, str]] = []
+    index = 0
+    combined = re.compile(
+        "|".join(
+            [
+                _MD_CODE_RE.pattern,
+                _MD_LINK_RE.pattern,
+                _MD_BOLD_RE.pattern,
+                _MD_ITALIC_RE.pattern,
+            ]
+        )
+    )
+    for match in combined.finditer(text):
+        start, end = match.span()
+        if start > index:
+            fragments.append(("", text[index:start]))
+        token = match.group(0)
+        if _MD_CODE_RE.fullmatch(token):
+            style = "class:md.inline-code"
+        elif _MD_LINK_RE.fullmatch(token):
+            style = "class:md.link"
+        elif _MD_BOLD_RE.fullmatch(token):
+            style = "class:md.bold"
+        else:
+            style = "class:md.italic"
+        fragments.append((style, token))
+        index = end
+    if index < len(text):
+        fragments.append(("", text[index:]))
+    return fragments or [("", text)]
+
+
+class _MarkdownLineProcessor(Processor):
+    def __init__(self, enabled_getter=None) -> None:
+        self._enabled_getter = enabled_getter or (lambda: True)
+
+    def apply_transformation(self, transformation_input) -> Transformation:
+        if not self._enabled_getter():
+            return Transformation(transformation_input.fragments)
+
+        text = "".join(fragment[1] for fragment in transformation_input.fragments)
+        if not text:
+            return Transformation(transformation_input.fragments)
+
+        lineno = getattr(transformation_input, "lineno", None)
+        document = getattr(transformation_input, "document", None)
+        in_code_block = False
+        if document is not None and lineno is not None:
+            lines = getattr(document, "lines", None) or []
+            fence_count = 0
+            for prior in lines[:lineno]:
+                if prior.lstrip().startswith("```"):
+                    fence_count += 1
+            in_code_block = bool(fence_count % 2)
+
+        return Transformation(_markdown_fragments_for_line(text, in_code_block=in_code_block))
 
 
 class _SlashCommandCompleter(Completer):
@@ -1813,6 +1920,19 @@ class CLIBridge:
             "menu.dim": "#7f7f7f bg:#000000",
             "rule": "#808080 bg:#000000",
             "tool-dim": "#7f7f7f bg:#000000",
+            "md.heading": "bold #f5f5f5 bg:#000000",
+            "md.heading.marker": "bold #ff3b30 bg:#000000",
+            "md.quote": "italic #b9c1c9 bg:#000000",
+            "md.quote.marker": "bold #7f7f7f bg:#000000",
+            "md.list": "#d7d7d7 bg:#000000",
+            "md.list.marker": "bold #ff3b30 bg:#000000",
+            "md.rule": "#7f7f7f bg:#000000",
+            "md.bold": "bold #f5f5f5 bg:#000000",
+            "md.italic": "italic #d7d7d7 bg:#000000",
+            "md.inline-code": "#ffb86c bg:#111111",
+            "md.code": "#c7d7ff bg:#111111",
+            "md.code-fence": "bold #7f7f7f bg:#111111",
+            "md.link": "underline #79c0ff bg:#000000",
         })
 
     def _build_application(self) -> Application:
@@ -1825,7 +1945,10 @@ class CLIBridge:
             scrollbar=True,
             wrap_lines=True,
             style="class:output-area",
-            input_processors=[_DimToolLineProcessor(lambda: self._bool_option("dim_tools", True))],
+            input_processors=[
+                _MarkdownLineProcessor(),
+                _DimToolLineProcessor(lambda: self._bool_option("dim_tools", True)),
+            ],
         )
         self._input_area = TextArea(
             multiline=False,

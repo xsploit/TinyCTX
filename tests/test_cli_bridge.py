@@ -13,6 +13,7 @@ from prompt_toolkit.document import Document
 from bridges.cli.__main__ import (
     CLIBridge,
     _DimToolLineProcessor,
+    _MarkdownLineProcessor,
     _SlashCommandCompleter,
 )
 from contracts import AgentError, AgentToolResult
@@ -137,6 +138,8 @@ def test_cli_style_uses_black_background_and_red_banner(tmp_path):
     assert ("input-area", "#f5f5f5 bg:#000000") in style
     assert ("banner", "bold #ff3b30 bg:#000000") in style
     assert ("tool-dim", "#7f7f7f bg:#000000") in style
+    assert ("md.heading.marker", "bold #ff3b30 bg:#000000") in style
+    assert ("md.inline-code", "#ffb86c bg:#111111") in style
     first_fragment = bridge._welcome_fragments()[0]
     assert first_fragment[0] == "class:banner"
 
@@ -155,6 +158,49 @@ def test_cli_dims_tool_prefix_lines():
         SimpleNamespace(fragments=[("", "tool web_search NHL scores today")])
     )
     assert transformed.fragments == [("class:tool-dim", "tool web_search NHL scores today")]
+
+
+def test_cli_markdown_processor_styles_headings():
+    processor = _MarkdownLineProcessor()
+    transformed = processor.apply_transformation(
+        SimpleNamespace(
+            fragments=[("", "## Heading")],
+            lineno=0,
+            document=SimpleNamespace(lines=["## Heading"]),
+        )
+    )
+    assert transformed.fragments == [
+        ("", ""),
+        ("class:md.heading.marker", "##"),
+        ("class:md.heading", " Heading"),
+    ]
+
+
+def test_cli_markdown_processor_styles_inline_code_bold_and_links():
+    processor = _MarkdownLineProcessor()
+    transformed = processor.apply_transformation(
+        SimpleNamespace(
+            fragments=[("", "Use `code`, **bold**, and [docs](https://example.com).")],
+            lineno=0,
+            document=SimpleNamespace(lines=["Use `code`, **bold**, and [docs](https://example.com)."]),
+        )
+    )
+    styles = [style for style, _ in transformed.fragments if style]
+    assert "class:md.inline-code" in styles
+    assert "class:md.bold" in styles
+    assert "class:md.link" in styles
+
+
+def test_cli_markdown_processor_styles_fenced_code_blocks():
+    processor = _MarkdownLineProcessor()
+    transformed = processor.apply_transformation(
+        SimpleNamespace(
+            fragments=[("", "print('x')")],
+            lineno=1,
+            document=SimpleNamespace(lines=["```python", "print('x')", "```"]),
+        )
+    )
+    assert transformed.fragments == [("class:md.code", "print('x')")]
 
 
 def test_cli_wraps_transcript_by_words(tmp_path):
