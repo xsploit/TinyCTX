@@ -553,7 +553,7 @@ class _CronRunner:
 
             reply_text = "".join(parts).strip()
             if reply_text:
-                print(f"\n[CRON: {job.name}]\n{reply_text}\n")
+                logger.info("[cron] job '%s' reply:\n%s", job.name, reply_text)
 
             # Advance the job cursor to the lane's latest tail so the next run
             # continues from the updated branch head.

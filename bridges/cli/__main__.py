@@ -4,6 +4,7 @@ bridges/cli/__main__.py — Fullscreen interactive CLI bridge using prompt_toolk
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 import textwrap
@@ -171,6 +172,20 @@ class _SlashCommandCompleter(Completer):
             )
 
 
+class _TranscriptLogHandler(logging.Handler):
+    def __init__(self, bridge: "CLIBridge") -> None:
+        super().__init__()
+        self._bridge = bridge
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = self.format(record)
+        except Exception:
+            self.handleError(record)
+            return
+        self._bridge._append_log_record(record.levelno, message)
+
+
 @dataclass
 class CLITheme:
     colors: dict[str, str] = field(default_factory=dict)
@@ -220,6 +235,7 @@ class CLIBridge:
         self._thinking = False
         self._status_text = "ready"
         self._send_task: asyncio.Task | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._last_output_width: int | None = None
         self._settings_path: list[str] = []
         self._settings_selected: list[int] = []
@@ -984,6 +1000,40 @@ class CLIBridge:
         if block:
             self._transcript_blocks.append(block)
 
+    def _append_log_record(self, levelno: int, message: str) -> None:
+        text = message.strip()
+        if not text:
+            return
+
+        prefix = "error" if levelno >= logging.ERROR else "warn"
+
+        def _update() -> None:
+            self._append_block(f"{prefix} {text}")
+            self._refresh_output(self._resolve_runtime_log_level())
+
+        if self._loop is not None and self._loop.is_running():
+            self._loop.call_soon_threadsafe(_update)
+            return
+        _update()
+
+    @contextlib.contextmanager
+    def _capture_root_logs(self, log_level: int):
+        root = logging.getLogger()
+        previous_handlers = list(root.handlers)
+        previous_level = root.level
+
+        handler = _TranscriptLogHandler(self)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        handler.setLevel(max(log_level, logging.WARNING))
+
+        root.handlers = [handler]
+        root.setLevel(min(previous_level, handler.level))
+        try:
+            yield
+        finally:
+            root.handlers = previous_handlers
+            root.setLevel(previous_level)
+
     def _compose_output_text(self, log_level: int) -> str:
         blocks = list(self._transcript_blocks)
         if self._current_stream.strip():
@@ -1362,19 +1412,15 @@ class CLIBridge:
 
     async def run(self) -> None:
         log_level = self._resolve_runtime_log_level()
-        logging.basicConfig(
-            level=log_level,
-            format="%(message)s",
-            datefmt="[%X]",
-            force=True,
-        )
         self._gateway.register_platform_handler(Platform.CLI.value, self.handle_event)
         self._cursor = _load_cli_cursor(self._gateway)
         self._application = self._build_application()
+        self._loop = asyncio.get_running_loop()
         self._refresh_output(log_level)
         try:
-            with patch_stdout(raw=True):
-                await self._application.run_async()
+            with self._capture_root_logs(log_level):
+                with patch_stdout(raw=True):
+                    await self._application.run_async()
         finally:
             if self._send_task is not None and not self._send_task.done():
                 self._send_task.cancel()

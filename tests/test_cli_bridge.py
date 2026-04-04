@@ -390,3 +390,20 @@ def test_tab_completion_fills_unique_slash_command(tmp_path):
     bridge._input_area.buffer.document = Document(text="/set", cursor_position=4)
     bridge._complete_input()
     assert bridge._input_area.text == "/settings"
+
+
+def test_cli_capture_root_logs_routes_warnings_to_transcript(tmp_path):
+    cfg = _make_config(tmp_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+    root = logging.getLogger()
+    previous_handlers = list(root.handlers)
+    previous_level = root.level
+
+    with bridge._capture_root_logs(logging.INFO):
+        logging.info("hidden info")
+        logging.warning("keep warning")
+
+    assert "warn keep warning" in bridge._transcript_blocks
+    assert all("hidden info" not in block for block in bridge._transcript_blocks)
+    assert root.handlers == previous_handlers
+    assert root.level == previous_level

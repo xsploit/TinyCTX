@@ -328,8 +328,7 @@ def _parse_reply(reply: str, ack_max: int) -> tuple[bool, str]:
 
 
 def _emit_alert(text: str) -> None:
-    print(f"\n[HEARTBEAT ALERT]\n{text}\n")
-    logger.info("[heartbeat] alert delivered (%d chars)", len(text))
+    logger.warning("[HEARTBEAT ALERT]\n%s", text)
 
 
 # ---------------------------------------------------------------------------
