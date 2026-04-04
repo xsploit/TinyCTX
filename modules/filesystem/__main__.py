@@ -85,6 +85,17 @@ _EXT_TO_MIME: dict[str, str] = {
 }
 
 
+def _filesystem_prompt(_ctx) -> str:
+    return (
+        "<filesystem>\n"
+        "- The shell() tool runs PowerShell on Windows and bash on Linux/macOS.\n"
+        "- On Windows, prefer PowerShell-native commands such as Get-ChildItem, Get-Content, Get-Location, and Select-String.\n"
+        "- Avoid Unix-only flags like `ls -la` on Windows.\n"
+        "- Prefer view(), grep(), and glob_search() for file inspection when they are sufficient.\n"
+        "</filesystem>"
+    )
+
+
 def _image_mime(path: Path) -> str | None:
     """Return the vision-compatible MIME type for a file, or None if not an image."""
     ext = path.suffix.lower()
@@ -101,6 +112,14 @@ def register(agent) -> None:
     workspace.mkdir(parents=True, exist_ok=True)
 
     shell_timeout: int = getattr(agent.config, 'shell_timeout', 60)
+
+    if hasattr(agent, "context"):
+        agent.context.register_prompt(
+            "filesystem_tools",
+            _filesystem_prompt,
+            role="system",
+            priority=11,
+        )
 
     # Load blacklist once at register time. Restart to pick up edits.
     blacklist = load_blacklist()

@@ -16,6 +16,7 @@ import re
 import fnmatch
 import logging
 import platform
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -181,6 +182,63 @@ def get_destructive_warning(command: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Windows command normalization — harmless Unix-style read commands
+# ---------------------------------------------------------------------------
+
+def _quote_powershell_literal(token: str) -> str:
+    return "'" + token.replace("'", "''") + "'"
+
+
+def _normalize_windows_command(command: str) -> str:
+    """Translate a few common read-only Unix commands into PowerShell.
+
+    This keeps common LLM habits like ``ls -la`` from failing on Windows while
+    preserving the original command for blacklist checks and error reporting.
+    """
+    if not _IS_WINDOWS:
+        return command
+
+    stripped = command.strip()
+    if not stripped or any(sep in stripped for sep in ("|", ";", "&", "\n", "\r")):
+        return command
+
+    try:
+        tokens = shlex.split(stripped, posix=False)
+    except ValueError:
+        return command
+
+    if not tokens:
+        return command
+
+    cmd = tokens[0].lower()
+
+    if cmd == "pwd" and len(tokens) == 1:
+        return "Get-Location"
+
+    if cmd not in {"ls", "ll"}:
+        return command
+
+    flags: set[str] = set()
+    paths: list[str] = []
+    for token in tokens[1:]:
+        if token.startswith("-") and len(token) > 1 and not paths:
+            chars = set(token[1:].lower())
+            if not chars.issubset({"a", "l"}):
+                return command
+            flags.update(chars)
+            continue
+        paths.append(token)
+
+    cmd_parts = ["Get-ChildItem"]
+    if "a" in flags:
+        cmd_parts.append("-Force")
+    if paths:
+        literal_paths = ", ".join(_quote_powershell_literal(path) for path in paths)
+        cmd_parts.append(f"-LiteralPath {literal_paths}")
+    return " ".join(cmd_parts)
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -202,9 +260,10 @@ def run_command(command: str, cwd: Path, timeout: int, blacklist: list[str]) -> 
 
     # Check for destructive command — warn but don't block
     destructive_warning = get_destructive_warning(command)
+    effective_command = _normalize_windows_command(command)
 
     if _IS_WINDOWS:
-        exec_args = ["powershell", "-NoProfile", "-NonInteractive", "-Command", command]
+        exec_args = ["powershell", "-NoProfile", "-NonInteractive", "-Command", effective_command]
     else:
         exec_args = ["bash", "-c", command]
 

@@ -21,6 +21,7 @@ if project_root not in sys.path:
 from modules.filesystem.shell import (
     _extract_last_command,
     _interpret_exit_code,
+    _normalize_windows_command,
     get_destructive_warning,
 )
 
@@ -197,3 +198,24 @@ class TestDestructiveWarnings:
         assert get_destructive_warning("git commit -m 'normal'") is None
         assert get_destructive_warning("git push origin main") is None
         assert get_destructive_warning("cat file.txt") is None
+
+
+class TestWindowsNormalization:
+    def test_non_windows_leaves_command_unchanged(self, monkeypatch):
+        monkeypatch.setattr("modules.filesystem.shell._IS_WINDOWS", False)
+        assert _normalize_windows_command("ls -la d:\\tq") == "ls -la d:\\tq"
+
+    def test_ls_la_becomes_get_child_item_force(self, monkeypatch):
+        monkeypatch.setattr("modules.filesystem.shell._IS_WINDOWS", True)
+        assert (
+            _normalize_windows_command(r"ls -la d:\tq")
+            == "Get-ChildItem -Force -LiteralPath 'd:\\tq'"
+        )
+
+    def test_pwd_becomes_get_location(self, monkeypatch):
+        monkeypatch.setattr("modules.filesystem.shell._IS_WINDOWS", True)
+        assert _normalize_windows_command("pwd") == "Get-Location"
+
+    def test_unsupported_ls_flags_are_left_alone(self, monkeypatch):
+        monkeypatch.setattr("modules.filesystem.shell._IS_WINDOWS", True)
+        assert _normalize_windows_command("ls -lah") == "ls -lah"
