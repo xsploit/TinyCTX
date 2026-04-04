@@ -22,6 +22,7 @@ from prompt_toolkit.layout import HSplit, Layout, Window
 from prompt_toolkit.layout.containers import ConditionalContainer
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.processors import Processor, Transformation
+from prompt_toolkit.mouse_events import MouseButton, MouseEventType
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
@@ -1308,13 +1309,29 @@ class CLIBridge:
         except Exception:
             return False
 
+    def _selected_buffer_text(self, buffer) -> str:
+        if buffer is None or getattr(buffer, "selection_state", None) is None:
+            return ""
+        document = getattr(buffer, "document", None)
+        if document is None:
+            return ""
+        try:
+            start, end = document.selection_range()
+        except Exception:
+            return ""
+        if start == end:
+            return ""
+        return document.text[start:end]
+
     def _copy_primary_text(self) -> bool:
-        if self._output_area is not None and self._output_area.buffer.selection_state is not None:
-            data = self._output_area.buffer.copy_selection()
-            return self._write_clipboard_text(data.text)
-        if self._input_area is not None and self._input_area.buffer.selection_state is not None:
-            data = self._input_area.buffer.copy_selection()
-            return self._write_clipboard_text(data.text)
+        if self._output_area is not None:
+            selected = self._selected_buffer_text(self._output_area.buffer)
+            if selected:
+                return self._write_clipboard_text(selected)
+        if self._input_area is not None:
+            selected = self._selected_buffer_text(self._input_area.buffer)
+            if selected:
+                return self._write_clipboard_text(selected)
         if self._has_transcript() and self._output_area is not None and self._output_area.text:
             return self._write_clipboard_text(self._output_area.text)
         if self._input_area is not None and self._input_area.text:
@@ -1324,6 +1341,33 @@ class CLIBridge:
     def _focus_input(self) -> None:
         if self._application is not None and self._input_area is not None:
             self._application.layout.focus(self._input_area)
+
+    def _paste_clipboard_into_input(self) -> bool:
+        text = self._read_clipboard_text()
+        if not text:
+            return False
+        self._focus_input()
+        self._handle_paste(text)
+        if self._application is not None:
+            self._application.invalidate()
+        return True
+
+    def _wrap_mouse_handler_for_paste(self, area: TextArea | None) -> None:
+        if area is None:
+            return
+        original_mouse_handler = area.control.mouse_handler
+
+        def _mouse_handler(mouse_event):
+            if (
+                not self._settings_open()
+                and mouse_event.event_type == MouseEventType.MOUSE_UP
+                and mouse_event.button == MouseButton.RIGHT
+            ):
+                if self._paste_clipboard_into_input():
+                    return None
+            return original_mouse_handler(mouse_event)
+
+        area.control.mouse_handler = _mouse_handler
 
     def _generation_running(self) -> bool:
         return self._send_task is not None and not self._send_task.done()
@@ -1824,6 +1868,7 @@ class CLIBridge:
                 "  Enter        send message\n"
                 "  Esc          abort the current generation\n"
                 "  Ctrl+C       copy selected text or the transcript\n"
+                "  Right click  paste clipboard into input\n"
                 "  Ctrl+Q       exit TinyCTX\n"
                 "  /copy all-tools    copy all raw tool calls/results\n"
                 "  /copy transcript   copy the full transcript\n"
@@ -1977,6 +2022,8 @@ class CLIBridge:
             wrap_lines=False,
             style="class:output-area",
         )
+        self._wrap_mouse_handler_for_paste(self._output_area)
+        self._wrap_mouse_handler_for_paste(self._input_area)
 
         key_bindings = KeyBindings()
         showing_settings = Condition(self._settings_open)
@@ -2003,7 +2050,7 @@ class CLIBridge:
         @key_bindings.add("c-v", filter=~showing_settings, eager=True)
         @key_bindings.add("s-insert", filter=~showing_settings, eager=True)
         def _paste_clipboard(_event) -> None:
-            self._handle_paste(self._read_clipboard_text())
+            self._paste_clipboard_into_input()
 
         @key_bindings.add("tab", filter=~showing_settings, eager=True)
         def _complete(_event) -> None:

@@ -8,7 +8,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 import yaml
 
+from prompt_toolkit.data_structures import Point
 from prompt_toolkit.document import Document
+from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
+from prompt_toolkit.selection import SelectionState, SelectionType
 
 from bridges.cli.__main__ import (
     CLIBridge,
@@ -646,10 +649,19 @@ def test_copy_primary_text_prefers_selected_output(tmp_path):
         bridge._build_application()
 
     assert bridge._output_area is not None
-    bridge._output_area.buffer.selection_state = object()
-    with patch.object(bridge._output_area.buffer, "copy_selection", return_value=SimpleNamespace(text="picked output")):
-        with patch.object(bridge, "_write_clipboard_text", return_value=True) as copy_mock:
-            assert bridge._copy_primary_text() is True
+    bridge._output_area.buffer.set_document(
+        Document(
+            text="picked output",
+            cursor_position=len("picked output"),
+        ),
+        bypass_readonly=True,
+    )
+    bridge._output_area.buffer.selection_state = SelectionState(
+        original_cursor_position=0,
+        type=SelectionType.CHARACTERS,
+    )
+    with patch.object(bridge, "_write_clipboard_text", return_value=True) as copy_mock:
+        assert bridge._copy_primary_text() is True
 
     copy_mock.assert_called_once_with("picked output")
 
@@ -669,6 +681,43 @@ def test_copy_primary_text_falls_back_to_full_transcript(tmp_path):
     copied_text = copy_mock.call_args[0][0]
     assert "line one" in copied_text
     assert "line two" in copied_text
+
+
+def test_right_click_on_output_pastes_clipboard_into_input(tmp_path):
+    cfg = _make_config(tmp_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+    with patch("bridges.cli.__main__.Application", return_value=SimpleNamespace()):
+        bridge._build_application()
+
+    assert bridge._output_area is not None
+    assert bridge._input_area is not None
+    bridge._application = SimpleNamespace(
+        layout=SimpleNamespace(focus=MagicMock()),
+        invalidate=MagicMock(),
+    )
+
+    event = MouseEvent(
+        position=Point(x=0, y=0),
+        event_type=MouseEventType.MOUSE_UP,
+        button=MouseButton.RIGHT,
+        modifiers=frozenset(),
+    )
+
+    with patch.object(bridge, "_read_clipboard_text", return_value="hello"):
+        assert bridge._output_area.control.mouse_handler(event) is None
+
+    assert bridge._input_area.text == "[Pasted text #1, 5 chars]"
+    bridge._application.layout.focus.assert_called_with(bridge._input_area)
+    bridge._application.invalidate.assert_called()
+
+
+def test_help_mentions_right_click_paste(tmp_path):
+    cfg = _make_config(tmp_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+
+    asyncio.run(bridge._handle_command("/help"))
+
+    assert "Right click  paste clipboard into input" in bridge._transcript_blocks[-1]
 
 
 def test_copy_command_copies_last_tool_block(tmp_path):
