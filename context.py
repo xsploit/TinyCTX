@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from copy import deepcopy
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -43,6 +44,17 @@ import logging
 from contracts import ToolCall, ToolResult
 
 logger = logging.getLogger(__name__)
+
+COMPACT_BOUNDARY_PREFIX = "__tinyctx_compact_boundary__:"
+
+
+def _make_compact_boundary_content(metadata: dict[str, Any] | None = None) -> str:
+    payload = metadata or {}
+    return COMPACT_BOUNDARY_PREFIX + json.dumps(payload, sort_keys=True, ensure_ascii=False)
+
+
+def _is_compact_boundary_content(content: str | list) -> bool:
+    return isinstance(content, str) and content.startswith(COMPACT_BOUNDARY_PREFIX)
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +137,10 @@ class HistoryEntry:
     @staticmethod
     def system(content: str) -> HistoryEntry:
         return HistoryEntry(role=ROLE_SYSTEM, content=content)
+
+    @staticmethod
+    def compact_boundary(metadata: dict[str, Any] | None = None) -> HistoryEntry:
+        return HistoryEntry.system(_make_compact_boundary_content(metadata))
 
 
 # ---------------------------------------------------------------------------
@@ -425,6 +441,47 @@ class Context:
         for i, entry in enumerate(self.dialogue):
             entry.index = i
 
+    def compact(
+        self,
+        summary: str,
+        preserved_tail: list[HistoryEntry] | None = None,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> list[HistoryEntry]:
+        """
+        Replace older active history with a compact summary while preserving a
+        recent raw suffix.
+
+        In DB-backed mode this creates a compact boundary node plus replayed
+        suffix nodes on a new branch, so older ancestors remain in the tree
+        but stop appearing in active context assembly.
+        """
+        preserved_tail = preserved_tail or []
+        summary_entry = HistoryEntry.user(summary)
+        cloned_tail = [self._clone_entry(entry) for entry in preserved_tail]
+
+        if self._db is not None and self._tail_node_id is not None:
+            self.add(HistoryEntry.compact_boundary(metadata))
+            self.add(summary_entry)
+            for entry in cloned_tail:
+                self.add(entry)
+            self.dialogue = self._load_from_db()
+            self._reindex()
+            return list(self.dialogue)
+
+        self.dialogue = [summary_entry, *cloned_tail]
+        self._reindex()
+        return list(self.dialogue)
+
+    def _clone_entry(self, entry: HistoryEntry) -> HistoryEntry:
+        return HistoryEntry(
+            role=entry.role,
+            content=deepcopy(entry.content),
+            tool_calls=deepcopy(entry.tool_calls),
+            tool_call_id=entry.tool_call_id,
+            author_id=entry.author_id,
+        )
+
     # ------------------------------------------------------------------
     # DB-backed history loading
     # ------------------------------------------------------------------
@@ -438,6 +495,13 @@ class Context:
             return []
 
         nodes = self._db.get_ancestors(self._tail_node_id)
+        latest_boundary_idx = None
+        for i, node in enumerate(nodes):
+            if node.role == ROLE_SYSTEM and _is_compact_boundary_content(node.content):
+                latest_boundary_idx = i
+        if latest_boundary_idx is not None:
+            nodes = nodes[latest_boundary_idx + 1 :]
+
         entries: list[HistoryEntry] = []
         for i, node in enumerate(nodes):
             # Deserialise content: JSON → list if it was stored as list.
