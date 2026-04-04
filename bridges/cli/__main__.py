@@ -60,7 +60,7 @@ _TINYCTX_BANNER = (
     "   ██║   ██║██║ ╚████║   ██║   ╚██████╗   ██║   ██╔╝ ██╗",
     "   ╚═╝   ╚═╝╚═╝  ╚═══╝   ╚═╝    ╚═════╝   ╚═╝   ╚═╝  ╚═╝",
 )
-_DIMMED_LINE_PREFIXES = ("tool ", "ok ", "err ", "thinking…")
+_DIMMED_LINE_PREFIXES = ("tool ", "ok ", "err ", "[tool ", "[ok ", "[err ", "thinking…")
 _PASTED_TEXT_REF = re.compile(r"\[Pasted text #(\d+)(?:[^\]]*)\]")
 _SHELL_EXIT_ERROR_RE_END = re.compile(r"(?:^|\n)\[exit \d+\]\s*\Z")
 _CLI_OPTION_DEFAULTS = {
@@ -70,9 +70,13 @@ _CLI_OPTION_DEFAULTS = {
     "quiet_startup": True,
 }
 _SLASH_COMMANDS = (
+    ("/copy all-tools", "copy all tool calls/results"),
     ("/copy transcript", "copy the full transcript"),
     ("/copy last-tool", "copy the most recent tool block"),
+    ("/copy last-tool-call", "copy the most recent raw tool call"),
+    ("/copy last-tool-result", "copy the most recent raw tool result"),
     ("/copy last-error", "copy the most recent error block"),
+    ("/debug", "fire a heartbeat tick now"),
     ("/help", "show available commands"),
     ("/reset", "start a new session"),
     ("/resume", "reuse the saved session"),
@@ -251,6 +255,8 @@ class CLIBridge:
         self._settings_notice = ""
         self._pasted_texts: dict[int, str] = {}
         self._next_paste_id = 1
+        self._tool_records: list[dict[str, object]] = []
+        self._tool_records_by_call_id: dict[str, dict[str, object]] = {}
 
     def _resolve_runtime_log_level(self) -> int:
         config = getattr(self._gateway, "_config", None)
@@ -1231,9 +1237,54 @@ class CLIBridge:
         return True
 
     def _is_tool_block(self, block: str) -> bool:
-        return block.startswith(("tool ", "ok ", "err "))
+        return block.startswith(("tool ", "ok ", "err ", "[tool ", "[ok ", "[err "))
+
+    def _tool_call_line_raw(self, tool_name: str, args: dict) -> str:
+        args_str = ", ".join(f"{k}={repr(v)}" for k, v in args.items())
+        return f"tool {tool_name}({args_str})" if args_str else f"tool {tool_name}()"
+
+    def _tool_result_line_raw(self, tool_name: str, output: str, is_error: bool) -> str:
+        state = "err" if is_error else "ok"
+        text = (output or "").rstrip()
+        if not text:
+            return f"{state} {tool_name}"
+        return f"{state} {tool_name}\n{text}"
+
+    def _record_tool_call(self, call_id: str, tool_name: str, args: dict) -> None:
+        record = {
+            "call_id": call_id,
+            "tool_name": tool_name,
+            "call_raw": self._tool_call_line_raw(tool_name, args),
+            "result_raw": "",
+            "is_error": False,
+        }
+        self._tool_records.append(record)
+        self._tool_records_by_call_id[call_id] = record
+
+    def _record_tool_result(self, call_id: str, tool_name: str, output: str, is_error: bool) -> None:
+        record = self._tool_records_by_call_id.get(call_id)
+        if record is None:
+            record = {
+                "call_id": call_id,
+                "tool_name": tool_name,
+                "call_raw": self._tool_call_line_raw(tool_name, {}),
+                "result_raw": "",
+                "is_error": False,
+            }
+            self._tool_records.append(record)
+            self._tool_records_by_call_id[call_id] = record
+        record["tool_name"] = tool_name
+        record["result_raw"] = self._tool_result_line_raw(tool_name, output, is_error)
+        record["is_error"] = bool(is_error)
 
     def _latest_tool_block_text(self) -> str:
+        if self._tool_records:
+            record = self._tool_records[-1]
+            parts = [str(record.get("call_raw", "")).strip()]
+            result_raw = str(record.get("result_raw", "")).strip()
+            if result_raw:
+                parts.append(result_raw)
+            return "\n".join(part for part in parts if part).strip()
         captured: list[str] = []
         for block in reversed(self._transcript_blocks):
             if self._is_tool_block(block):
@@ -1244,13 +1295,45 @@ class CLIBridge:
                 break
         return "\n".join(reversed(captured)).strip()
 
+    def _latest_tool_call_text(self) -> str:
+        if self._tool_records:
+            return str(self._tool_records[-1].get("call_raw", "")).strip()
+        return ""
+
+    def _latest_tool_result_text(self) -> str:
+        if self._tool_records:
+            return str(self._tool_records[-1].get("result_raw", "")).strip()
+        return ""
+
+    def _all_tool_blocks_text(self) -> str:
+        if not self._tool_records:
+            return ""
+        blocks: list[str] = []
+        for record in self._tool_records:
+            parts = [str(record.get("call_raw", "")).strip()]
+            result_raw = str(record.get("result_raw", "")).strip()
+            if result_raw:
+                parts.append(result_raw)
+            block = "\n".join(part for part in parts if part).strip()
+            if block:
+                blocks.append(block)
+        return "\n\n".join(blocks).strip()
+
     def _latest_error_block_text(self) -> str:
+        for record in reversed(self._tool_records):
+            if not bool(record.get("is_error")):
+                continue
+            parts = [str(record.get("call_raw", "")).strip()]
+            result_raw = str(record.get("result_raw", "")).strip()
+            if result_raw:
+                parts.append(result_raw)
+            return "\n".join(part for part in parts if part).strip()
         for index in range(len(self._transcript_blocks) - 1, -1, -1):
             block = self._transcript_blocks[index]
-            if not block.startswith("err "):
+            if not block.startswith(("err ", "[err ")):
                 continue
             captured = [block]
-            if index > 0 and self._transcript_blocks[index - 1].startswith("tool "):
+            if index > 0 and self._transcript_blocks[index - 1].startswith(("tool ", "[tool ")):
                 captured.insert(0, self._transcript_blocks[index - 1])
             return "\n".join(captured).strip()
         return ""
@@ -1260,12 +1343,30 @@ class CLIBridge:
         if normalized in {"", "transcript"}:
             copied = self._write_clipboard_text(self._output_area.text if self._output_area is not None else "")
             return copied, "copied transcript" if copied else "copy failed"
+        if normalized in {"tools", "all-tools", "all tools"}:
+            text = self._all_tool_blocks_text()
+            if not text:
+                return False, "no tool output to copy"
+            copied = self._write_clipboard_text(text)
+            return copied, "copied all tool blocks" if copied else "copy failed"
         if normalized in {"tool", "last-tool", "last tool"}:
             text = self._latest_tool_block_text()
             if not text:
                 return False, "no tool output to copy"
             copied = self._write_clipboard_text(text)
             return copied, "copied last tool block" if copied else "copy failed"
+        if normalized in {"tool-call", "last-tool-call", "last tool call"}:
+            text = self._latest_tool_call_text()
+            if not text:
+                return False, "no tool call to copy"
+            copied = self._write_clipboard_text(text)
+            return copied, "copied last tool call" if copied else "copy failed"
+        if normalized in {"tool-result", "last-tool-result", "last tool result"}:
+            text = self._latest_tool_result_text()
+            if not text:
+                return False, "no tool result to copy"
+            copied = self._write_clipboard_text(text)
+            return copied, "copied last tool result" if copied else "copy failed"
         if normalized in {"error", "last-error", "last error"}:
             text = self._latest_error_block_text()
             if not text:
@@ -1315,18 +1416,20 @@ class CLIBridge:
     def _tool_call_line(self, tool_name: str, args: dict) -> str:
         if not self._bool_option("compact_tools", True):
             args_str = ", ".join(f"{k}={self._truncate_arg(v)}" for k, v in args.items())
-            return f"tool {tool_name}({args_str})"
+            return f"[tool {tool_name}({args_str})]"
         summary = self._tool_arg_summary(tool_name, args)
-        return f"tool {tool_name} {summary}".rstrip()
+        inner = f"tool {tool_name} {summary}".rstrip()
+        return f"[{inner}]"
 
     def _tool_result_line(self, tool_name: str, output: str, is_error: bool) -> str:
         preview = self._summarize_value(output, max_chars=96)
         state = "err" if is_error else "ok"
         if not self._bool_option("compact_tools", True):
-            return f"{state} {tool_name}: {preview}" if preview else f"{state} {tool_name}"
+            inner = f"{state} {tool_name}: {preview}" if preview else f"{state} {tool_name}"
+            return f"[{inner}]"
         if preview:
-            return f"{state} {tool_name} {preview}"
-        return f"{state} {tool_name}"
+            return f"[{state} {tool_name} {preview}]"
+        return f"[{state} {tool_name}]"
 
     def _append_block(self, text: str) -> None:
         block = text.strip()
@@ -1352,6 +1455,8 @@ class CLIBridge:
 
         blocks: list[str] = []
         tool_names: dict[str, str] = {}
+        self._tool_records = []
+        self._tool_records_by_call_id = {}
         for entry in entries:
             if entry.role == ROLE_USER:
                 text = self._content_to_text(entry.content)
@@ -1371,6 +1476,7 @@ class CLIBridge:
                     call_id = tool_call.get("id")
                     if isinstance(call_id, str) and call_id:
                         tool_names[call_id] = tool_name
+                        self._record_tool_call(call_id, tool_name, arguments)
                     blocks.append(self._tool_call_line(tool_name, arguments))
                 continue
 
@@ -1378,6 +1484,13 @@ class CLIBridge:
                 output = self._content_to_text(entry.content)
                 tool_name = tool_names.get(entry.tool_call_id or "", "tool")
                 if output:
+                    if entry.tool_call_id:
+                        self._record_tool_result(
+                            entry.tool_call_id,
+                            tool_name,
+                            output,
+                            self._looks_like_error_output(tool_name, output),
+                        )
                     blocks.append(
                             self._tool_result_line(
                                 tool_name,
@@ -1516,10 +1629,12 @@ class CLIBridge:
                 self._append_block(self._current_stream)
                 self._current_stream = ""
             self._set_status(event.tool_name)
+            self._record_tool_call(event.call_id, event.tool_name, event.args)
             self._append_block(self._tool_call_line(event.tool_name, event.args))
             self._refresh_output(log_level)
         elif isinstance(event, AgentToolResult):
-            self._set_status("ready")
+            self._set_status("thinking")
+            self._record_tool_result(event.call_id, event.tool_name, event.output, event.is_error)
             self._append_block(
                 self._tool_result_line(event.tool_name, event.output, event.is_error)
             )
@@ -1552,7 +1667,7 @@ class CLIBridge:
             self._append_block(message)
             self._refresh_output(self._resolve_runtime_log_level())
             return
-        if text.lower() == "/debug heartbeat":
+        if text.lower() in {"/debug", "/debug heartbeat"}:
             self._set_status("heartbeat")
             await _debug_heartbeat(
                 self._gateway,
@@ -1574,6 +1689,8 @@ class CLIBridge:
             self._cursor = node.id
             self._gateway.reset_lane(self._cursor)
             self._transcript_blocks.clear()
+            self._tool_records.clear()
+            self._tool_records_by_call_id.clear()
             self._current_stream = ""
             self._thinking = False
             self._set_status("ready")
@@ -1595,13 +1712,16 @@ class CLIBridge:
                 "  Esc          abort the current generation\n"
                 "  Ctrl+C       copy selected text or the transcript\n"
                 "  Ctrl+Q       exit TinyCTX\n"
+                "  /copy all-tools    copy all raw tool calls/results\n"
                 "  /copy transcript   copy the full transcript\n"
                 "  /copy last-tool    copy the most recent tool call/result\n"
+                "  /copy last-tool-call    copy the most recent raw tool call\n"
+                "  /copy last-tool-result  copy the most recent raw tool result\n"
                 "  /copy last-error   copy the most recent tool error\n"
                 "  /reset       start a new session\n"
                 "  /resume      keep using the saved session\n"
                 "  /settings    open CLI settings\n"
-                "  /debug heartbeat  fire a heartbeat tick now\n"
+                "  /debug or /debug heartbeat  fire a heartbeat tick now\n"
                 "  exit         quit TinyCTX"
             )
             self._refresh_output(self._resolve_runtime_log_level())

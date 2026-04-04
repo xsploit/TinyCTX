@@ -5,7 +5,7 @@ import json
 import logging
 from types import SimpleNamespace
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 import yaml
 
 from prompt_toolkit.document import Document
@@ -15,7 +15,7 @@ from bridges.cli.__main__ import (
     _DimToolLineProcessor,
     _SlashCommandCompleter,
 )
-from contracts import AgentError
+from contracts import AgentError, AgentToolResult
 from config import (
     BridgeConfig,
     Config,
@@ -144,9 +144,9 @@ def test_cli_style_uses_black_background_and_red_banner(tmp_path):
 def test_cli_tool_lines_are_compact(tmp_path):
     cfg = _make_config(tmp_path)
     bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
-    assert bridge._tool_call_line("web_search", {"query": "NHL scores today"}) == 'tool web_search NHL scores today'
-    assert bridge._tool_call_line("browse_url", {"url": "https://example.com", "mode": "text"}) == "tool browse_url https://example.com"
-    assert bridge._tool_result_line("web_search", "Search results for NHL scores today", False) == "ok web_search Search results for NHL scores today"
+    assert bridge._tool_call_line("web_search", {"query": "NHL scores today"}) == "[tool web_search NHL scores today]"
+    assert bridge._tool_call_line("browse_url", {"url": "https://example.com", "mode": "text"}) == "[tool browse_url https://example.com]"
+    assert bridge._tool_result_line("web_search", "Search results for NHL scores today", False) == "[ok web_search Search results for NHL scores today]"
 
 
 def test_cli_dims_tool_prefix_lines():
@@ -197,8 +197,16 @@ def test_slash_command_completer_supports_copy_tool_command():
             None,
         )
     )
-    assert [completion.display_text for completion in completions] == ["/copy last-tool"]
-    assert [completion.text for completion in completions] == ["ool"]
+    assert [completion.display_text for completion in completions] == [
+        "/copy last-tool",
+        "/copy last-tool-call",
+        "/copy last-tool-result",
+    ]
+    assert [completion.text for completion in completions] == [
+        "ool",
+        "ool-call",
+        "ool-result",
+    ]
 
 
 def test_settings_command_opens_menu(tmp_path):
@@ -622,14 +630,14 @@ def test_copy_command_copies_last_tool_block(tmp_path):
     bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
     bridge._transcript_blocks = [
         "› hello",
-        "tool shell Get-ChildItem -Path C:\\repo",
-        "err shell [stderr] missing path [exit 1]",
+        "[tool shell Get-ChildItem -Path C:\\repo]",
+        "[err shell [stderr] missing path [exit 1]]",
     ]
     with patch.object(bridge, "_write_clipboard_text", return_value=True) as copy_mock:
         asyncio.run(bridge._handle_command("/copy last-tool"))
 
     copy_mock.assert_called_once_with(
-        "tool shell Get-ChildItem -Path C:\\repo\nerr shell [stderr] missing path [exit 1]"
+        "[tool shell Get-ChildItem -Path C:\\repo]\n[err shell [stderr] missing path [exit 1]]"
     )
     assert bridge._transcript_blocks[-1] == "copied last tool block"
 
@@ -638,17 +646,64 @@ def test_copy_command_copies_last_error_block(tmp_path):
     cfg = _make_config(tmp_path)
     bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
     bridge._transcript_blocks = [
-        "tool shell bad command",
-        "err shell [stderr] boom [exit 1]",
+        "[tool shell bad command]",
+        "[err shell [stderr] boom [exit 1]]",
         "› next",
     ]
     with patch.object(bridge, "_write_clipboard_text", return_value=True) as copy_mock:
         asyncio.run(bridge._handle_command("/copy last-error"))
 
     copy_mock.assert_called_once_with(
-        "tool shell bad command\nerr shell [stderr] boom [exit 1]"
+        "[tool shell bad command]\n[err shell [stderr] boom [exit 1]]"
     )
     assert bridge._transcript_blocks[-1] == "copied last error block"
+
+
+def test_copy_command_uses_raw_tool_history_when_available(tmp_path):
+    cfg = _make_config(tmp_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+    bridge._record_tool_call("call-1", "shell", {"command": 'Get-Content "C:\\repo\\README.md" -Head 50'})
+    bridge._record_tool_result("call-1", "shell", "line one\nline two\nline three", False)
+
+    with patch.object(bridge, "_write_clipboard_text", return_value=True) as copy_mock:
+        asyncio.run(bridge._handle_command("/copy last-tool"))
+
+    copy_mock.assert_called_once_with(
+        'tool shell(command=\'Get-Content "C:\\\\repo\\\\README.md" -Head 50\')\n'
+        'ok shell\nline one\nline two\nline three'
+    )
+    assert bridge._transcript_blocks[-1] == "copied last tool block"
+
+
+def test_copy_command_can_copy_last_tool_call_and_result(tmp_path):
+    cfg = _make_config(tmp_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+    bridge._record_tool_call("call-1", "web_search", {"query": "NHL scores today"})
+    bridge._record_tool_result("call-1", "web_search", "Search results...", False)
+
+    with patch.object(bridge, "_write_clipboard_text", return_value=True) as copy_mock:
+        asyncio.run(bridge._handle_command("/copy last-tool-call"))
+        asyncio.run(bridge._handle_command("/copy last-tool-result"))
+
+    assert copy_mock.call_args_list[0][0][0] == "tool web_search(query='NHL scores today')"
+    assert copy_mock.call_args_list[1][0][0] == "ok web_search\nSearch results..."
+
+
+def test_copy_command_can_copy_all_tool_blocks(tmp_path):
+    cfg = _make_config(tmp_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+    bridge._record_tool_call("call-1", "shell", {"command": "pwd"})
+    bridge._record_tool_result("call-1", "shell", "C:\\repo", False)
+    bridge._record_tool_call("call-2", "shell", {"command": "dir"})
+    bridge._record_tool_result("call-2", "shell", "file.txt", False)
+
+    with patch.object(bridge, "_write_clipboard_text", return_value=True) as copy_mock:
+        asyncio.run(bridge._handle_command("/copy all-tools"))
+
+    copied_text = copy_mock.call_args[0][0]
+    assert "tool shell(command='pwd')" in copied_text
+    assert "tool shell(command='dir')" in copied_text
+    assert copied_text.count("ok shell") == 2
 
 
 def test_agent_error_resets_status_to_ready(tmp_path):
@@ -667,6 +722,37 @@ def test_agent_error_resets_status_to_ready(tmp_path):
 
     assert bridge._transcript_blocks[-1] == "error: [internal error]"
     assert bridge._footer_text() == "working ready"
+
+
+def test_tool_result_keeps_status_as_thinking(tmp_path):
+    cfg = _make_config(tmp_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+
+    event = AgentToolResult(
+        tail_node_id="tail-1",
+        lane_node_id="lane-1",
+        trace_id="trace-1",
+        reply_to_message_id="msg-1",
+        call_id="call-1",
+        tool_name="shell",
+        output="C:\\repo",
+        is_error=False,
+    )
+
+    asyncio.run(bridge.handle_event(event))
+
+    assert bridge._transcript_blocks[-1] == "[ok shell C:\\repo]"
+    assert bridge._footer_text() == "working thinking"
+
+
+def test_debug_alias_routes_to_heartbeat(tmp_path):
+    cfg = _make_config(tmp_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+
+    with patch("bridges.cli.__main__._debug_heartbeat", new=AsyncMock()) as debug_mock:
+        asyncio.run(bridge._handle_command("/debug"))
+
+    assert debug_mock.await_count == 1
 
 
 def test_cli_restores_transcript_from_saved_cursor(tmp_path):
@@ -718,8 +804,8 @@ def test_cli_restores_tool_history_from_saved_cursor(tmp_path):
 
     assert restored == 3
     assert bridge._transcript_blocks[0] == "› check cwd"
-    assert bridge._transcript_blocks[1] == "tool shell pwd"
-    assert bridge._transcript_blocks[2] == "ok shell C:\\repo"
+    assert bridge._transcript_blocks[1] == "[tool shell pwd]"
+    assert bridge._transcript_blocks[2] == "[ok shell C:\\repo]"
 
 
 def test_cli_restores_shell_error_history_as_err(tmp_path):
@@ -751,7 +837,7 @@ def test_cli_restores_shell_error_history_as_err(tmp_path):
     restored = bridge._restore_transcript_from_cursor()
 
     assert restored == 3
-    assert bridge._transcript_blocks[2].startswith("err shell")
+    assert bridge._transcript_blocks[2].startswith("[err shell")
 
 
 def test_cli_restore_non_shell_exit_marker_stays_ok(tmp_path):
@@ -783,4 +869,4 @@ def test_cli_restore_non_shell_exit_marker_stays_ok(tmp_path):
     restored = bridge._restore_transcript_from_cursor()
 
     assert restored == 3
-    assert bridge._transcript_blocks[2].startswith("ok my_tool")
+    assert bridge._transcript_blocks[2].startswith("[ok my_tool")
