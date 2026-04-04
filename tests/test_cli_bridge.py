@@ -133,19 +133,9 @@ def test_cli_output_wraps_while_input_stays_single_line(tmp_path):
     assert app is not None
 
 
-def test_cli_mouse_capture_defaults_off(tmp_path):
+def test_cli_mouse_capture_defaults_on(tmp_path):
     cfg = _make_config(tmp_path)
     bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
-    with patch("bridges.cli.__main__.Application", return_value=SimpleNamespace()) as app_cls:
-        bridge._build_application()
-
-    mouse_support = app_cls.call_args.kwargs["mouse_support"]
-    assert mouse_support() is False
-
-
-def test_cli_mouse_capture_can_be_enabled(tmp_path):
-    cfg = _make_config(tmp_path, cli_options={"mouse_capture": True})
-    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={"mouse_capture": True})
     with patch("bridges.cli.__main__.Application", return_value=SimpleNamespace()) as app_cls:
         bridge._build_application()
 
@@ -196,6 +186,37 @@ def test_cli_refresh_output_preserves_scrolled_position(tmp_path):
     bridge._refresh_output(logging.WARNING)
 
     assert bridge._output_area.buffer.cursor_position == scrolled_cursor
+
+
+def test_cli_drag_selection_can_autoscroll_output(tmp_path):
+    cfg = _make_config(tmp_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+    with patch("bridges.cli.__main__.Application", return_value=SimpleNamespace()):
+        bridge._build_application()
+
+    assert bridge._output_area is not None
+    bridge._application = SimpleNamespace(
+        layout=SimpleNamespace(focus=MagicMock()),
+        invalidate=MagicMock(),
+    )
+
+    original_mouse_handler = MagicMock(return_value=None)
+    bridge._output_area.control.mouse_handler = original_mouse_handler
+    bridge._wrap_mouse_handler_for_paste(bridge._output_area)
+    bridge._output_area.window.render_info = SimpleNamespace(displayed_lines=[object()] * 20)
+    bridge._output_area.window._scroll_down = MagicMock()
+    bridge._output_area.window._scroll_up = MagicMock()
+
+    mouse_event = SimpleNamespace(
+        event_type=MouseEventType.MOUSE_MOVE,
+        button=MouseButton.LEFT,
+        position=Point(x=0, y=19),
+    )
+
+    bridge._output_area.control.mouse_handler(mouse_event)
+
+    bridge._output_area.window._scroll_down.assert_called_once()
+    assert original_mouse_handler.call_count == 2
 
 
 def test_cli_style_uses_black_background_and_red_banner(tmp_path):
@@ -343,7 +364,7 @@ def test_settings_command_opens_menu(tmp_path):
     asyncio.run(bridge._handle_command("/settings"))
     assert bridge._settings_open() is True
     assert bridge._settings_menu()[0] == "Settings"
-    assert bridge._footer_text() == "working settings | selection"
+    assert bridge._footer_text() == "working settings | mouse"
 
 
 def test_settings_navigation_enters_submenu_and_applies_choice(tmp_path):
@@ -463,7 +484,7 @@ def test_mouse_command_updates_footer_without_transcript_spam(tmp_path):
     cfg = _make_config(tmp_path)
     bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
 
-    assert "working ready | selection" in bridge._footer_text()
+    assert "working ready | mouse" in bridge._footer_text()
 
     asyncio.run(bridge._handle_command("/mouse on"))
     assert bridge._transcript_blocks == []
@@ -763,7 +784,7 @@ def test_submit_from_buffer_reports_running_generation(tmp_path):
 
     assert bridge._input_area.text == "hello"
     assert bridge._transcript_blocks[-1] == "[generation already running — press Esc to abort or wait for the current reply]"
-    assert bridge._footer_text() == "working busy | selection"
+    assert bridge._footer_text() == "working busy | mouse"
 
 
 def test_abort_active_generation_calls_gateway(tmp_path):
@@ -776,7 +797,7 @@ def test_abort_active_generation_calls_gateway(tmp_path):
 
     assert bridge._abort_active_generation() is True
     gateway.abort_generation.assert_called_once_with("cursor-1")
-    assert bridge._footer_text() == "working aborting | selection"
+    assert bridge._footer_text() == "working aborting | mouse"
 
 
 def test_copy_primary_text_prefers_selected_output(tmp_path):
@@ -1007,7 +1028,7 @@ def test_agent_error_resets_status_to_ready(tmp_path):
     asyncio.run(bridge.handle_event(event))
 
     assert bridge._transcript_blocks[-1] == "error: [internal error]"
-    assert bridge._footer_text() == "working ready | selection"
+    assert bridge._footer_text() == "working ready | mouse"
 
 
 def test_tool_result_keeps_status_as_thinking(tmp_path):
@@ -1028,7 +1049,7 @@ def test_tool_result_keeps_status_as_thinking(tmp_path):
     asyncio.run(bridge.handle_event(event))
 
     assert bridge._transcript_blocks[-1] == "[ok shell C:\\repo]"
-    assert bridge._footer_text() == "working thinking | selection"
+    assert bridge._footer_text() == "working thinking | mouse"
 
 
 def test_debug_alias_routes_to_heartbeat(tmp_path):

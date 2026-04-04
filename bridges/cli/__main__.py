@@ -75,7 +75,7 @@ _MD_CODE_RE = re.compile(r"`[^`\n]+`")
 _CLI_OPTION_DEFAULTS = {
     "compact_tools": True,
     "dim_tools": True,
-    "mouse_capture": False,
+    "mouse_capture": True,
     "word_wrap": True,
     "quiet_startup": True,
 }
@@ -583,7 +583,7 @@ class CLIBridge:
                     "label": "Mouse capture",
                     "kind": "toggle",
                     "option": "mouse_capture",
-                    "default": False,
+                    "default": True,
                 },
                 {"label": "Back", "kind": "action", "action": "back"},
             ]
@@ -841,7 +841,7 @@ class CLIBridge:
             self._application.invalidate()
 
     def _toggle_mouse_capture(self, value: bool | None = None) -> bool:
-        current = self._bool_option("mouse_capture", False)
+        current = self._bool_option("mouse_capture", True)
         enabled = (not current) if value is None else bool(value)
         if enabled == current:
             return enabled
@@ -1229,7 +1229,7 @@ class CLIBridge:
 
     def _footer_text(self) -> str:
         width = self._current_width()
-        mouse_mode = "mouse" if self._bool_option("mouse_capture", False) else "selection"
+        mouse_mode = "mouse" if self._bool_option("mouse_capture", True) else "selection"
         return self._fit(f"working {self._settings_status_text()} | {mouse_mode}", width)
 
     def _set_status(self, text: str) -> None:
@@ -1427,8 +1427,44 @@ class CLIBridge:
         if area is None:
             return
         original_mouse_handler = area.control.mouse_handler
+        is_output_area = area is self._output_area
+
+        def _drag_autoscroll_output(mouse_event) -> bool:
+            if not is_output_area or self._output_area is None:
+                return False
+            if (
+                mouse_event.event_type != MouseEventType.MOUSE_MOVE
+                or mouse_event.button == MouseButton.NONE
+            ):
+                return False
+            window = self._output_area.window
+            render_info = window.render_info
+            if render_info is None:
+                return False
+            visible_height = max(1, len(render_info.displayed_lines))
+            if visible_height <= 1:
+                return False
+            threshold = 1
+            scrolled = False
+            if mouse_event.position.y <= threshold:
+                window._scroll_up()
+                scrolled = True
+            elif mouse_event.position.y >= visible_height - 1 - threshold:
+                window._scroll_down()
+                scrolled = True
+            if scrolled and self._application is not None:
+                self._application.invalidate()
+            return scrolled
 
         def _mouse_handler(mouse_event):
+            if (
+                is_output_area
+                and not self._settings_open()
+                and mouse_event.event_type == MouseEventType.MOUSE_DOWN
+                and mouse_event.button == MouseButton.LEFT
+                and self._application is not None
+            ):
+                self._application.layout.focus(area)
             if (
                 not self._settings_open()
                 and mouse_event.event_type == MouseEventType.MOUSE_UP
@@ -1441,7 +1477,10 @@ class CLIBridge:
                         return None
                 if self._paste_clipboard_into_input():
                     return None
-            return original_mouse_handler(mouse_event)
+            result = original_mouse_handler(mouse_event)
+            if _drag_autoscroll_output(mouse_event):
+                result = original_mouse_handler(mouse_event)
+            return result
 
         area.control.mouse_handler = _mouse_handler
 
@@ -2253,7 +2292,7 @@ class CLIBridge:
             layout=Layout(root, focused_element=self._input_area),
             key_bindings=key_bindings,
             full_screen=True,
-            mouse_support=Condition(lambda: self._bool_option("mouse_capture", False)),
+            mouse_support=Condition(lambda: self._bool_option("mouse_capture", True)),
             enable_page_navigation_bindings=True,
             style=self._style(),
             before_render=self._before_render,
