@@ -164,13 +164,38 @@ def test_cli_page_scroll_moves_transcript_window(tmp_path):
         output=SimpleNamespace(get_size=lambda: SimpleNamespace(columns=120, rows=30)),
         invalidate=MagicMock(),
     )
-    bridge._output_area.window.vertical_scroll = 0
+    bridge._output_area.buffer.set_document(
+        Document(
+            text="\n".join(f"line {i}" for i in range(200)),
+            cursor_position=0,
+        ),
+        bypass_readonly=True,
+    )
 
     bridge._scroll_output_pages(1)
-    assert bridge._output_area.window.vertical_scroll > 0
+    assert bridge._output_area.buffer.cursor_position > 0
 
     bridge._scroll_output_pages(-1)
-    assert bridge._output_area.window.vertical_scroll == 0
+    assert bridge._output_area.buffer.cursor_position == 0
+
+
+def test_cli_refresh_output_preserves_scrolled_position(tmp_path):
+    cfg = _make_config(tmp_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+    with patch("bridges.cli.__main__.Application", return_value=SimpleNamespace()):
+        bridge._build_application()
+
+    assert bridge._output_area is not None
+    bridge._transcript_blocks = [f"line {i}" for i in range(200)]
+    bridge._refresh_output(logging.WARNING)
+    bridge._scroll_output_pages(-3)
+    scrolled_cursor = bridge._output_area.buffer.cursor_position
+    assert scrolled_cursor < len(bridge._output_area.buffer.text)
+
+    bridge._append_block("new line after scroll")
+    bridge._refresh_output(logging.WARNING)
+
+    assert bridge._output_area.buffer.cursor_position == scrolled_cursor
 
 
 def test_cli_style_uses_black_background_and_red_banner(tmp_path):

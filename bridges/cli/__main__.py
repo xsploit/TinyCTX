@@ -1383,13 +1383,40 @@ class CLIBridge:
         if self._application is not None and self._input_area is not None:
             self._application.layout.focus(self._input_area)
 
+    def _output_should_follow_tail(self) -> bool:
+        if self._output_area is None:
+            return True
+        buffer = self._output_area.buffer
+        text = buffer.document.text
+        return buffer.cursor_position >= len(text)
+
+    def _set_output_document(self, text: str, *, follow_tail: bool | None = None) -> None:
+        if self._output_area is None:
+            return
+        buffer = self._output_area.buffer
+        window = self._output_area.window
+        current_doc = buffer.document
+        current_scroll = int(window.vertical_scroll)
+        if follow_tail is None:
+            follow_tail = self._output_should_follow_tail()
+        cursor_position = len(text) if follow_tail else min(current_doc.cursor_position, len(text))
+        buffer.set_document(
+            Document(text=text, cursor_position=cursor_position),
+            bypass_readonly=True,
+        )
+        if not follow_tail:
+            window.vertical_scroll = max(0, current_scroll)
+
     def _scroll_output_pages(self, delta_pages: int) -> None:
         if self._output_area is None:
             return
-        window = self._output_area.window
+        buffer = self._output_area.buffer
+        document = buffer.document
         page_step = max(3, self._current_height() - 6)
-        next_scroll = max(0, int(window.vertical_scroll) + (page_step * delta_pages))
-        window.vertical_scroll = next_scroll
+        current_row, _ = document.translate_index_to_position(buffer.cursor_position)
+        max_row = max(0, document.line_count - 1)
+        target_row = max(0, min(max_row, current_row + (page_step * delta_pages)))
+        buffer.cursor_position = document.translate_row_col_to_index(target_row, 0)
         if self._application is not None:
             self._application.invalidate()
 
@@ -1799,10 +1826,7 @@ class CLIBridge:
             return
         self._last_output_width = self._output_wrap_width()
         text = self._compose_output_text(log_level)
-        self._output_area.buffer.set_document(
-            Document(text=text, cursor_position=len(text)),
-            bypass_readonly=True,
-        )
+        self._set_output_document(text)
         if self._application is not None:
             self._application.invalidate()
 
@@ -1814,10 +1838,7 @@ class CLIBridge:
             return
         self._last_output_width = width
         text = self._compose_output_text(self._resolve_runtime_log_level())
-        self._output_area.buffer.set_document(
-            Document(text=text, cursor_position=len(text)),
-            bypass_readonly=True,
-        )
+        self._set_output_document(text)
 
     def _strip_markup(self, text: str) -> str:
         return _RICH_TAG.sub("", text)
