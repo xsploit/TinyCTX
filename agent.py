@@ -453,8 +453,8 @@ class AgentLoop:
         streaming_active = False
         tool_result_cache: dict[str, ToolResult] = {}
 
+        compacted_this_turn = False
         for cycle in range(max_cycles):
-            compacted_this_cycle = False
             while True:
                 # Abort check between cycles
                 if abort_event and abort_event.is_set():
@@ -483,8 +483,8 @@ class AgentLoop:
                         self._tail_node_id, token_pct * 100, tokens_used, token_limit, active_tokens,
                     )
 
-                if not compacted_this_cycle and await self._maybe_compact_context():
-                    compacted_this_cycle = True
+                if not compacted_this_turn and await self._maybe_compact_context():
+                    compacted_this_turn = True
                     continue
 
                 break

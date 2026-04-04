@@ -513,6 +513,46 @@ class TestCompaction:
         assert any(content.startswith("Compact summary:\n- durable older context") for content in active_users)
         assert not any(content.startswith("user-0 ") for content in active_users)
 
+    @pytest.mark.asyncio
+    async def test_context_compacts_at_most_once_per_turn(self, make_agent):
+        compact_calls = {"n": 0}
+        normal_calls = {"n": 0}
+
+        async def stream(messages, tools=None):
+            if messages and messages[0].get("content") == COMPACT_SYSTEM_PROMPT:
+                compact_calls["n"] += 1
+                yield TextDelta(text="- durable older context")
+                return
+
+            if normal_calls["n"] == 0:
+                normal_calls["n"] += 1
+                yield ToolCallAssembled(call_id="c1", tool_name="my_tool", args={})
+                return
+
+            yield TextDelta(text="done")
+
+        agent = make_agent(stream)
+        agent.config.context = 120
+
+        def my_tool() -> str:
+            """Tool."""
+            return "tool result"
+
+        agent.tool_handler.register_tool(my_tool)
+
+        for i in range(6):
+            agent.context.add(HistoryEntry.user(f"user-{i} " + ("x" * 80)))
+            agent.context.add(HistoryEntry.assistant(f"assistant-{i} " + ("y" * 80)))
+
+        chunks = await _collect(
+            agent,
+            _make_msg("latest request " + ("z" * 80), node_id=agent.tail_node_id),
+        )
+
+        final_text = "".join(chunk.text for chunk in chunks if isinstance(chunk, (AgentTextChunk, AgentTextFinal)))
+        assert final_text == "done"
+        assert compact_calls["n"] == 1
+
 
 # ---------------------------------------------------------------------------
 # Background branches (Phase 3)
