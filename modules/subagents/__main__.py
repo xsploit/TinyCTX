@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from subagents import spawn_subagent, wait_for_subagent
+from modules.subagents.subagents import spawn_subagent, wait_for_subagent
 
 
 def _subagent_prompt(_ctx) -> str:

@@ -291,10 +291,8 @@ def _web_prompt(_ctx) -> str:
     return (
         "<web_tools>\n"
         "- Use web_search when you need discovery, current information, or you do not yet have a URL.\n"
-        "- Use browse_url when you already have a specific http/https URL and need the page contents, docs, or data from that page.\n"
-        "- Use browse_url with prompt='...' to extract specific information from a page without consuming your main context with the full page content. This runs a secondary LLM call against the fetched content and returns only the extracted answer.\n"
-        "- Use navigate when the page is JS-heavy or when you need browser actions like click, type, wait_for, extract_text, screenshot, or extract_html.\n"
-        "- Do not use shell with curl, wget, Invoke-WebRequest, or similar commands for normal web fetching when browse_url, navigate, or http_request can handle it.\n"
+        "- Use navigate when you have a specific URL and need the page contents, or when you need browser actions like click, type, wait_for, extract_text, screenshot, or extract_html.\n"
+        "- Do not use shell with curl, wget, Invoke-WebRequest, or similar commands for normal web fetching when navigate or http_request can handle it.\n"
         "- Reserve shell/network commands for debugging or edge cases the web tools cannot handle.\n"
         "</web_tools>"
     )
@@ -641,55 +639,6 @@ def register(agent) -> None:
     agent.reset = patched_reset
 
     # ------------------------------------------------------------------
-    # Secondary LLM call — used by browse_url(prompt=...)
-    # ------------------------------------------------------------------
-
-    _CONTENT_PROMPT_MAX_CHARS = 80_000  # truncate page before sending to LLM
-
-    async def _apply_prompt_to_content(
-        page_content: str,
-        page_url: str,
-        page_title: str,
-        user_prompt: str,
-    ) -> str:
-        """Send fetched page content + a user prompt to the LLM and return its answer."""
-        from ai import TextDelta, LLMError as _LLMError
-
-        # Truncate to avoid blowing the model's context
-        content = page_content
-        if len(content) > _CONTENT_PROMPT_MAX_CHARS:
-            content = content[:_CONTENT_PROMPT_MAX_CHARS] + "\n\n[content truncated due to length]"
-
-        system_msg = (
-            "You are a web content extraction assistant. "
-            "The user has fetched a web page and wants specific information from it. "
-            "Respond concisely based only on the page content provided."
-        )
-        user_msg = (
-            f"Page URL: {page_url}\n"
-            f"Page title: {page_title}\n"
-            f"---\n{content}\n---\n\n"
-            f"{user_prompt}\n\n"
-            "Provide a concise response based on the content above. "
-            "Include relevant details, code examples, and documentation excerpts as needed."
-        )
-
-        messages = [
-            {"role": "system", "content": system_msg},
-            {"role": "user",   "content": user_msg},
-        ]
-
-        llm = agent.get_model(agent.config.llm.primary)
-        chunks: list[str] = []
-        async for event in llm.stream(messages, tools=None):
-            if isinstance(event, TextDelta):
-                chunks.append(event.text)
-            elif isinstance(event, _LLMError):
-                raise RuntimeError(f"LLM error during web prompt: {event.message}")
-
-        return "".join(chunks).strip() or "No response from model."
-
-    # ------------------------------------------------------------------
     # Tool definitions
     # ------------------------------------------------------------------
 
@@ -737,95 +686,6 @@ def register(agent) -> None:
                 "or navigate() instead of shell-based curl/Invoke-WebRequest."
             )
             return "\n".join(lines)
-        except Exception as e:
-            return f"[error: {e}]"
-
-    async def browse_url(
-        url: str,
-        mode: str = "text",
-        render_js: bool = False,
-        max_chars: int = None,
-        prompt: str = "",
-    ) -> str:
-        """
-        Fetch a URL and return readable page content for browsing or scraping.
-        Prefer this when the user gives a specific URL and wants the page contents.
-
-        When prompt is provided, the fetched content is processed by the LLM to
-        extract or summarize the information you asked for — much cheaper than
-        returning the full page and using your main context to analyze it.
-
-        Args:
-            url: The full URL to fetch (http:// or https://).
-            mode: Content mode: text or html.
-            render_js: Render the page in Playwright before extracting content.
-            max_chars: Maximum characters to return (default uses web config).
-            prompt: If set, process the page with this instruction and return the LLM summary instead of raw content. Use this to extract specific info from large pages.
-        """
-        st = _state(agent)
-        err = _validate_browse_url(url)
-        if err:
-            return err
-
-        mode = (mode or "text").strip().lower()
-        if mode not in {"text", "html"}:
-            return "Error: mode must be 'text' or 'html'."
-
-        if max_chars is None:
-            max_chars = st["settings"]["browse_max_chars"]
-        try:
-            max_chars = int(max_chars)
-        except (TypeError, ValueError):
-            return "Error: max_chars must be an integer."
-        if max_chars <= 0:
-            return "Error: max_chars must be greater than 0."
-
-        try:
-            if render_js:
-                result = await _browse_with_browser(
-                    agent,
-                    url,
-                    mode,
-                    max_chars=max_chars,
-                    timeout_ms=st["settings"]["timeout_ms"],
-                    ignored_tags=st["settings"]["ignore_tags"],
-                )
-            else:
-                result = await _browse_with_http(
-                    url,
-                    mode,
-                    max_chars=max_chars,
-                    max_bytes=st["settings"]["browse_max_bytes"],
-                    timeout_ms=st["settings"]["timeout_ms"],
-                    user_agent=st["settings"]["browse_user_agent"],
-                    ignored_tags=st["settings"]["ignore_tags"],
-                )
-
-            # If prompt is given, run the fetched content through the LLM
-            # to extract/summarize instead of returning the full page.
-            prompt = (prompt or "").strip()
-            if prompt and result.get("content"):
-                try:
-                    summary = await _apply_prompt_to_content(
-                        page_content=result["content"],
-                        page_url=result.get("final_url") or url,
-                        page_title=result.get("title") or "",
-                        user_prompt=prompt,
-                    )
-                    return json.dumps({
-                        "url": result.get("url", url),
-                        "final_url": result.get("final_url", url),
-                        "title": result.get("title"),
-                        "prompt": prompt,
-                        "result": summary,
-                        "source_bytes": result.get("bytes", 0),
-                        "truncated": result.get("truncated", False),
-                    }, indent=2)
-                except Exception as exc:
-                    # Fall through to raw content on LLM failure
-                    result["prompt_error"] = str(exc)
-
-            return json.dumps(result, indent=2)
         except Exception as e:
             return f"[error: {e}]"
 
@@ -1121,7 +981,6 @@ def register(agent) -> None:
 
     _WEB_DEFAULTS: dict[str, bool] = {
         "web_search":    True,
-        "browse_url":    True,
         "navigate":      True,
         "http_request":  False,
         "click":         False,
@@ -1135,7 +994,6 @@ def register(agent) -> None:
 
     for fn in (
         web_search,
-        browse_url,
         http_request,
         navigate,
         click,

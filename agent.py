@@ -69,13 +69,6 @@ from ai import LLM, TextDelta, ThinkingDelta, ToolCallAssembled, LLMError
 from utils.tool_handler import ToolCallHandler
 from utils.attachments import build_content_blocks
 from db import ConversationDB
-from compact import (
-    COMPACT_SYSTEM_PROMPT,
-    COMPACT_USER_PROMPT,
-    build_compaction_plan,
-    format_summary,
-    should_compact,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -292,98 +285,6 @@ class AgentLoop:
             except Exception:
                 logger.exception("Failed to load module '%s'", entry.name)
 
-    async def _maybe_compact_context(self) -> bool:
-        pretrim_tokens = int(self.context.state.get("tokens_used_pre_trim", 0) or 0)
-        token_limit = int(self.config.context or 0)
-        if not should_compact(pretrim_tokens, token_limit):
-            return False
-
-        plan = build_compaction_plan(self.context.dialogue)
-        if plan is None:
-            return False
-
-        summary = await self._generate_compact_summary(plan.to_summarize)
-        if not summary:
-            logger.warning(
-                "[cursor=%s] compaction skipped — summary generation failed",
-                self._tail_node_id,
-            )
-            return False
-
-        active = self.context.compact(
-            format_summary(summary),
-            preserved_tail=plan.preserved_tail,
-            metadata={
-                "entries_summarized": len(plan.to_summarize),
-                "summarized_units": plan.summarized_units,
-            },
-        )
-        logger.info(
-            "[cursor=%s] compacted %d entry(s) into summary + %d preserved entry(s)",
-            self._tail_node_id,
-            len(plan.to_summarize),
-            len(active) - 1,
-        )
-        return True
-
-    async def _generate_compact_summary(self, entries: list[HistoryEntry]) -> str | None:
-        summary_messages = (
-            [{"role": "system", "content": COMPACT_SYSTEM_PROMPT}]
-            + [self.context._render(entry) for entry in entries]
-            + [{"role": "user", "content": COMPACT_USER_PROMPT}]
-        )
-
-        model_chain = [self.config.llm.primary] + list(self.config.llm.fallback)
-        for model_name in model_chain:
-            llm = self._models[model_name]
-            text_chunks: list[str] = []
-            error: str | None = None
-            last_http_status: int | None = None
-
-            async for llm_event in llm.stream(summary_messages, tools=None):
-                if isinstance(llm_event, TextDelta):
-                    text_chunks.append(llm_event.text)
-                elif isinstance(llm_event, ToolCallAssembled):
-                    error = "compaction summary unexpectedly returned tool calls"
-                    break
-                elif isinstance(llm_event, LLMError):
-                    error = llm_event.message
-                    if llm_event.message.startswith("HTTP "):
-                        try:
-                            last_http_status = int(llm_event.message.split()[1].rstrip(":"))
-                        except (IndexError, ValueError):
-                            pass
-                    break
-
-            if not error:
-                summary = "".join(text_chunks).strip()
-                if summary:
-                    return summary
-                error = "empty compaction summary"
-
-            fo = self.config.llm.fallback_on
-            should_fallback = fo.any_error or (
-                last_http_status is not None and last_http_status in fo.http_codes
-            )
-            if should_fallback and model_name != model_chain[-1]:
-                logger.warning(
-                    "[cursor=%s] compaction model '%s' failed (%s) — trying fallback",
-                    self._tail_node_id,
-                    model_name,
-                    error,
-                )
-                continue
-
-            logger.warning(
-                "[cursor=%s] compaction summary failed on model '%s': %s",
-                self._tail_node_id,
-                model_name,
-                error,
-            )
-            break
-
-        return None
-
     # ------------------------------------------------------------------
     # Main entry point
     # ------------------------------------------------------------------
@@ -444,40 +345,27 @@ class AgentLoop:
         tool_result_cache: dict[str, ToolResult] = {}
 
         for cycle in range(max_cycles):
-            compacted_this_cycle = False
-            while True:
-                # Abort check between cycles
-                if abort_event and abort_event.is_set():
-                    logger.info("[%s] aborted before cycle %d", self._tail_node_id, cycle)
-                    yield AgentError(message="[generation aborted]", **ev)
-                    return
+            # Abort check between cycles
+            if abort_event and abort_event.is_set():
+                logger.info("[%s] aborted before cycle %d", self._tail_node_id, cycle)
+                yield AgentError(message="[generation aborted]", **ev)
+                return
 
-                # Stage 2: Context Assembly
-                await self.context.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
-                tools    = self.tool_handler.get_tool_definitions() or None
-                messages = self.context.assemble(tools=tools)
+            # Stage 2: Context Assembly
+            await self.context.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
+            tools    = self.tool_handler.get_tool_definitions() or None
+            messages = self.context.assemble(tools=tools)
 
-                # Token budget telemetry
-                tokens_used = int(self.context.state.get("tokens_used_pre_trim", 0) or 0)
-                active_tokens = int(self.context.state.get("tokens_used", 0) or 0)
-                token_limit = self.config.context
-                token_pct   = tokens_used / token_limit if token_limit else 0
-                if token_pct >= 0.95:
-                    logger.warning(
-                        "[cursor=%s] context at %.0f%% of token budget (%d/%d, active=%d) — consider compaction",
-                        self._tail_node_id, token_pct * 100, tokens_used, token_limit, active_tokens,
-                    )
-                elif token_pct >= 0.80:
-                    logger.info(
-                        "[cursor=%s] context at %.0f%% of token budget (%d/%d, active=%d)",
-                        self._tail_node_id, token_pct * 100, tokens_used, token_limit, active_tokens,
-                    )
-
-                if not compacted_this_cycle and await self._maybe_compact_context():
-                    compacted_this_cycle = True
-                    continue
-
-                break
+            # Token budget telemetry
+            tokens_used = int(self.context.state.get("tokens_used_pre_trim", 0) or 0)
+            active_tokens = int(self.context.state.get("tokens_used", 0) or 0)
+            token_limit = self.config.context
+            token_pct   = tokens_used / token_limit if token_limit else 0
+            if token_pct >= 0.80:
+                logger.info(
+                    "[cursor=%s] context at %.0f%% of token budget (%d/%d, active=%d)",
+                    self._tail_node_id, token_pct * 100, tokens_used, token_limit, active_tokens,
+                )
 
             # Stage 3: Inference — walk primary → fallback chain
             text_chunks:      list[str]      = []

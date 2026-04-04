@@ -10,7 +10,7 @@ import pytest
 from ai import TextDelta
 from db import ConversationDB
 from modules.subagents import __main__ as subagents_module
-from subagents import reset_subagent_tasks
+from modules.subagents.subagents import reset_subagent_tasks
 
 
 class _MockConfig:
