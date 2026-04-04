@@ -60,8 +60,6 @@ python main.py
 
 **`example.config.yaml` is the full configuration reference** — every option is documented there with defaults and examples.
 
-If you use the CLI bridge, `/settings` can also update common runtime settings and provider presets without hand-editing `config.yaml`.
-
 ---
 
 ## Bridges
@@ -82,11 +80,10 @@ bridges:
       word_wrap: true          # wrap transcript lines instead of hard-clipping
 ```
 
-The CLI bridge is a fullscreen `prompt_toolkit` TUI with:
+The CLI bridge is a fullscreen `rich` TUI with:
 
 - persistent transcript restore from the last CLI session
 - slash command autocomplete
-- provider/settings menus via `/settings`
 - explicit copy helpers via `/copy transcript`, `/copy last-tool`, and `/copy last-error`
 - paste refs like `[Pasted text #1, 332 chars]` for large or multiline clipboard content
 
@@ -97,18 +94,7 @@ Useful keys and commands:
 - `Ctrl+Q` — quit TinyCTX
 - `/reset` — start a fresh CLI session
 - `/resume` — keep using the saved CLI session
-- `/settings` — open the settings UI
 - `/debug heartbeat` — trigger one heartbeat tick immediately
-
-The settings UI exposes the current round-trip limit (`max_tool_cycles`) plus provider presets for:
-
-- OpenAI
-- OpenRouter
-- Ollama
-- LM Studio
-- `llama.cpp`
-- Custom OpenAI-compatible endpoints
-
 ---
 
 ### Discord
