@@ -60,6 +60,54 @@ def register(agent) -> None:
     # Load blacklist once at register time. Restart to pick up edits.
     blacklist = load_blacklist()
 
+    # ------------------------------------------------------------------
+    # File-state tracking (read-before-write + staleness detection)
+    # ------------------------------------------------------------------
+    # Maps absolute file path → mtime (float) at the time of last view().
+    # Persists for the session lifetime; cleared on agent reset.
+    if not hasattr(agent, '_file_read_state'):
+        agent._file_read_state = {}
+
+    file_read_state: dict[str, float] = agent._file_read_state
+
+    def _record_read(p: Path) -> None:
+        """Record that we just read a file — store its current mtime."""
+        try:
+            file_read_state[str(p)] = p.stat().st_mtime
+        except OSError:
+            pass
+
+    def _check_staleness(p: Path) -> str | None:
+        """Check file is safe to write. Returns an error string or None if OK."""
+        abs_key = str(p)
+        if not p.exists():
+            # New file — no prior read needed.
+            return None
+        if abs_key not in file_read_state:
+            return (
+                f"[error: {p.name} has not been read yet. "
+                "Use view() to read the file before writing to it.]"
+            )
+        try:
+            current_mtime = p.stat().st_mtime
+        except OSError:
+            return None  # file vanished — let the write handle it
+        recorded_mtime = file_read_state[abs_key]
+        if current_mtime > recorded_mtime:
+            return (
+                f"[error: {p.name} has been modified since it was last read "
+                "(possibly by a linter, formatter, or the user). "
+                "Read it again with view() before editing.]"
+            )
+        return None
+
+    def _update_after_write(p: Path) -> None:
+        """Update tracked mtime after a successful write."""
+        try:
+            file_read_state[str(p)] = p.stat().st_mtime
+        except OSError:
+            pass
+
     def resolve(raw: str) -> Path:
         p = Path(raw)
         return p if p.is_absolute() else workspace / p
@@ -110,6 +158,10 @@ def register(agent) -> None:
             text = p.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             return "[error: binary file, cannot read as text]"
+
+        # Track that we read this file (for staleness detection).
+        _record_read(p)
+
         lines = text.splitlines()
         total = len(lines)
         if view_range:
@@ -137,6 +189,7 @@ def register(agent) -> None:
 
     def write_file(path: str, content: str = "", mode: str = "append") -> str:
         """Write content to a file. Creates the file and any missing parent directories if they don't exist.
+        Existing files must be read with view() first (prevents blind overwrites).
 
         Args:
             path: Path to the file.
@@ -150,6 +203,12 @@ def register(agent) -> None:
         p.parent.mkdir(parents=True, exist_ok=True)
         existed = p.exists()
 
+        # Staleness check — skip for new files.
+        if existed:
+            err = _check_staleness(p)
+            if err:
+                return err
+
         if mode == "overwrite" or not existed:
             p.write_text(content, encoding="utf-8")
             action = "truncated" if existed and content == "" else ("overwrote" if existed else "created")
@@ -162,10 +221,12 @@ def register(agent) -> None:
                 f.write(content)
             action = "appended"
 
+        _update_after_write(p)
         return f"[{action} {p} ({len(content)} chars)]"
 
     def str_replace(path: str, old_str: str, new_str: str = "", replace_all: bool = False) -> str:
         """Replace a string in an existing file. By default old_str must appear exactly once.
+        The file must have been read with view() first.
 
         Args:
             path: Path to the file.
@@ -176,6 +237,12 @@ def register(agent) -> None:
         p = resolve(path)
         if not p.exists():
             return f"[error: file not found: {p}]"
+
+        # Staleness check — str_replace always targets existing files.
+        err = _check_staleness(p)
+        if err:
+            return err
+
         original = p.read_text(encoding="utf-8")
         count = original.count(old_str)
         if count == 0:
@@ -184,8 +251,10 @@ def register(agent) -> None:
             return f"[error: old_str appears {count} times — add more context to make it unique, or set replace_all=true]"
         if replace_all:
             p.write_text(original.replace(old_str, new_str), encoding="utf-8")
+            _update_after_write(p)
             return f"[replaced {count} occurrences in {p}]"
         p.write_text(original.replace(old_str, new_str, 1), encoding="utf-8")
+        _update_after_write(p)
         return f"[replaced 1 occurrence in {p}]"
 
     # ------------------------------------------------------------------
