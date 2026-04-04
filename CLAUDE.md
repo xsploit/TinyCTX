@@ -310,6 +310,9 @@ When no DB is wired (tests / legacy path), the nudge falls back to the old inlin
 4. Use `content_type_for(text, bool(attachments))` from `contracts.py` to set `content_type`.
 5. Handle `AgentEvent` objects in the handler — switch on type.
 6. Add entry to `config.yaml` under `bridges:` with `enabled: true`.
+   For the CLI bridge, `options.quiet_startup: true` and `options.log_level: WARNING`
+   keep the terminal UI clean; switch `log_level` to `inherit` only when you
+   explicitly want module/runtime INFO logs in the chat session.
 7. Tokens from env vars only — do not add bridge-specific dataclasses to `config/`.
 
 ---
@@ -375,6 +378,7 @@ agent.tool_handler.enable("tool_name")                 # enable programmatically
 | `memory` | `memory_search` | — |
 | `skills` | `use_skill` | — |
 | `web` | `web_search`, `browse_url`, `navigate` | `http_request`, `click`, `type_text`, `extract_text`, `extract_html`, `screenshot`, `wait_for`, `manage_browser` |
+| `todo` | — | `todo_write`, `todo_read` |
 | `mcp` | configurable per-tool (see below) | all tools default to deferred |
 | `cron` | `cron_list` | — |
 
@@ -438,7 +442,8 @@ Token-budget trimming in `assemble()` follows the same rules: assistant turns wi
 |--------|-------------|
 | `memory` | Static: injects SOUL.md, AGENTS.md, MEMORY.md as system prompts. Dynamic: hybrid BM25+vector search over `workspace/memory/**/*.md` via async pre-assemble hook + `memory_search` tool. Context nudge: when token delta exceeds threshold, spawns a background branch for memory consolidation instead of injecting inline. Config key: `memory_search:`. |
 | `filesystem` | Tools: `shell`, `view`, `write_file`, `str_replace`, `grep`, `glob_search` — all always-on. `grep` wraps ripgrep with automatic Python fallback; supports files/content/count output modes, glob filtering, file type filtering, context lines, and result limits. `glob_search` finds files by pattern (pathlib), sorted by mtime. **Read-before-write guard:** `write_file` and `str_replace` require the target file to have been read via `view()` first; they also reject writes if the file has been modified since the last read (staleness detection). New file creation is exempt. Sandboxed to workspace. Shell execution split into `shell.py` (platform detection, blacklist, subprocess dispatch). On Linux/macOS runs via `bash -c`; on Windows via `powershell -NonInteractive`. Blacklist (`blacklist.txt`, glob patterns, case-insensitive) enforced on both platforms — covers bulk destruction, RCE, privilege escalation, persistence, system path writes, and more. Blocked commands return an error string. Blacklist loaded at `register()` time; restart to reload. `str_replace` supports `replace_all=true` for multi-occurrence replacements. |
-| `web` | Tools: `web_search` (DuckDuckGo), `browse_url` (direct page fetch/scrape), and `navigate` are always-on. `http_request`, `click`, `type_text`, `extract_text`, `extract_html`, `screenshot`, `wait_for`, `manage_browser` (Playwright) are deferred. |
+| `web` | Tools: `web_search` (DuckDuckGo), `browse_url` (direct page fetch/scrape with optional `prompt` for LLM-powered content extraction), and `navigate` are always-on. `browse_url(prompt=...)` fetches a page then runs a secondary LLM call to extract/summarize specific information — saves context by not returning the full page. `http_request`, `click`, `type_text`, `extract_text`, `extract_html`, `screenshot`, `wait_for`, `manage_browser` (Playwright) are deferred. |
+| `todo` | Persistent per-session task checklist. Deferred tools: `todo_write` (create/update task list), `todo_read` (view current tasks). State persisted to `workspace/TODO.json`. Current task list injected into system prompt every turn so the agent always sees its progress. Statuses: `pending`, `in_progress`, `completed`. Use for multi-step work with 3+ steps. |
 | `cron` | Scheduled agent turns. Jobs in `workspace/CRON.json`. Schedule kinds: `every`, `at`, `cron` (requires `croniter`). Tool: `cron_list`. Each job holds its own `cursor_node_id` (child of global root, created on first run). `reset_after_run: true` rewinds the cursor to the job's root node rather than wiping the DB. |
 | `heartbeat` | Periodic timer turns on an isolated DB branch — never pollutes the user's conversation thread. On `register()`, creates a session-init node in `agent.db` and stores its `node_id` as `agent._heartbeat_cursor_node_id`. All ticks push through the gateway (own `Lane` + `AgentLoop`); the cursor advances after each turn and is cached for the next. `branch_from: "root"` (default) — fully isolated; `branch_from: "session"` — branches off the user session tail at startup. Agent replies `HEARTBEAT_OK` if nothing needs attention; otherwise triggers a continuation loop (up to `max_continuations`). Configurable active hours. |
 | `ctx_tools` | Context pipeline hooks: deduplicates repeated identical tool calls, strips `<think>` CoT blocks from old turns, truncates/trims large tool outputs. |
