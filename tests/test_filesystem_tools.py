@@ -305,3 +305,104 @@ class TestStalenessDetection:
         (workspace / "readme.md").write_text("# changed externally\n", encoding="utf-8")
         result = tools["write_file"](path="readme.md", content="overwrite", mode="overwrite")
         assert "modified since" in result
+
+
+# ===================================================================
+# Quote normalization — curly ↔ straight quote matching
+# ===================================================================
+
+class TestQuoteNormalization:
+    def test_straight_quotes_match_curly_in_file(self, tools, workspace):
+        """LLM sends straight quotes, file has curly quotes — should match."""
+        (workspace / "quotes.txt").write_text(
+            "She said \u201CHello\u201D and \u2018goodbye\u2019\n", encoding="utf-8"
+        )
+        tools["view"](path="quotes.txt")
+        result = tools["str_replace"](
+            path="quotes.txt",
+            old_str='She said "Hello"',
+            new_str='She said "Hi"',
+        )
+        assert "replaced" in result
+        content = (workspace / "quotes.txt").read_text(encoding="utf-8")
+        # The replacement should have happened
+        assert "Hi" in content
+
+    def test_curly_quotes_match_straight_in_file(self, tools, workspace):
+        """LLM sends curly quotes, file has straight quotes — should match."""
+        (workspace / "straight.txt").write_text(
+            'He said "yes" and \'no\'\n', encoding="utf-8"
+        )
+        tools["view"](path="straight.txt")
+        result = tools["str_replace"](
+            path="straight.txt",
+            old_str='He said \u201Cyes\u201D',
+            new_str='He said "maybe"',
+        )
+        assert "replaced" in result
+
+    def test_exact_match_preferred_over_normalized(self, tools, workspace):
+        """When exact match exists, don't use normalized matching."""
+        (workspace / "exact.txt").write_text(
+            'say "hello" world\n', encoding="utf-8"
+        )
+        tools["view"](path="exact.txt")
+        result = tools["str_replace"](
+            path="exact.txt",
+            old_str='"hello"',
+            new_str='"hi"',
+        )
+        assert "replaced" in result
+        content = (workspace / "exact.txt").read_text(encoding="utf-8")
+        assert '"hi"' in content
+
+    def test_no_match_still_fails(self, tools, workspace):
+        """Normalization doesn't create false matches."""
+        tools["view"](path="hello.py")
+        result = tools["str_replace"](path="hello.py", old_str="zzznomatch")
+        assert "not found" in result
+
+
+# ===================================================================
+# Trailing whitespace stripping on new_str
+# ===================================================================
+
+class TestTrailingWhitespace:
+    def test_trailing_spaces_stripped_from_replacement(self, tools, workspace):
+        (workspace / "ws.txt").write_text("line1\nline2\n", encoding="utf-8")
+        tools["view"](path="ws.txt")
+        result = tools["str_replace"](
+            path="ws.txt",
+            old_str="line1",
+            new_str="replaced   ",  # trailing spaces
+        )
+        assert "replaced" in result
+        content = (workspace / "ws.txt").read_text(encoding="utf-8")
+        # Trailing spaces should be stripped
+        assert "replaced   " not in content
+        assert "replaced\n" in content
+
+    def test_multiline_trailing_ws_stripped(self, tools, workspace):
+        (workspace / "multi.txt").write_text("aaa\nbbb\n", encoding="utf-8")
+        tools["view"](path="multi.txt")
+        result = tools["str_replace"](
+            path="multi.txt",
+            old_str="aaa\nbbb",
+            new_str="xxx   \nyyy  ",
+        )
+        assert "replaced" in result
+        content = (workspace / "multi.txt").read_text(encoding="utf-8")
+        assert "xxx\nyyy\n" in content
+
+    def test_intentional_content_preserved(self, tools, workspace):
+        """Non-trailing whitespace is preserved."""
+        (workspace / "indent.txt").write_text("def foo():\n    pass\n", encoding="utf-8")
+        tools["view"](path="indent.txt")
+        result = tools["str_replace"](
+            path="indent.txt",
+            old_str="    pass",
+            new_str="    return 42",
+        )
+        assert "replaced" in result
+        content = (workspace / "indent.txt").read_text(encoding="utf-8")
+        assert "    return 42" in content

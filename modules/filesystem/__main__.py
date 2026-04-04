@@ -25,6 +25,51 @@ from modules.filesystem.shell import load_blacklist, run_command
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Quote normalization — LLMs output straight quotes but files may have curly
+# ones. Normalizing lets str_replace match even when quote styles differ.
+# ---------------------------------------------------------------------------
+
+_CURLY_QUOTE_MAP = str.maketrans({
+    "\u2018": "'",   # left single curly  → straight
+    "\u2019": "'",   # right single curly → straight
+    "\u201C": '"',   # left double curly  → straight
+    "\u201D": '"',   # right double curly → straight
+})
+
+
+def _normalize_quotes(s: str) -> str:
+    """Convert curly quotes to straight quotes."""
+    return s.translate(_CURLY_QUOTE_MAP)
+
+
+def _find_actual_string(file_content: str, search_string: str) -> str | None:
+    """Find the actual string in the file that matches search_string,
+    accounting for curly-vs-straight quote differences.
+
+    Returns the actual substring from file_content, or None if not found.
+    """
+    # Fast path — exact match
+    if search_string in file_content:
+        return search_string
+
+    # Try with normalized quotes
+    norm_search = _normalize_quotes(search_string)
+    norm_file = _normalize_quotes(file_content)
+    idx = norm_file.find(norm_search)
+    if idx != -1:
+        # Return the original (curly-quoted) slice from the file
+        return file_content[idx : idx + len(search_string)]
+
+    return None
+
+
+def _strip_trailing_ws(s: str) -> str:
+    """Strip trailing whitespace from each line. Prevents phantom diffs from
+    LLMs that add/drop trailing spaces."""
+    return "\n".join(line.rstrip() for line in s.split("\n"))
+
+
 # Image MIME types we can pass to a vision model as an image_url block.
 _VISION_MIMES: frozenset[str] = frozenset({
     "image/jpeg", "image/png", "image/gif", "image/webp",
@@ -244,16 +289,24 @@ def register(agent) -> None:
             return err
 
         original = p.read_text(encoding="utf-8")
-        count = original.count(old_str)
-        if count == 0:
+
+        # Quote normalization — match even if file uses curly quotes and
+        # the LLM sent straight quotes (or vice versa).
+        actual_old = _find_actual_string(original, old_str)
+        if actual_old is None:
             return f"[error: old_str not found in {p}]"
+
+        # Strip trailing whitespace from new_str to prevent phantom diffs.
+        clean_new = _strip_trailing_ws(new_str)
+
+        count = original.count(actual_old)
         if count > 1 and not replace_all:
             return f"[error: old_str appears {count} times — add more context to make it unique, or set replace_all=true]"
         if replace_all:
-            p.write_text(original.replace(old_str, new_str), encoding="utf-8")
+            p.write_text(original.replace(actual_old, clean_new), encoding="utf-8")
             _update_after_write(p)
             return f"[replaced {count} occurrences in {p}]"
-        p.write_text(original.replace(old_str, new_str, 1), encoding="utf-8")
+        p.write_text(original.replace(actual_old, clean_new, 1), encoding="utf-8")
         _update_after_write(p)
         return f"[replaced 1 occurrence in {p}]"
 

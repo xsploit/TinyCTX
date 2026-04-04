@@ -3,6 +3,7 @@ modules/web/__main__.py
 
 Registers web tools into the agent loop's tool_handler:
   - web_search     — DuckDuckGo text search
+  - browse_url     — fetch and scrape a page directly
   - http_request   — generic async HTTP (GET/POST/etc.)
   - navigate       — open a URL in Playwright, returns element map
   - click          — click an element
@@ -24,8 +25,10 @@ import asyncio
 import json
 import re
 import time
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -41,6 +44,26 @@ _KNOWN_ROLES = {
     "menu", "tab", "tabpanel", "tablist", "slider", "switch",
     "progressbar", "alert", "dialog",
 }
+_BLOCK_TAGS = {
+    "address", "article", "aside", "blockquote", "dd", "div", "dl", "dt",
+    "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3",
+    "h4", "h5", "h6", "header", "hr", "li", "main", "nav", "ol", "p", "pre",
+    "section", "table", "tbody", "td", "tfoot", "th", "thead", "tr", "ul",
+}
+_IGNORED_TEXT_TAGS = {
+    "canvas", "head", "meta", "link", "noscript", "script", "style", "svg", "title",
+}
+_TEXTUAL_CONTENT_TYPES = {
+    "application/json",
+    "application/javascript",
+    "application/x-javascript",
+    "application/xml",
+    "application/xhtml+xml",
+    "application/rss+xml",
+    "application/atom+xml",
+    "image/svg+xml",
+}
+_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 
 
 def _looks_like_css(s: str) -> bool:
@@ -54,6 +77,259 @@ def _strip_quotes(s: str) -> Optional[str]:
     if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
         return s[1:-1]
     return None
+
+
+def _normalise_inline_ws(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _normalise_extracted_text(text: str) -> str:
+    lines: list[str] = []
+    last_blank = True
+
+    for raw_line in text.replace("\r", "\n").split("\n"):
+        line = _normalise_inline_ws(raw_line)
+        if not line:
+            if lines and not last_blank:
+                lines.append("")
+            last_blank = True
+            continue
+        lines.append(line)
+        last_blank = False
+
+    while lines and not lines[-1]:
+        lines.pop()
+
+    return "\n".join(lines).strip()
+
+
+class _HTMLTextExtractor(HTMLParser):
+    def __init__(self, ignored_tags: set[str]) -> None:
+        super().__init__(convert_charrefs=True)
+        self._ignored_tags = ignored_tags
+        self._ignored_depth = 0
+        self._chunks: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:  # noqa: ANN001
+        tag = tag.lower()
+        if tag in self._ignored_tags:
+            self._ignored_depth += 1
+            return
+        if self._ignored_depth:
+            return
+        if tag == "br" or tag in _BLOCK_TAGS:
+            self._chunks.append("\n")
+
+    def handle_startendtag(self, tag: str, attrs) -> None:  # noqa: ANN001
+        self.handle_starttag(tag, attrs)
+        self.handle_endtag(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in self._ignored_tags:
+            if self._ignored_depth:
+                self._ignored_depth -= 1
+            return
+        if self._ignored_depth:
+            return
+        if tag in _BLOCK_TAGS:
+            self._chunks.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if self._ignored_depth or not data:
+            return
+        self._chunks.append(data)
+
+    def get_text(self) -> str:
+        return _normalise_extracted_text("".join(self._chunks))
+
+
+def _html_to_text(html_text: str, extra_ignored_tags: list[str] | None = None) -> str:
+    ignored = _IGNORED_TEXT_TAGS | {tag.lower() for tag in (extra_ignored_tags or [])}
+    parser = _HTMLTextExtractor(ignored)
+    parser.feed(html_text)
+    parser.close()
+    return parser.get_text()
+
+
+def _extract_html_title(html_text: str) -> Optional[str]:
+    match = _TITLE_RE.search(html_text)
+    if not match:
+        return None
+    title = re.sub(r"<[^>]+>", " ", match.group(1))
+    title = _normalise_inline_ws(title)
+    return title or None
+
+
+def _truncate_content(text: str, max_chars: int) -> tuple[str, bool]:
+    if len(text) <= max_chars:
+        return text, False
+    return text[:max_chars].rstrip(), True
+
+
+def _is_textual_content_type(content_type: str) -> bool:
+    ctype = content_type.split(";", 1)[0].strip().lower()
+    if not ctype:
+        return True
+    return (
+        ctype.startswith("text/")
+        or ctype in _TEXTUAL_CONTENT_TYPES
+        or ctype.endswith("+json")
+        or ctype.endswith("+xml")
+    )
+
+
+def _looks_like_html_content(content_type: str, body_text: str) -> bool:
+    ctype = content_type.lower()
+    if "html" in ctype:
+        return True
+    probe = body_text.lstrip()[:512].lower()
+    return (
+        probe.startswith("<!doctype html")
+        or probe.startswith("<html")
+        or "<html" in probe
+        or "<body" in probe
+    )
+
+
+def _validate_browse_url(url: str) -> Optional[str]:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return "Error: invalid URL."
+    if parsed.scheme.lower() not in ("http", "https"):
+        return "Error: browse_url only supports http:// or https:// URLs."
+    if not parsed.netloc:
+        return "Error: browse_url requires a full URL with a hostname."
+    if parsed.username or parsed.password:
+        return "Error: URLs with embedded credentials are not supported."
+    return None
+
+
+def _web_prompt(_ctx) -> str:
+    return (
+        "<web_tools>\n"
+        "- Use web_search when you need discovery, current information, or you do not yet have a URL.\n"
+        "- Use browse_url when you already have a specific http/https URL and need the page contents, docs, or data from that page.\n"
+        "- Use navigate when the page is JS-heavy or when you need browser actions like click, type, wait_for, extract_text, screenshot, or extract_html.\n"
+        "- Do not use shell with curl, wget, Invoke-WebRequest, or similar commands for normal web fetching when browse_url, navigate, or http_request can handle it.\n"
+        "- Reserve shell/network commands for debugging or edge cases the web tools cannot handle.\n"
+        "</web_tools>"
+    )
+
+
+async def _read_response_body(resp, max_bytes: int) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+
+    async for chunk in resp.content.iter_chunked(16384):
+        total += len(chunk)
+        if total > max_bytes:
+            raise ValueError(f"Response body exceeds configured limit ({max_bytes} bytes).")
+        chunks.append(chunk)
+
+    return b"".join(chunks)
+
+
+async def _browse_with_http(
+    url: str,
+    mode: str,
+    *,
+    max_chars: int,
+    max_bytes: int,
+    timeout_ms: int,
+    user_agent: str,
+    ignored_tags: list[str] | None = None,
+) -> dict:
+    timeout = aiohttp.ClientTimeout(total=max(timeout_ms / 1000, 1))
+    headers = {
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "text/plain;q=0.8,application/json;q=0.7,*/*;q=0.5"
+        ),
+        "User-Agent": user_agent,
+    }
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url, allow_redirects=True, headers=headers) as resp:
+            body = await _read_response_body(resp, max_bytes=max_bytes)
+            charset = resp.charset or "utf-8"
+            try:
+                body_text = body.decode(charset, errors="replace")
+            except LookupError:
+                body_text = body.decode("utf-8", errors="replace")
+
+            content_type = resp.headers.get("Content-Type", "")
+            if not _is_textual_content_type(content_type):
+                raise ValueError(
+                    f"Unsupported content type for browse_url: {content_type or 'unknown'}"
+                )
+
+            is_html = _looks_like_html_content(content_type, body_text)
+            title = _extract_html_title(body_text) if is_html else None
+            content = body_text if mode == "html" else (
+                _html_to_text(body_text, ignored_tags) if is_html
+                else _normalise_extracted_text(body_text)
+            )
+            content, truncated = _truncate_content(content, max_chars)
+
+            return {
+                "url": url,
+                "final_url": str(resp.url),
+                "status_code": resp.status,
+                "content_type": content_type,
+                "mode": mode,
+                "rendered": False,
+                "truncated": truncated,
+                "bytes": len(body),
+                "title": title,
+                "content": content,
+            }
+
+
+async def _browse_with_browser(
+    agent,
+    url: str,
+    mode: str,
+    *,
+    max_chars: int,
+    timeout_ms: int,
+    ignored_tags: list[str] | None = None,
+) -> dict:
+    st = _state(agent)
+    page = await _ensure_page(agent)
+    response = await page.goto(
+        url,
+        wait_until=st["settings"]["wait_until"],
+        timeout=timeout_ms,
+    )
+
+    status_code = response.status if response is not None else 200
+    content_type = "text/html"
+    if response is not None:
+        try:
+            headers = await response.all_headers()
+            content_type = headers.get("content-type", content_type)
+        except Exception:
+            pass
+
+    html_text = await page.content()
+    title = await page.title()
+    content = html_text if mode == "html" else _html_to_text(html_text, ignored_tags)
+    content, truncated = _truncate_content(content, max_chars)
+
+    return {
+        "url": url,
+        "final_url": page.url,
+        "status_code": status_code,
+        "content_type": content_type,
+        "mode": mode,
+        "rendered": True,
+        "truncated": truncated,
+        "bytes": len(html_text.encode("utf-8")),
+        "title": title or _extract_html_title(html_text),
+        "content": content,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +489,10 @@ def register(agent) -> None:
         cfg: dict = EXTENSION_META.get("default_config", {})
     except ImportError:
         cfg = {}
+    runtime_web_cfg: dict = {}
+    if hasattr(agent.config, "extra") and isinstance(agent.config.extra, dict):
+        runtime_web_cfg = agent.config.extra.get("web", {})
+    cfg = {**cfg, **{k: v for k, v in runtime_web_cfg.items() if k != "tools"}}
 
     workspace     = Path(agent.config.workspace.path).expanduser().resolve()
     downloads_dir = workspace / cfg.get("downloads_dir", "downloads")
@@ -227,7 +507,17 @@ def register(agent) -> None:
         "shift_enter_for_newline": cfg.get("shift_enter_for_newline", True),
         "ignore_tags":            list(cfg.get("ignore_tags", ["script", "style"])),
         "max_discovery_elements": cfg.get("max_discovery_elements", 40),
+        "browse_max_bytes":       int(cfg.get("browse_max_bytes", 2000000)),
+        "browse_max_chars":       int(cfg.get("browse_max_chars", 20000)),
+        "browse_user_agent":      str(cfg.get("browse_user_agent", "TinyCTX/1.1")),
     })
+
+    agent.context.register_prompt(
+        "web_tools",
+        _web_prompt,
+        role="system",
+        priority=int(cfg.get("prompt_priority", 12)),
+    )
 
     original_reset = agent.reset
 
@@ -268,7 +558,69 @@ def register(agent) -> None:
                 lines.append(
                     f"{i}. {r.get('title','')}\n   {r.get('href','')}\n   {r.get('body','')}"
                 )
+            lines.append(
+                "If you need the contents of a specific result URL, prefer browse_url() "
+                "or navigate() instead of shell-based curl/Invoke-WebRequest."
+            )
             return "\n".join(lines)
+        except Exception as e:
+            return f"[error: {e}]"
+
+    async def browse_url(
+        url: str,
+        mode: str = "text",
+        render_js: bool = False,
+        max_chars: int = None,
+    ) -> str:
+        """
+        Fetch a URL and return readable page content for browsing or scraping.
+        Prefer this when the user gives a specific URL and wants the page contents.
+
+        Args:
+            url: The full URL to fetch (http:// or https://).
+            mode: Content mode: text or html.
+            render_js: Render the page in Playwright before extracting content.
+            max_chars: Maximum characters to return (default uses web config).
+        """
+        st = _state(agent)
+        err = _validate_browse_url(url)
+        if err:
+            return err
+
+        mode = (mode or "text").strip().lower()
+        if mode not in {"text", "html"}:
+            return "Error: mode must be 'text' or 'html'."
+
+        if max_chars is None:
+            max_chars = st["settings"]["browse_max_chars"]
+        try:
+            max_chars = int(max_chars)
+        except (TypeError, ValueError):
+            return "Error: max_chars must be an integer."
+        if max_chars <= 0:
+            return "Error: max_chars must be greater than 0."
+
+        try:
+            if render_js:
+                result = await _browse_with_browser(
+                    agent,
+                    url,
+                    mode,
+                    max_chars=max_chars,
+                    timeout_ms=st["settings"]["timeout_ms"],
+                    ignored_tags=st["settings"]["ignore_tags"],
+                )
+            else:
+                result = await _browse_with_http(
+                    url,
+                    mode,
+                    max_chars=max_chars,
+                    max_bytes=st["settings"]["browse_max_bytes"],
+                    timeout_ms=st["settings"]["timeout_ms"],
+                    user_agent=st["settings"]["browse_user_agent"],
+                    ignored_tags=st["settings"]["ignore_tags"],
+                )
+            return json.dumps(result, indent=2)
         except Exception as e:
             return f"[error: {e}]"
 
@@ -549,7 +901,7 @@ def register(agent) -> None:
         else:
             return f"Error: unknown action '{action}'. Valid: {valid}"
 
-    # Defaults: web_search and navigate are always_on; the rest are deferred.
+    # Defaults: web_search, browse_url and navigate are always_on; the rest are deferred.
     # Can be overridden per-tool via config: web.tools.<tool_name>: always_on|deferred|disabled
     try:
         from modules.web import EXTENSION_META as _META
@@ -558,12 +910,13 @@ def register(agent) -> None:
         _tools_cfg = {}
     # Also allow runtime config.yaml override under web.tools:
     _runtime_tools_cfg: dict = {}
-    if hasattr(agent.config, "extra") and isinstance(agent.config.extra, dict):
-        _runtime_tools_cfg = agent.config.extra.get("web", {}).get("tools", {})
+    if runtime_web_cfg:
+        _runtime_tools_cfg = runtime_web_cfg.get("tools", {})
     _tools_cfg = {**_tools_cfg, **_runtime_tools_cfg}
 
     _WEB_DEFAULTS: dict[str, bool] = {
         "web_search":    True,
+        "browse_url":    True,
         "navigate":      True,
         "http_request":  False,
         "click":         False,
@@ -577,6 +930,7 @@ def register(agent) -> None:
 
     for fn in (
         web_search,
+        browse_url,
         http_request,
         navigate,
         click,

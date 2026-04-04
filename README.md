@@ -249,6 +249,7 @@ The following tools are available to the agent out of the box (if the correspond
 | `grep` | Search file contents with regex (ripgrep with Python fallback) |
 | `glob_search` | Find files by name pattern, sorted by modification time |
 | `web_search` | Search the web via DuckDuckGo |
+| `browse_url` | Fetch and scrape a specific URL into readable text or raw HTML |
 | `memory_search` | Search the semantic memory index |
 | `use_skill` | Load a skill by name |
 
