@@ -159,13 +159,14 @@ def register(agent) -> None:
 
         return f"[{action} {p} ({len(content)} chars)]"
 
-    def str_replace(path: str, old_str: str, new_str: str = "") -> str:
-        """Replace a unique string in an existing file. old_str must appear exactly once.
+    def str_replace(path: str, old_str: str, new_str: str = "", replace_all: bool = False) -> str:
+        """Replace a string in an existing file. By default old_str must appear exactly once.
 
         Args:
             path: Path to the file.
-            old_str: Exact string to replace. Must be unique in the file.
+            old_str: Exact string to replace. Must be unique unless replace_all is true.
             new_str: Replacement string. Leave empty to delete old_str.
+            replace_all: If true, replace every occurrence instead of requiring uniqueness.
         """
         p = resolve(path)
         if not p.exists():
@@ -174,8 +175,11 @@ def register(agent) -> None:
         count = original.count(old_str)
         if count == 0:
             return f"[error: old_str not found in {p}]"
-        if count > 1:
-            return f"[error: old_str appears {count} times — add more context to make it unique]"
+        if count > 1 and not replace_all:
+            return f"[error: old_str appears {count} times — add more context to make it unique, or set replace_all=true]"
+        if replace_all:
+            p.write_text(original.replace(old_str, new_str), encoding="utf-8")
+            return f"[replaced {count} occurrences in {p}]"
         p.write_text(original.replace(old_str, new_str, 1), encoding="utf-8")
         return f"[replaced 1 occurrence in {p}]"
 
