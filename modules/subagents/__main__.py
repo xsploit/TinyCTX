@@ -2,17 +2,7 @@ from __future__ import annotations
 
 import json
 
-from subagents import spawn_subagent, wait_for_subagent
-
-
-def _subagent_prompt(_ctx) -> str:
-    return (
-        "<subagents>\n"
-        "- Use spawn_agent for bounded side tasks that can run independently on a child branch.\n"
-        "- Use wait_agent(task_id=...) when you need the spawned subagent's final result.\n"
-        "- Do not spawn subagents for trivial work or when you can finish faster in the current turn.\n"
-        "</subagents>"
-    )
+from modules.subagents.subagents import spawn_subagent, wait_for_subagent
 
 
 def register(agent) -> None:
@@ -75,9 +65,3 @@ def register(agent) -> None:
 
     agent.tool_handler.register_tool(spawn_agent, always_on=True)
     agent.tool_handler.register_tool(wait_agent, always_on=True)
-    agent.context.register_prompt(
-        "subagents",
-        _subagent_prompt,
-        role="system",
-        priority=int(cfg.get("prompt_priority", 13)),
-    )

@@ -68,52 +68,13 @@ from config import Config, ModelConfig
 from ai import LLM, TextDelta, ThinkingDelta, ToolCallAssembled, LLMError
 from utils.tool_handler import ToolCallHandler
 from utils.attachments import build_content_blocks
+from utils.commands import CommandRegistry
 from db import ConversationDB
-from compact import (
-    COMPACT_SYSTEM_PROMPT,
-    COMPACT_USER_PROMPT,
-    build_compaction_plan,
-    format_summary,
-    should_compact,
-)
 
 logger = logging.getLogger(__name__)
 
 MODULES_DIR = Path("modules")
 _EXIT_ERROR_RE = re.compile(r"(^|\n)\[exit \d+\](?=\n|$)")
-
-
-def _tool_cache_key(call: ToolCall) -> str:
-    return call.tool_name + "::" + json.dumps(call.args, sort_keys=True, ensure_ascii=False)
-
-
-def _summarize_cached_tool_call(call: ToolCall, *, max_chars: int = 160) -> str:
-    if not call.args:
-        return f"{call.tool_name}()"
-    parts = [
-        f"{key}={json.dumps(value, ensure_ascii=False)}"
-        for key, value in sorted(call.args.items())
-    ]
-    summary = f"{call.tool_name}(" + ", ".join(parts) + ")"
-    summary = summary.replace("\n", " ")
-    if len(summary) > max_chars:
-        return summary[: max_chars - 1] + "…"
-    return summary
-
-
-def _cached_tool_result_notice(call: ToolCall, *, is_error: bool) -> str:
-    if is_error:
-        return (
-            "[error: cached exact same tool call reused earlier error from this turn: "
-            + _summarize_cached_tool_call(call)
-            + " — refer to the previous tool result instead of calling it again]"
-        )
-    return (
-        "[cached exact same tool call reused earlier result from this turn: "
-        + _summarize_cached_tool_call(call)
-        + " — refer to the previous tool result instead of calling it again]"
-    )
-
 
 def _looks_like_failed_tool_output(output: str) -> bool:
     lowered = (output or "").lstrip().lower()
@@ -168,6 +129,7 @@ class AgentLoop:
             image_tokens_per_block=primary_mc.tokens_per_image if primary_mc else 280,
         )
         self.tool_handler  = ToolCallHandler()
+        self.commands      = CommandRegistry()  # replaced by Lane with the shared router registry
         self._turn_count   = 0
         self.gateway       = None  # set by Lane after construction
 
@@ -179,10 +141,7 @@ class AgentLoop:
         self.context.set_cursor_callback(self._on_context_tail_advance)
 
         # Background hooks: called after AgentTextFinal with (tail_node_id, config).
-        # Each hook is responsible for spawning its own detached task if needed.
         self._background_hooks: list[Callable[[str, Config], Awaitable[None]]] = []
-
-        self._pending_background_branches: list[str] = []
 
         self._models: dict[str, LLM] = {
             name: _build_llm(mc)
@@ -191,7 +150,13 @@ class AgentLoop:
         }
 
         self.tool_handler.register_tool(self.tool_handler.tools_search, always_on=True)
-        self._load_modules()
+        # NOTE: _load_modules() is NOT called here. Lane.__post_init__ wires
+        # self.commands = router.commands first, then calls load_modules() so
+        # modules register their commands into the shared registry.
+        # Exception: subagent loops (background branches) have no Lane and
+        # don't need commands — they load modules immediately.
+        if is_subagent:
+            self.load_modules()
 
     # ------------------------------------------------------------------
     # DB
@@ -231,28 +196,7 @@ class AgentLoop:
     def register_background_hook(
         self, fn: Callable[[str, Config], Awaitable[None]]
     ) -> None:
-        """
-        Register an async hook to be called after each interactive turn
-        completes (after AgentTextFinal is yielded).
-
-        fn(tail_node_id: str, config: Config) -> Awaitable[None]
-
-        The hook receives the tail node_id at the moment the turn finished
-        and the agent's config. It is responsible for spawning its own
-        detached asyncio.create_task() if it needs to run in the background
-        without blocking. Hooks are called sequentially in registration order;
-        exceptions are caught and logged.
-
-        Typical usage (memory module):
-            def register(agent):
-                async def _memory_hook(tail_node_id, config):
-                    opening = agent._db.add_node(
-                        parent_id=tail_node_id, role="user",
-                        content="Consolidate memory from this conversation.",
-                    )
-                    asyncio.create_task(_run_background(opening.id, config))
-                agent.register_background_hook(_memory_hook)
-        """
+        """Register an async hook called after each turn with (tail_node_id, config)."""
         self._background_hooks.append(fn)
 
     async def _fire_background_hooks(self, tail_node_id: str) -> None:
@@ -267,7 +211,7 @@ class AgentLoop:
     # Module loader
     # ------------------------------------------------------------------
 
-    def _load_modules(self) -> None:
+    def load_modules(self) -> None:
         if not MODULES_DIR.exists():
             return
         for entry in sorted(MODULES_DIR.iterdir()):
@@ -291,98 +235,6 @@ class AgentLoop:
                 logger.info("Loaded module '%s'", entry.name)
             except Exception:
                 logger.exception("Failed to load module '%s'", entry.name)
-
-    async def _maybe_compact_context(self) -> bool:
-        pretrim_tokens = int(self.context.state.get("tokens_used_pre_trim", 0) or 0)
-        token_limit = int(self.config.context or 0)
-        if not should_compact(pretrim_tokens, token_limit):
-            return False
-
-        plan = build_compaction_plan(self.context.dialogue)
-        if plan is None:
-            return False
-
-        summary = await self._generate_compact_summary(plan.to_summarize)
-        if not summary:
-            logger.warning(
-                "[cursor=%s] compaction skipped — summary generation failed",
-                self._tail_node_id,
-            )
-            return False
-
-        active = self.context.compact(
-            format_summary(summary),
-            preserved_tail=plan.preserved_tail,
-            metadata={
-                "entries_summarized": len(plan.to_summarize),
-                "summarized_units": plan.summarized_units,
-            },
-        )
-        logger.info(
-            "[cursor=%s] compacted %d entry(s) into summary + %d preserved entry(s)",
-            self._tail_node_id,
-            len(plan.to_summarize),
-            len(active) - 1,
-        )
-        return True
-
-    async def _generate_compact_summary(self, entries: list[HistoryEntry]) -> str | None:
-        summary_messages = (
-            [{"role": "system", "content": COMPACT_SYSTEM_PROMPT}]
-            + [self.context._render(entry) for entry in entries]
-            + [{"role": "user", "content": COMPACT_USER_PROMPT}]
-        )
-
-        model_chain = [self.config.llm.primary] + list(self.config.llm.fallback)
-        for model_name in model_chain:
-            llm = self._models[model_name]
-            text_chunks: list[str] = []
-            error: str | None = None
-            last_http_status: int | None = None
-
-            async for llm_event in llm.stream(summary_messages, tools=None):
-                if isinstance(llm_event, TextDelta):
-                    text_chunks.append(llm_event.text)
-                elif isinstance(llm_event, ToolCallAssembled):
-                    error = "compaction summary unexpectedly returned tool calls"
-                    break
-                elif isinstance(llm_event, LLMError):
-                    error = llm_event.message
-                    if llm_event.message.startswith("HTTP "):
-                        try:
-                            last_http_status = int(llm_event.message.split()[1].rstrip(":"))
-                        except (IndexError, ValueError):
-                            pass
-                    break
-
-            if not error:
-                summary = "".join(text_chunks).strip()
-                if summary:
-                    return summary
-                error = "empty compaction summary"
-
-            fo = self.config.llm.fallback_on
-            should_fallback = fo.any_error or (
-                last_http_status is not None and last_http_status in fo.http_codes
-            )
-            if should_fallback and model_name != model_chain[-1]:
-                logger.warning(
-                    "[cursor=%s] compaction model '%s' failed (%s) — trying fallback",
-                    self._tail_node_id,
-                    model_name,
-                    error,
-                )
-                continue
-
-            logger.warning(
-                "[cursor=%s] compaction summary failed on model '%s': %s",
-                self._tail_node_id,
-                model_name,
-                error,
-            )
-            break
-
-        return None
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -441,43 +293,29 @@ class AgentLoop:
         max_cycles       = self.config.max_tool_cycles
         final_text       = ""
         streaming_active = False
-        tool_result_cache: dict[str, ToolResult] = {}
 
         for cycle in range(max_cycles):
-            compacted_this_cycle = False
-            while True:
-                # Abort check between cycles
-                if abort_event and abort_event.is_set():
-                    logger.info("[%s] aborted before cycle %d", self._tail_node_id, cycle)
-                    yield AgentError(message="[generation aborted]", **ev)
-                    return
+            # Abort check between cycles
+            if abort_event and abort_event.is_set():
+                logger.info("[%s] aborted before cycle %d", self._tail_node_id, cycle)
+                yield AgentError(message="[generation aborted]", **ev)
+                return
 
-                # Stage 2: Context Assembly
-                await self.context.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
-                tools    = self.tool_handler.get_tool_definitions() or None
-                messages = self.context.assemble(tools=tools)
+            # Stage 2: Context Assembly
+            await self.context.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
+            tools    = self.tool_handler.get_tool_definitions() or None
+            messages = self.context.assemble(tools=tools)
 
-                # Token budget telemetry
-                tokens_used = int(self.context.state.get("tokens_used_pre_trim", 0) or 0)
-                active_tokens = int(self.context.state.get("tokens_used", 0) or 0)
-                token_limit = self.config.context
-                token_pct   = tokens_used / token_limit if token_limit else 0
-                if token_pct >= 0.95:
-                    logger.warning(
-                        "[cursor=%s] context at %.0f%% of token budget (%d/%d, active=%d) — consider compaction",
-                        self._tail_node_id, token_pct * 100, tokens_used, token_limit, active_tokens,
-                    )
-                elif token_pct >= 0.80:
-                    logger.info(
-                        "[cursor=%s] context at %.0f%% of token budget (%d/%d, active=%d)",
-                        self._tail_node_id, token_pct * 100, tokens_used, token_limit, active_tokens,
-                    )
-
-                if not compacted_this_cycle and await self._maybe_compact_context():
-                    compacted_this_cycle = True
-                    continue
-
-                break
+            # Token budget telemetry
+            tokens_used = int(self.context.state.get("tokens_used_pre_trim", 0) or 0)
+            active_tokens = int(self.context.state.get("tokens_used", 0) or 0)
+            token_limit = self.config.context
+            token_pct   = tokens_used / token_limit if token_limit else 0
+            if token_pct >= 0.80:
+                logger.info(
+                    "[cursor=%s] context at %.0f%% of token budget (%d/%d, active=%d)",
+                    self._tail_node_id, token_pct * 100, tokens_used, token_limit, active_tokens,
+                )
 
             # Stage 3: Inference — walk primary → fallback chain
             text_chunks:      list[str]      = []
@@ -569,7 +407,7 @@ class AgentLoop:
             logger.debug("[%s] cycle %d — %d tool call(s)", self._tail_node_id, cycle, len(tool_calls))
             for tc in tool_calls:
                 yield AgentToolCall(call_id=tc.call_id, tool_name=tc.tool_name, args=tc.args, **ev)
-                result = await self._execute_tool(tc, tool_result_cache=tool_result_cache)
+                result = await self._execute_tool(tc)
                 self.context.add(HistoryEntry.tool_result(result))
                 # For image results, inject a follow-up user message with the image_url
                 # block.  OpenAI-compat servers don't support list content in tool result
@@ -596,18 +434,13 @@ class AgentLoop:
 
         yield AgentTextFinal(text=final_text if not streaming_active else "", **ev)
 
-        # Phase 3: fire any background branches registered this turn.
-        for branch_node_id in self._pending_background_branches:
-            asyncio.ensure_future(self._run_background(branch_node_id))
-        self._pending_background_branches.clear()
-
-        # Phase 3: fire background hooks after the turn completes.
-        # Skipped for synthetic turns — they are already background work.
+        # Fire background hooks after the turn completes.
+        # Skipped for synthetic turns — they are themselves background work.
         if not is_synthetic and self._background_hooks:
             await self._fire_background_hooks(self._tail_node_id)
 
     # ------------------------------------------------------------------
-    # Background branch runner (Phase 3)
+    # Background branch runner
     # ------------------------------------------------------------------
 
     async def _run_background(self, tail_node_id: str) -> None:
@@ -627,10 +460,13 @@ class AgentLoop:
 
     def queue_background_branch(self, tail_node_id: str) -> None:
         """
-        Schedule a background branch to be fired after the current turn yields
-        AgentTextFinal. Called by modules (e.g. memory) during a hook.
+        Deprecated — call asyncio.create_task(_run_background(node_id, config)) directly.
+        Kept temporarily so old call sites fail loudly rather than silently.
         """
-        self._pending_background_branches.append(tail_node_id)
+        raise RuntimeError(
+            "queue_background_branch() is removed. "
+            "Use asyncio.create_task(_run_background(node_id, agent.config)) directly."
+        )
 
     # ------------------------------------------------------------------
     # Tool execution
@@ -638,26 +474,9 @@ class AgentLoop:
 
     async def _execute_tool(
         self,
-        call: ToolCall,
-        *,
-        tool_result_cache: dict[str, ToolResult] | None = None,
+        call: ToolCall
     ) -> ToolResult:
         cache_key = None
-        if tool_result_cache is not None:
-            cache_key = _tool_cache_key(call)
-            cached = tool_result_cache.get(cache_key)
-            if cached is not None:
-                logger.info(
-                    "[cursor=%s] reusing cached tool result for %s",
-                    self._tail_node_id, call.tool_name,
-                )
-                return ToolResult(
-                    call_id=call.call_id,
-                    tool_name=call.tool_name,
-                    output=_cached_tool_result_notice(call, is_error=cached.is_error),
-                    is_error=cached.is_error,
-                    is_image=False,
-                )
 
         proxy = {
             "function": {"name": call.tool_name, "arguments": call.args},
@@ -690,8 +509,6 @@ class AgentLoop:
                     image_mime=mime,
                     image_b64=b64data,
                 )
-                if cache_key is not None and tool_result_cache is not None:
-                    tool_result_cache[cache_key] = tool_result
                 return tool_result
             else:
                 # Model doesn't support vision — return a friendly stub.
@@ -706,8 +523,6 @@ class AgentLoop:
             output=raw_output,
             is_error=is_error,
         )
-        if cache_key is not None and tool_result_cache is not None:
-            tool_result_cache[cache_key] = tool_result
         return tool_result
 
     # ------------------------------------------------------------------
