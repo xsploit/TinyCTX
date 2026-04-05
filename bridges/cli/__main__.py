@@ -64,6 +64,7 @@ _TINYCTX_BANNER = (
 _DIMMED_LINE_PREFIXES = ("tool ", "ok ", "err ", "[tool ", "[ok ", "[err ", "thinking…")
 _PASTED_TEXT_REF = re.compile(r"\[Pasted text #(\d+)(?:[^\]]*)\]")
 _SHELL_EXIT_ERROR_RE_END = re.compile(r"(?:^|\n)\[exit \d+\]\s*\Z")
+_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 _MD_HEADING_RE = re.compile(r"^(\s{0,3})(#{1,6})(\s+.*)$")
 _MD_LIST_RE = re.compile(r"^(\s*)([-*+]|\d+\.)(\s+.*)$")
 _MD_QUOTE_RE = re.compile(r"^(\s*)(>+)(\s*.*)$")
@@ -359,6 +360,7 @@ class CLIBridge:
         self._current_stream = ""
         self._thinking = False
         self._status_text = "ready"
+        self._active_tool_name: str | None = None
         self._send_task: asyncio.Task | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._last_output_width: int | None = None
@@ -1236,10 +1238,39 @@ class CLIBridge:
     def _footer_text(self) -> str:
         width = self._current_width()
         mouse_mode = "mouse" if self._bool_option("mouse_capture", True) else "selection"
-        return self._fit(f"working {self._settings_status_text()} | {mouse_mode}", width)
+        activity = self._footer_activity_text()
+        if self._spinner_active():
+            activity = f"{self._spinner_frame()} {activity}"
+        return self._fit(f"working {activity} | {mouse_mode}", width)
 
     def _set_status(self, text: str) -> None:
         self._status_text = text.strip() or "ready"
+
+    def _spinner_active(self) -> bool:
+        if self._settings_open():
+            return False
+        return (
+            self._generation_running()
+            or self._thinking
+            or bool(self._current_stream.strip())
+            or self._status_text in {"busy", "aborting", "waiting for response", "replying"}
+        )
+
+    def _spinner_frame(self) -> str:
+        idx = int(time.monotonic() / 0.12) % len(_SPINNER_FRAMES)
+        return _SPINNER_FRAMES[idx]
+
+    def _footer_activity_text(self) -> str:
+        status = self._settings_status_text()
+        if self._settings_open():
+            return status
+        if self._current_stream.strip():
+            return "replying"
+        if status == "waiting for response":
+            return "waiting"
+        if status == "thinking" and self._active_tool_name:
+            return f"thinking {self._active_tool_name}"
+        return status
 
     def _render_user_block(self, text: str) -> str:
         lines = [line.rstrip() for line in text.strip().splitlines()]
@@ -1961,6 +1992,7 @@ class CLIBridge:
             self._refresh_output(log_level)
         elif isinstance(event, AgentTextChunk):
             self._thinking = False
+            self._active_tool_name = None
             self._set_status("replying")
             self._current_stream += event.text
             self._refresh_output(log_level)
@@ -1969,11 +2001,13 @@ class CLIBridge:
             if self._current_stream.strip():
                 self._append_block(self._current_stream)
                 self._current_stream = ""
+            self._active_tool_name = event.tool_name
             self._set_status(event.tool_name)
             self._record_tool_call(event.call_id, event.tool_name, event.args)
             self._append_block(self._tool_call_line(event.tool_name, event.args))
             self._refresh_output(log_level)
         elif isinstance(event, AgentToolResult):
+            self._active_tool_name = event.tool_name
             self._set_status("thinking")
             self._record_tool_result(event.call_id, event.tool_name, event.output, event.is_error)
             self._append_block(
@@ -1984,6 +2018,7 @@ class CLIBridge:
             final_text = (event.text or self._current_stream).strip()
             self._thinking = False
             self._current_stream = ""
+            self._active_tool_name = None
             if final_text:
                 self._append_block(final_text)
             self._set_status("ready")
@@ -1993,6 +2028,7 @@ class CLIBridge:
         elif isinstance(event, AgentError):
             self._thinking = False
             self._current_stream = ""
+            self._active_tool_name = None
             if event.message == "[generation aborted]":
                 self._append_block("[generation aborted]")
             else:
@@ -2105,6 +2141,7 @@ class CLIBridge:
         expanded_text = self._expand_pasted_text_refs(display_text, pasted_texts)
 
         self._set_status("waiting for response")
+        self._active_tool_name = None
         self._append_block(self._render_user_block(display_text))
         self._refresh_output(self._resolve_runtime_log_level())
 
@@ -2373,6 +2410,7 @@ class CLIBridge:
             enable_page_navigation_bindings=True,
             style=self._style(),
             before_render=self._before_render,
+            refresh_interval=0.12,
         )
 
     async def run(self) -> None:

@@ -130,7 +130,21 @@ def test_cli_output_wraps_while_input_stays_single_line(tmp_path):
     assert bridge._output_area.control.focus_on_click() is True
     assert bridge._input_area.buffer.multiline() is False
     assert app_cls.called
+    assert app_cls.call_args.kwargs["refresh_interval"] == 0.12
     assert app is not None
+
+
+def test_cli_footer_shows_spinner_during_active_generation(tmp_path):
+    cfg = _make_config(tmp_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+    bridge._send_task = MagicMock()
+    bridge._send_task.done.return_value = False
+    bridge._set_status("web_search")
+
+    with patch("bridges.cli.__main__.time.monotonic", return_value=0.0):
+        footer = bridge._footer_text()
+
+    assert footer == "working ⠋ web_search | mouse"
 
 
 def test_cli_mouse_capture_defaults_on(tmp_path):
@@ -821,7 +835,9 @@ def test_submit_from_buffer_reports_running_generation(tmp_path):
 
     assert bridge._input_area.text == "hello"
     assert bridge._transcript_blocks[-1] == "[generation already running — press Esc to abort or wait for the current reply]"
-    assert bridge._footer_text() == "working busy | mouse"
+    assert "working " in bridge._footer_text()
+    assert "busy" in bridge._footer_text()
+    assert "| mouse" in bridge._footer_text()
 
 
 def test_abort_active_generation_calls_gateway(tmp_path):
@@ -834,7 +850,9 @@ def test_abort_active_generation_calls_gateway(tmp_path):
 
     assert bridge._abort_active_generation() is True
     gateway.abort_generation.assert_called_once_with("cursor-1")
-    assert bridge._footer_text() == "working aborting | mouse"
+    assert "working " in bridge._footer_text()
+    assert "aborting" in bridge._footer_text()
+    assert "| mouse" in bridge._footer_text()
 
 
 def test_copy_primary_text_prefers_selected_output(tmp_path):
@@ -1086,7 +1104,7 @@ def test_tool_result_keeps_status_as_thinking(tmp_path):
     asyncio.run(bridge.handle_event(event))
 
     assert bridge._transcript_blocks[-1] == "[ok shell C:\\repo]"
-    assert bridge._footer_text() == "working thinking | mouse"
+    assert bridge._footer_text() == "working thinking shell | mouse"
 
 
 def test_debug_alias_routes_to_heartbeat(tmp_path):
