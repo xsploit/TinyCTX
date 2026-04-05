@@ -15,13 +15,14 @@ class ModelConfig:
     One named model entry under models:.
 
     kind controls how the model is used:
-      "chat"      — standard /v1/chat/completions  (default)
-      "embedding" — /v1/embeddings, used by modules like memory/rag.
-                    max_tokens and temperature are ignored for embeddings.
+      "chat"       — standard /v1/chat/completions  (default)
+      "responses"  — OpenAI-style /v1/responses
+      "embedding"  — /v1/embeddings, used by modules like memory/rag.
+                     max_tokens and temperature are ignored for embeddings.
     """
     model:       str
     base_url:    str
-    kind:        str   = "chat"       # "chat" | "embedding"
+    kind:        str   = "chat"       # "chat" | "responses" | "embedding"
     api_key_env: str   = "ANTHROPIC_API_KEY"
     max_tokens:       int        = 2048
     temperature:      float      = 0.7
@@ -31,6 +32,7 @@ class ModelConfig:
     llama_cpp_cache_prompt: bool        = False  # Send cache_prompt=true to llama.cpp-compatible servers
     llama_cpp_sticky_slots: bool        = False  # Reuse the returned slot id across turns
     llama_cpp_slot_id:      int | None  = None   # Optional fixed slot id override for llama.cpp servers
+    responses_previous_response_id: bool | None = None  # Override /v1/responses chaining (None = auto)
     vision:             bool        = False  # Back-compat alias for multimodal chat models
     tokens_per_image:   int | None  = None   # Flat token cost per image_url block (None = vision disabled)
 
@@ -61,6 +63,10 @@ class ModelConfig:
     @property
     def is_embedding(self) -> bool:
         return self.kind.lower() == "embedding"
+
+    @property
+    def uses_responses(self) -> bool:
+        return self.kind.lower() == "responses"
 
 
 @dataclass
@@ -254,8 +260,8 @@ def _parse_model(raw: dict) -> ModelConfig:
     if not raw.get("model"):
         raise ValueError("Model config missing required field: model")
     kind = raw.get("kind", "chat").lower()
-    if kind not in ("chat", "embedding"):
-        raise ValueError(f"Model kind must be 'chat' or 'embedding', got '{kind}'")
+    if kind not in ("chat", "responses", "embedding"):
+        raise ValueError(f"Model kind must be 'chat', 'responses', or 'embedding', got '{kind}'")
     tokens_per_image_raw = raw.get("tokens_per_image")
     if tokens_per_image_raw is not None:
         tokens_per_image = int(tokens_per_image_raw)
@@ -281,6 +287,10 @@ def _parse_model(raw: dict) -> ModelConfig:
         if llama_cpp_slot_id < 0:
             raise ValueError(f"llama_cpp_slot_id must be >= 0, got {llama_cpp_slot_id}")
 
+    responses_previous_response_id = raw.get("responses_previous_response_id")
+    if responses_previous_response_id is not None:
+        responses_previous_response_id = bool(responses_previous_response_id)
+
     vision = bool(raw.get("vision", False))
 
     return ModelConfig(
@@ -296,6 +306,7 @@ def _parse_model(raw: dict) -> ModelConfig:
         llama_cpp_cache_prompt=bool(raw.get("llama_cpp_cache_prompt", False)),
         llama_cpp_sticky_slots=bool(raw.get("llama_cpp_sticky_slots", False)),
         llama_cpp_slot_id=llama_cpp_slot_id,
+        responses_previous_response_id=responses_previous_response_id,
         vision=vision,
         tokens_per_image=tokens_per_image,
     )

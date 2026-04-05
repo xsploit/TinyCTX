@@ -78,11 +78,17 @@ class TestModelConfig:
         assert m.llama_cpp_cache_prompt is False
         assert m.llama_cpp_sticky_slots is False
         assert m.llama_cpp_slot_id is None
+        assert m.responses_previous_response_id is None
         assert m.is_embedding is False
 
     def test_embedding_kind(self):
         m = ModelConfig(model="nomic", base_url="http://localhost/v1", kind="embedding")
         assert m.is_embedding is True
+
+    def test_responses_kind(self):
+        m = ModelConfig(model="llama", base_url="http://localhost/v1", kind="responses")
+        assert m.is_embedding is False
+        assert m.uses_responses is True
 
     def test_api_key_na_returns_empty(self):
         m = ModelConfig(model="x", base_url="http://x", api_key_env="N/A")
@@ -111,6 +117,24 @@ class TestCompactionConfig:
     def test_invalid_trigger_pct_raises(self):
         with pytest.raises(ValueError, match="trigger_pct"):
             CompactionConfig(trigger_pct=0)
+
+
+class TestResponsesChainingConfig:
+    def test_model_can_force_responses_previous_response_id(self, tmp_path):
+        path = _write_config(tmp_path, """
+            models:
+              main:
+                base_url: http://localhost:8080/v1
+                model: qwen
+                kind: responses
+                api_key_env: N/A
+                llama_cpp_cache_prompt: true
+                responses_previous_response_id: true
+            llm:
+              primary: main
+        """)
+        cfg = load(path)
+        assert cfg.models["main"].responses_previous_response_id is True
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +334,20 @@ class TestLoadHappyPath:
         """)
         cfg = load(str(p))
         assert cfg.models["embed"].is_embedding is True
+
+    def test_responses_model_parsed(self, tmp_path):
+        p = _write_config(tmp_path, """
+            models:
+              main:
+                base_url: http://localhost/v1
+                model: llama3
+                api_key_env: N/A
+                kind: responses
+            llm:
+              primary: main
+        """)
+        cfg = load(str(p))
+        assert cfg.models["main"].uses_responses is True
 
     def test_fallback_chain_parsed(self, tmp_path):
         p = _write_config(tmp_path, """

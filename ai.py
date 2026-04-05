@@ -430,6 +430,7 @@ class LLM:
         llama_cpp_cache_prompt: bool = False,
         llama_cpp_sticky_slots: bool = False,
         llama_cpp_slot_id: int | None = None,
+        responses_previous_response_id: bool | None = None,
         kind: str = "chat",
     ) -> None:
         self.model = model
@@ -448,6 +449,7 @@ class LLM:
         self.llama_cpp_cache_prompt = llama_cpp_cache_prompt
         self.llama_cpp_sticky_slots = llama_cpp_sticky_slots
         self.llama_cpp_slot_id = llama_cpp_slot_id
+        self.responses_previous_response_id = responses_previous_response_id
         self._sticky_slot_id: int | None = None
         self._last_response_id: str | None = None
         self._last_chain_items: list[dict[str, Any]] | None = None
@@ -479,6 +481,8 @@ class LLM:
         llama.cpp-specific compatibility knob is enabled we fall back to
         sending the full input history on each request.
         """
+        if self.responses_previous_response_id is not None:
+            return self.responses_previous_response_id
         return not (
             self.llama_cpp_cache_prompt
             or self.llama_cpp_sticky_slots

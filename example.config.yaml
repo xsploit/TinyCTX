@@ -19,9 +19,10 @@ compaction:
 # models:
 #   Named model definitions. Add as many as you need.
 #
-#   kind: chat      (default) — /v1/chat/completions, used for inference
+#   kind: chat       (default) — /v1/chat/completions, used for inference
+#   kind: responses           — /v1/responses, used for stateful inference
 #   kind: embedding           — /v1/embeddings, used by the memory module
-#                               max_tokens and temperature are ignored
+#                                max_tokens and temperature are ignored
 #
 #   Embedding models are NOT eligible for llm: routing.
 #
@@ -49,11 +50,13 @@ models:
     base_url: http://localhost:11434/v1
     api_key_env: N/A          # local endpoints need no key
     model: qwen3:32b
+    # kind: responses         # enable for llama.cpp/OpenAI-style Responses backends
     max_tokens: 8192
     temperature: 0.6
     # If this points at a llama.cpp server instead of Ollama, enable:
     # llama_cpp_cache_prompt: true
     # llama_cpp_sticky_slots: true
+    # responses_previous_response_id: true   # force real /v1/responses chaining on direct llama.cpp
 
   embed:
     kind: embedding
@@ -64,7 +67,7 @@ models:
 # ---------------------------------------------------------------------------
 # llm:
 #   Which chat model to use and when to fall back.
-#   Only kind: chat models (or models with no kind) are valid here.
+#   Only non-embedding models are valid here (chat or responses).
 # ---------------------------------------------------------------------------
 llm:
   primary: smart

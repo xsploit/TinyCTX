@@ -233,6 +233,8 @@ def _build_llm(cfg: ModelConfig) -> LLM:
         llama_cpp_cache_prompt=getattr(cfg, "llama_cpp_cache_prompt", False),
         llama_cpp_sticky_slots=getattr(cfg, "llama_cpp_sticky_slots", False),
         llama_cpp_slot_id=getattr(cfg, "llama_cpp_slot_id", None),
+        responses_previous_response_id=getattr(cfg, "responses_previous_response_id", None),
+        kind="responses" if getattr(cfg, "uses_responses", False) else "chat",
     )
 
 
@@ -1056,4 +1058,6 @@ class AgentLoop:
         """
         self.context.clear()
         self._turn_count = 0
+        for llm in self._models.values():
+            llm.reset()
         logger.info("[cursor=%s] reset (in-memory only — tree intact)", self._tail_node_id)

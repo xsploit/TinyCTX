@@ -302,6 +302,65 @@ async def test_responses_mode_disables_previous_response_id_for_llama_cpp(monkey
 
 
 @pytest.mark.asyncio
+async def test_responses_mode_can_force_previous_response_id_for_llama_cpp(monkeypatch):
+    calls: list[dict] = []
+    responses = [
+        _FakeResponse([
+            "event: response.created\n",
+            'data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}\n',
+            "\n",
+            "event: response.output_text.delta\n",
+            'data: {"type":"response.output_text.delta","item_id":"msg_1","delta":"Hello"}\n',
+            "\n",
+            "event: response.completed\n",
+            'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Hello","annotations":[],"logprobs":[]}]}]}}\n',
+            "\n",
+            "data: [DONE]\n",
+            "\n",
+        ]),
+        _FakeResponse([
+            "event: response.created\n",
+            'data: {"type":"response.created","response":{"id":"resp_2","status":"in_progress"}}\n',
+            "\n",
+            "event: response.output_text.delta\n",
+            'data: {"type":"response.output_text.delta","item_id":"msg_2","delta":"Next"}\n',
+            "\n",
+            "event: response.completed\n",
+            'data: {"type":"response.completed","response":{"id":"resp_2","status":"completed","output":[{"id":"msg_2","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Next","annotations":[],"logprobs":[]}]}]}}\n',
+            "\n",
+            "data: [DONE]\n",
+            "\n",
+        ]),
+    ]
+    _patch_client_session(monkeypatch, calls, responses)
+
+    llm = LLM(
+        base_url="http://localhost:8080/v1",
+        api_key="",
+        model="test-model",
+        kind="responses",
+        llama_cpp_cache_prompt=True,
+        llama_cpp_sticky_slots=True,
+        responses_previous_response_id=True,
+    )
+
+    _ = [event async for event in llm.stream([{"role": "user", "content": "hello"}])]
+
+    second_messages = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "Hello"},
+        {"role": "user", "content": "follow up"},
+    ]
+    second_events = [event async for event in llm.stream(second_messages)]
+
+    assert [event.text for event in second_events if isinstance(event, TextDelta)] == ["Next"]
+    assert calls[1]["json"]["previous_response_id"] == "resp_1"
+    assert calls[1]["json"]["input"] == [
+        {"role": "user", "content": [{"type": "input_text", "text": "follow up"}]}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_responses_mode_assembles_tool_calls_from_stream(monkeypatch):
     calls: list[dict] = []
     responses = [
