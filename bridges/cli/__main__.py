@@ -77,6 +77,8 @@ _CLI_OPTION_DEFAULTS = {
     "compact_tools": True,
     "dim_tools": True,
     "mouse_capture": True,
+    "show_tool_panel": True,
+    "show_tool_transcript": False,
     "word_wrap": True,
     "quiet_startup": True,
 }
@@ -90,6 +92,12 @@ _SLASH_COMMANDS = (
     ("/mouse", "toggle mouse capture / selection mode"),
     ("/mouse off", "disable app mouse capture for terminal selection"),
     ("/mouse on", "enable app mouse capture for scrolling"),
+    ("/tools", "toggle the recent tool activity pane"),
+    ("/tools on", "show the recent tool activity pane"),
+    ("/tools off", "hide the recent tool activity pane"),
+    ("/tools inline", "toggle tool rows in the main chat"),
+    ("/tools inline on", "show tool rows in the main chat"),
+    ("/tools inline off", "hide tool rows from the main chat"),
     ("/debug", "fire a heartbeat tick now"),
     ("/help", "show available commands"),
     ("/reset", "start a new session"),
@@ -354,9 +362,12 @@ class CLIBridge:
         self._output_area: TextArea | None = None
         self._input_area: TextArea | None = None
         self._welcome_window: Window | None = None
+        self._tool_panel_control: FormattedTextControl | None = None
+        self._tool_panel_window: Window | None = None
         self._settings_control: FormattedTextControl | None = None
         self._settings_window: Window | None = None
         self._transcript_blocks: list[str] = []
+        self._tool_panel_lines: list[str] = []
         self._current_stream = ""
         self._thinking = False
         self._status_text = "ready"
@@ -580,6 +591,18 @@ class CLIBridge:
                     "default": True,
                 },
                 {
+                    "label": "Tool panel",
+                    "kind": "toggle",
+                    "option": "show_tool_panel",
+                    "default": True,
+                },
+                {
+                    "label": "Tool lines in chat",
+                    "kind": "toggle",
+                    "option": "show_tool_transcript",
+                    "default": False,
+                },
+                {
                     "label": "Word wrap",
                     "kind": "toggle",
                     "option": "word_wrap",
@@ -778,6 +801,39 @@ class CLIBridge:
         if len(rendered) > max_chars:
             return rendered[:max_chars] + "..."
         return rendered
+
+    def _show_tool_panel(self) -> bool:
+        return self._bool_option("show_tool_panel", True)
+
+    def _show_tool_transcript(self) -> bool:
+        return self._bool_option("show_tool_transcript", False)
+
+    def _tool_panel_visible(self) -> bool:
+        if self._settings_open() or not self._show_tool_panel():
+            return False
+        return bool(self._tool_panel_lines)
+
+    def _toggle_tool_panel(self, value: bool | None = None) -> bool:
+        current = self._show_tool_panel()
+        enabled = (not current) if value is None else bool(value)
+        if enabled != current:
+            self._apply_cli_option(
+                "show_tool_panel",
+                enabled,
+                notice=f"tool panel {'enabled' if enabled else 'disabled'}",
+            )
+        return enabled
+
+    def _toggle_tool_transcript(self, value: bool | None = None) -> bool:
+        current = self._show_tool_transcript()
+        enabled = (not current) if value is None else bool(value)
+        if enabled != current:
+            self._apply_cli_option(
+                "show_tool_transcript",
+                enabled,
+                notice=f"inline tool rows {'enabled' if enabled else 'disabled'}",
+            )
+        return enabled
 
     def _persist_cli_option(self, key: str, value) -> None:
         update_bridge_options("cli", {key: value}, path=self._config_source_path(), enabled=True)
@@ -1805,6 +1861,26 @@ class CLIBridge:
             return f"[{state} {tool_name} {preview}]"
         return f"[{state} {tool_name}]"
 
+    def _append_tool_panel_line(self, text: str) -> None:
+        line = text.strip()
+        if not line:
+            return
+        self._tool_panel_lines.append(line)
+        if len(self._tool_panel_lines) > 64:
+            self._tool_panel_lines = self._tool_panel_lines[-64:]
+
+    def _maybe_append_tool_block(self, text: str) -> None:
+        self._append_tool_panel_line(text)
+        if self._show_tool_transcript():
+            self._append_block(text)
+
+    def _tool_panel_text(self) -> str:
+        width = max(24, self._current_width() - 3)
+        lines = ["tools"]
+        for line in self._tool_panel_lines[-3:]:
+            lines.append(self._fit(line, width))
+        return "\n".join(lines)
+
     def _append_block(self, text: str) -> None:
         block = text.strip()
         if block:
@@ -1831,6 +1907,7 @@ class CLIBridge:
         tool_names: dict[str, str] = {}
         self._tool_records = []
         self._tool_records_by_call_id = {}
+        self._tool_panel_lines = []
         for entry in entries:
             if entry.role == ROLE_USER:
                 text = self._content_to_text(entry.content)
@@ -1851,7 +1928,10 @@ class CLIBridge:
                     if isinstance(call_id, str) and call_id:
                         tool_names[call_id] = tool_name
                         self._record_tool_call(call_id, tool_name, arguments)
-                    blocks.append(self._tool_call_line(tool_name, arguments))
+                    tool_line = self._tool_call_line(tool_name, arguments)
+                    self._append_tool_panel_line(tool_line)
+                    if self._show_tool_transcript():
+                        blocks.append(tool_line)
                 continue
 
             if entry.role == ROLE_TOOL:
@@ -1865,13 +1945,14 @@ class CLIBridge:
                             output,
                             self._looks_like_error_output(tool_name, output),
                         )
-                    blocks.append(
-                            self._tool_result_line(
-                                tool_name,
-                                output,
-                                self._looks_like_error_output(tool_name, output),
-                            )
-                        )
+                    tool_line = self._tool_result_line(
+                        tool_name,
+                        output,
+                        self._looks_like_error_output(tool_name, output),
+                    )
+                    self._append_tool_panel_line(tool_line)
+                    if self._show_tool_transcript():
+                        blocks.append(tool_line)
 
         self._transcript_blocks = blocks
         return len(blocks)
@@ -2004,13 +2085,13 @@ class CLIBridge:
             self._active_tool_name = event.tool_name
             self._set_status(event.tool_name)
             self._record_tool_call(event.call_id, event.tool_name, event.args)
-            self._append_block(self._tool_call_line(event.tool_name, event.args))
+            self._maybe_append_tool_block(self._tool_call_line(event.tool_name, event.args))
             self._refresh_output(log_level)
         elif isinstance(event, AgentToolResult):
             self._active_tool_name = event.tool_name
             self._set_status("thinking")
             self._record_tool_result(event.call_id, event.tool_name, event.output, event.is_error)
-            self._append_block(
+            self._maybe_append_tool_block(
                 self._tool_result_line(event.tool_name, event.output, event.is_error)
             )
             self._refresh_output(log_level)
@@ -2044,6 +2125,25 @@ class CLIBridge:
             copied, message = self._copy_named_target(target)
             self._set_status("ready")
             self._append_block(message)
+            self._refresh_output(self._resolve_runtime_log_level())
+            return
+        if text.lower() in {"/tools", "/tools on", "/tools off", "/tools inline", "/tools inline on", "/tools inline off"}:
+            lowered = text.lower()
+            if lowered.startswith("/tools inline"):
+                forced = None
+                if lowered.endswith(" on"):
+                    forced = True
+                elif lowered.endswith(" off"):
+                    forced = False
+                self._toggle_tool_transcript(forced)
+            else:
+                forced = None
+                if lowered.endswith(" on"):
+                    forced = True
+                elif lowered.endswith(" off"):
+                    forced = False
+                self._toggle_tool_panel(forced)
+            self._set_status("ready")
             self._refresh_output(self._resolve_runtime_log_level())
             return
         if text.lower() in {"/mouse", "/mouse on", "/mouse off"}:
@@ -2080,6 +2180,7 @@ class CLIBridge:
             self._transcript_blocks.clear()
             self._tool_records.clear()
             self._tool_records_by_call_id.clear()
+            self._tool_panel_lines.clear()
             self._current_stream = ""
             self._thinking = False
             self._set_status("ready")
@@ -2114,6 +2215,8 @@ class CLIBridge:
                 "  /copy last-error   copy the most recent tool error\n"
                 "  /copy errors       copy the most recent tool error\n"
                 "  /mouse       toggle mouse capture / selection mode\n"
+                "  /tools       toggle the recent tool activity pane\n"
+                "  /tools inline toggle tool rows in the main chat\n"
                 "  /reset       start a new session\n"
                 "  /resume      keep using the saved session\n"
                 "  /settings    open CLI settings\n"
@@ -2142,6 +2245,7 @@ class CLIBridge:
 
         self._set_status("waiting for response")
         self._active_tool_name = None
+        self._tool_panel_lines.clear()
         self._append_block(self._render_user_block(display_text))
         self._refresh_output(self._resolve_runtime_log_level())
 
@@ -2197,6 +2301,7 @@ class CLIBridge:
             "title": "bold #d0d0d0 bg:#000000",
             "banner": "bold #ff3b30 bg:#000000",
             "output-area": "#d7d7d7 bg:#000000",
+            "tool-panel": "#9a9a9a bg:#050505",
             "input-area": "#f5f5f5 bg:#000000",
             "footer": "#b0b0b0 bg:#000000",
             "menu.header": "bold #d0d0d0 bg:#000000",
@@ -2254,6 +2359,18 @@ class CLIBridge:
             always_hide_cursor=True,
             wrap_lines=False,
             style="class:output-area",
+        )
+        self._tool_panel_control = FormattedTextControl(
+            self._tool_panel_text,
+            focusable=False,
+            show_cursor=False,
+        )
+        self._tool_panel_window = Window(
+            content=self._tool_panel_control,
+            always_hide_cursor=True,
+            wrap_lines=False,
+            height=4,
+            style="class:tool-panel",
         )
         self._welcome_window = Window(
             content=FormattedTextControl(self._welcome_fragments),
@@ -2366,6 +2483,7 @@ class CLIBridge:
                 event.app.exit(result=None)
 
         showing_transcript = Condition(self._has_transcript)
+        showing_tool_panel = Condition(self._tool_panel_visible)
         root = HSplit([
             Window(
                 content=FormattedTextControl(self._titlebar_text),
@@ -2383,6 +2501,14 @@ class CLIBridge:
             ConditionalContainer(
                 self._output_area,
                 filter=~showing_settings & showing_transcript,
+            ),
+            ConditionalContainer(
+                Window(height=1, char="─", style="class:rule"),
+                filter=~showing_settings & showing_tool_panel,
+            ),
+            ConditionalContainer(
+                self._tool_panel_window,
+                filter=~showing_settings & showing_tool_panel,
             ),
             ConditionalContainer(
                 Window(height=1, char="─", style="class:rule"),

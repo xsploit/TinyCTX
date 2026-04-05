@@ -157,6 +157,13 @@ def test_cli_mouse_capture_defaults_on(tmp_path):
     assert mouse_support() is True
 
 
+def test_cli_defaults_hide_tool_rows_from_main_transcript(tmp_path):
+    cfg = _make_config(tmp_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+    assert bridge._show_tool_panel() is True
+    assert bridge._show_tool_transcript() is False
+
+
 def test_cli_page_scroll_moves_transcript_window(tmp_path):
     cfg = _make_config(tmp_path)
     bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
@@ -544,6 +551,21 @@ def test_mouse_command_updates_footer_without_transcript_spam(tmp_path):
     asyncio.run(bridge._handle_command("/mouse off"))
     assert bridge._transcript_blocks == []
     assert "working ready | selection" in bridge._footer_text()
+
+
+def test_tools_command_toggles_tool_panel_without_transcript_spam(tmp_path):
+    cfg = _make_config(tmp_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+
+    assert bridge._show_tool_panel() is True
+
+    asyncio.run(bridge._handle_command("/tools off"))
+    assert bridge._transcript_blocks == []
+    assert bridge._show_tool_panel() is False
+
+    asyncio.run(bridge._handle_command("/tools on"))
+    assert bridge._transcript_blocks == []
+    assert bridge._show_tool_panel() is True
 
 
 def test_settings_appearance_menu_shows_mouse_capture(tmp_path):
@@ -1103,8 +1125,30 @@ def test_tool_result_keeps_status_as_thinking(tmp_path):
 
     asyncio.run(bridge.handle_event(event))
 
-    assert bridge._transcript_blocks[-1] == "[ok shell C:\\repo]"
+    assert bridge._transcript_blocks == []
+    assert bridge._tool_panel_lines[-1] == "[ok shell C:\\repo]"
     assert bridge._footer_text() == "working thinking shell | mouse"
+
+
+def test_tool_rows_can_still_render_inline_when_enabled(tmp_path):
+    cfg = _make_config(tmp_path, cli_options={"show_tool_transcript": True})
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={"show_tool_transcript": True})
+
+    event = AgentToolResult(
+        tail_node_id="tail-1",
+        lane_node_id="lane-1",
+        trace_id="trace-1",
+        reply_to_message_id="msg-1",
+        call_id="call-1",
+        tool_name="shell",
+        output="C:\\repo",
+        is_error=False,
+    )
+
+    asyncio.run(bridge.handle_event(event))
+
+    assert bridge._transcript_blocks[-1] == "[ok shell C:\\repo]"
+    assert bridge._tool_panel_lines[-1] == "[ok shell C:\\repo]"
 
 
 def test_debug_alias_routes_to_heartbeat(tmp_path):
@@ -1164,10 +1208,9 @@ def test_cli_restores_tool_history_from_saved_cursor(tmp_path):
 
     restored = bridge._restore_transcript_from_cursor()
 
-    assert restored == 3
-    assert bridge._transcript_blocks[0] == "› check cwd"
-    assert bridge._transcript_blocks[1] == "[tool shell pwd]"
-    assert bridge._transcript_blocks[2] == "[ok shell C:\\repo]"
+    assert restored == 1
+    assert bridge._transcript_blocks == ["› check cwd"]
+    assert bridge._tool_panel_lines == ["[tool shell pwd]", "[ok shell C:\\repo]"]
 
 
 def test_cli_restores_shell_error_history_as_err(tmp_path):
@@ -1198,8 +1241,8 @@ def test_cli_restores_shell_error_history_as_err(tmp_path):
 
     restored = bridge._restore_transcript_from_cursor()
 
-    assert restored == 3
-    assert bridge._transcript_blocks[2].startswith("[err shell")
+    assert restored == 1
+    assert bridge._tool_panel_lines[-1].startswith("[err shell")
 
 
 def test_cli_restore_non_shell_exit_marker_stays_ok(tmp_path):
@@ -1230,5 +1273,5 @@ def test_cli_restore_non_shell_exit_marker_stays_ok(tmp_path):
 
     restored = bridge._restore_transcript_from_cursor()
 
-    assert restored == 3
-    assert bridge._transcript_blocks[2].startswith("[ok my_tool")
+    assert restored == 1
+    assert bridge._tool_panel_lines[-1].startswith("[ok my_tool")
