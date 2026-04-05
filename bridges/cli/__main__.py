@@ -1385,8 +1385,12 @@ class CLIBridge:
     def _output_should_follow_tail(self) -> bool:
         if self._output_area is None:
             return True
+        if not self._has_transcript():
+            return True
         buffer = self._output_area.buffer
         text = buffer.document.text
+        if not text:
+            return True
         return buffer.cursor_position >= len(text)
 
     def _set_output_document(self, text: str, *, follow_tail: bool | None = None) -> None:
@@ -1926,8 +1930,12 @@ class CLIBridge:
         if self._output_area is None:
             return
         self._last_output_width = self._output_wrap_width()
+        previous_text = self._output_area.buffer.document.text
         text = self._compose_output_text(log_level)
-        self._set_output_document(text)
+        follow_tail = None
+        if previous_text == self._compose_welcome_text(log_level):
+            follow_tail = True
+        self._set_output_document(text, follow_tail=follow_tail)
         if self._application is not None:
             self._application.invalidate()
 

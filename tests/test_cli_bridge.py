@@ -188,6 +188,26 @@ def test_cli_refresh_output_preserves_scrolled_position(tmp_path):
     assert bridge._output_area.buffer.cursor_position == scrolled_cursor
 
 
+def test_cli_refresh_output_follows_tail_when_already_at_bottom(tmp_path):
+    cfg = _make_config(tmp_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+    with patch("bridges.cli.__main__.Application", return_value=SimpleNamespace()):
+        bridge._build_application()
+
+    assert bridge._output_area is not None
+    bridge._transcript_blocks = [f"line {i}" for i in range(20)]
+    bridge._refresh_output(logging.WARNING)
+
+    original_len = len(bridge._output_area.buffer.text)
+    assert bridge._output_area.buffer.cursor_position == original_len
+
+    bridge._append_block("new line at bottom")
+    bridge._refresh_output(logging.WARNING)
+
+    assert bridge._output_area.buffer.cursor_position == len(bridge._output_area.buffer.text)
+    assert len(bridge._output_area.buffer.text) > original_len
+
+
 def test_cli_drag_selection_can_autoscroll_output(tmp_path):
     cfg = _make_config(tmp_path)
     bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
